@@ -1,0 +1,31 @@
+╔══════════════════════════════════════════════════════════════╗
+║           VINYLLOCAL AI - SCHNELLSTART                      ║
+╚══════════════════════════════════════════════════════════════╝
+
+1. PYTHON INSTALLIEREN
+   → Laden Sie Python von python.org herunter
+   → WICHTIG: "Add Python to PATH" aktivieren!
+   → Computer neu starten
+
+2. APP-ORDNER ÖFFNEN
+   → Entpacken Sie die ZIP-Datei
+   → Öffnen Sie den Ordner
+
+3. ABHÄNGIGKEITEN INSTALLIEREN
+   → Öffnen Sie PowerShell/CMD im App-Ordner
+   → Führen Sie aus: pip install -r requirements.txt
+
+4. APP STARTEN
+   → Doppelklick auf start.bat (Windows)
+   → ODER: streamlit run app.py
+   → Browser öffnet sich automatisch
+
+5. KONFIGURIEREN
+   → Gehen Sie zu "⚙️ Einstellungen"
+   → Tragen Sie Firmendaten ein
+   → (Optional) API-Keys eintragen
+   → Speichern
+
+═══════════════════════════════════════════════════════════════
+
+Bei Problemen siehe INSTALLATION.md

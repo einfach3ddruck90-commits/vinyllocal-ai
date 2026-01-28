@@ -1,0 +1,108 @@
+╔══════════════════════════════════════════════════════════════╗
+║        VINYLLOCAL AI - INSTALLATIONSVARIANTEN                ║
+╚══════════════════════════════════════════════════════════════╝
+
+Die App kann auf zwei Arten installiert werden:
+
+═══════════════════════════════════════════════════════════════
+
+VARIANTE 1: STANDARD-INSTALLATION
+──────────────────────────────────
+Ordner: 01_STANDARD_INSTALLATION/
+
+✓ Nutzt bereits installiertes Python
+✓ Ideal wenn Python bereits auf dem System vorhanden ist
+✓ Einfache Installation mit automatischem Skript
+
+SCHNELLSTART:
+1. Python installieren (falls nicht vorhanden)
+   → https://www.python.org/downloads/
+   → "Add Python to PATH" aktivieren!
+2. Doppelklick auf: install.bat
+3. Doppelklick auf: start.bat
+
+Detaillierte Anleitung: 01_STANDARD_INSTALLATION/README.txt
+
+═══════════════════════════════════════════════════════════════
+
+VARIANTE 2: PORTABLE VERSION
+─────────────────────────────
+Ordner: 02_PORTABLE_VERSION/
+
+✓ Keine Python-Installation nötig
+✓ Nutzt portable Python-Distribution
+✓ Ideal für USB-Stick oder wenn keine System-Installation gewünscht
+✓ Sehr einfach zu löschen (einfach Ordner löschen)
+
+SCHNELLSTART:
+1. Portable Python herunterladen
+   → Siehe: 02_PORTABLE_VERSION/python_portable/README.txt
+   → Empfohlen: WinPython für Windows
+2. Portable Python in python_portable/ entpacken
+3. Doppelklick auf: START_HIER.bat
+
+Detaillierte Anleitung: 02_PORTABLE_VERSION/README.txt
+
+═══════════════════════════════════════════════════════════════
+
+VERGLEICH:
+──────────
+
+┌─────────────────────┬──────────────────────┬──────────────────┐
+│ Feature             │ Standard-Installation│ Portable Version │
+├─────────────────────┼──────────────────────┼──────────────────┤
+│ Python-Installation │ Erforderlich         │ Nicht erforderlich│
+│ System-Änderungen   │ Ja (Python im PATH)  │ Nein             │
+│ USB-Stick nutzbar   │ Nein                 │ Ja               │
+│ Einfach zu löschen  │ Mittel               │ Sehr einfach     │
+│ Empfohlen für       │ Normale Nutzer       │ USB/Portable     │
+└─────────────────────┴──────────────────────┴──────────────────┘
+
+═══════════════════════════════════════════════════════════════
+
+WELCHE VARIANTE SOLL ICH WÄHLEN?
+─────────────────────────────────
+
+→ Standard-Installation:
+  - Wenn Python bereits installiert ist
+  - Wenn Sie Python systemweit nutzen möchten
+  - Für normale Desktop-Nutzung
+
+→ Portable Version:
+  - Wenn keine System-Installation gewünscht ist
+  - Für USB-Stick Nutzung
+  - Wenn Sie die App einfach löschen möchten
+  - Wenn Sie keine Administratorrechte haben
+
+═══════════════════════════════════════════════════════════════
+
+ORDNERSTRUKTUR:
+───────────────
+
+VinylLocalAI/
+├── 01_STANDARD_INSTALLATION/    ← Variante 1
+│   ├── install.bat              ← Start hier!
+│   ├── start.bat                 ← Dann hier!
+│   ├── README.txt
+│   └── app/                      ← App-Dateien
+│
+├── 02_PORTABLE_VERSION/          ← Variante 2
+│   ├── START_HIER.bat            ← Start hier!
+│   ├── README.txt
+│   ├── python_portable/          ← Portable Python hier
+│   └── app/                      ← App-Dateien
+│
+└── README.md                     ← Haupt-README
+
+═══════════════════════════════════════════════════════════════
+
+VERTEILUNG:
+───────────
+
+Sie können beide Varianten separat verteilen:
+
+→ Variante 1: ZIP mit Inhalt von 01_STANDARD_INSTALLATION/
+→ Variante 2: ZIP mit Inhalt von 02_PORTABLE_VERSION/
+→ Beide: ZIP mit beiden Ordnern + Haupt-README.md
+
+═══════════════════════════════════════════════════════════════
