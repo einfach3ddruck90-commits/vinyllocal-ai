@@ -118,6 +118,8 @@ except: pass
 # #endregion
 
 from database import Database
+from logic.auth import UserDatabase, validate_email
+from logic.email_service import EmailService
 
 # #region agent log
 try:
@@ -437,7 +439,7 @@ def parse_tracklist_to_table(tracklist_text: str) -> List[Dict[str, str]]:
             if side_letter:
                 seite = side_to_seite(side_letter)
             else:
-                seite = current_seite if current_seite else ""
+                seite = current_seite if current_seite else "1"
             
             # Position: Side-Letter + Nummer oder nur Nummer
             if side_letter:
@@ -544,7 +546,7 @@ def parse_tracklist_to_table(tracklist_text: str) -> List[Dict[str, str]]:
                     position = str(position_counters[current_seite])
                 
                 tracks.append({
-                    "Seite": current_seite if current_seite else "",
+                    "Seite": current_seite if current_seite else "1",
                     "Position": position,
                     "Titel": title,
                     "Länge": length
@@ -650,18 +652,335 @@ def table_to_readable_string(tracklist_table: List[Dict[str, str]]) -> str:
     return "\n".join(lines)
 
 
+def show_login():
+    """Zeigt Login-Seite."""
+    st.header("🔐 Anmelden")
+    
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        with st.form("login_form"):
+            username = st.text_input("Benutzername", key="login_username")
+            password = st.text_input("Passwort", type="password", key="login_password")
+            submit_button = st.form_submit_button("Anmelden", use_container_width=True)
+            
+            if submit_button:
+                if username and password:
+                    user_db = st.session_state.user_db
+                    success, user_data, message = user_db.authenticate_user(username, password)
+                    
+                    if success and user_data:
+                        # Login erfolgreich - direkt einloggen (keine E-Mail-Verifizierung erforderlich)
+                        st.session_state.is_authenticated = True
+                        st.session_state.current_user = user_data
+                        # Initialisiere benutzerspezifische Datenbank
+                        st.session_state.db = Database(username=username)
+                        
+                        # Prüfe ob E-Mail vorhanden ist
+                        if not user_data.get("email") or not user_data.get("email").strip():
+                            st.session_state.needs_email_update = True
+                            st.warning("Bitte tragen Sie Ihre E-Mail-Adresse ein.")
+                        else:
+                            st.success(f"Willkommen, {username}!")
+                        st.rerun()
+                    else:
+                        st.error(message)
+                else:
+                    st.warning("Bitte geben Sie Benutzername und Passwort ein.")
+        
+        st.markdown("---")
+        st.markdown("**Noch kein Konto?**")
+        if st.button("Registrieren", use_container_width=True, key="go_to_register"):
+            st.session_state.show_register = True
+            st.rerun()
+
+
+def get_email_service() -> Optional[EmailService]:
+    """
+    Erstellt EmailService aus Umgebungsvariablen.
+    
+    Returns:
+        EmailService Instanz oder None wenn Einstellungen fehlen
+    """
+    return EmailService.from_env()
+
+
+def show_register():
+    """Zeigt Registrierungs-Seite."""
+    st.header("📝 Registrierung")
+    
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        with st.form("register_form"):
+            username = st.text_input("Benutzername *", help="Mindestens 3 Zeichen, nur Buchstaben, Zahlen und Unterstriche (erforderlich)", key="register_username")
+            password = st.text_input("Passwort *", type="password", help="Mindestens 8 Zeichen (erforderlich)", key="register_password")
+            password_confirm = st.text_input("Passwort bestätigen *", type="password", help="Passwort zur Bestätigung wiederholen (erforderlich)", key="register_password_confirm")
+            email = st.text_input("E-Mail *", help="Gültige E-Mail-Adresse erforderlich", key="register_email")
+            submit_button = st.form_submit_button("Registrieren", use_container_width=True)
+            
+            if submit_button:
+                if not username or len(username) < 3:
+                    st.error("Benutzername muss mindestens 3 Zeichen lang sein.")
+                elif not re.match(r'^[a-zA-Z0-9_]+$', username):
+                    st.error("Benutzername darf nur Buchstaben, Zahlen und Unterstriche enthalten.")
+                elif not password or len(password) < 8:
+                    st.error("Passwort muss mindestens 8 Zeichen lang sein.")
+                elif password != password_confirm:
+                    st.error("Passwörter stimmen nicht überein.")
+                elif not email or not email.strip():
+                    st.error("E-Mail-Adresse ist erforderlich.")
+                else:
+                    # E-Mail-Format-Validierung
+                    email_valid, email_error = validate_email(email.strip())
+                    if not email_valid:
+                        st.error(email_error)
+                    else:
+                        user_db = st.session_state.user_db
+                        success, message, token = user_db.register_user(username, password, email.strip())
+                        
+                        if success:
+                            # Automatisches Login nach erfolgreicher Registrierung
+                            user_data = user_db.get_user(username)
+                            if user_data:
+                                st.session_state.is_authenticated = True
+                                st.session_state.current_user = user_data
+                                # Initialisiere benutzerspezifische Datenbank
+                                st.session_state.db = Database(username=username)
+                                st.success("✅ Registrierung erfolgreich! Willkommen bei VinylLocal AI!")
+                                st.rerun()
+                            else:
+                                st.success("✅ Registrierung erfolgreich! Sie können sich jetzt einloggen.")
+                        else:
+                            st.error(message)
+        
+        st.markdown("---")
+        st.markdown("**Bereits registriert?**")
+        if st.button("Zurück zur Anmeldung", use_container_width=True, key="go_to_login"):
+            st.session_state.show_register = False
+            st.rerun()
+
+
+def show_resend_verification():
+    """Zeigt Seite zum erneuten Senden der Bestätigungs-E-Mail."""
+    st.header("📧 Bestätigungs-E-Mail erneut senden")
+    
+    username = st.session_state.get("resend_username", "")
+    
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        with st.form("resend_verification_form"):
+            if not username:
+                input_username = st.text_input("Benutzername", help="Geben Sie Ihren Benutzernamen ein", key="resend_username_input")
+            else:
+                input_username = username
+                st.text_input("Benutzername", value=username, disabled=True, key="resend_username_display")
+            
+            submit_button = st.form_submit_button("Bestätigungs-E-Mail senden", use_container_width=True, type="primary")
+            
+            if submit_button:
+                if not input_username or not input_username.strip():
+                    st.error("Bitte geben Sie Ihren Benutzernamen ein.")
+                else:
+                    user_db = st.session_state.user_db
+                    success, message, token = user_db.resend_verification_email(input_username.strip())
+                    
+                    if success and token:
+                        # Hole Benutzer-E-Mail
+                        user = user_db.get_user(input_username.strip())
+                        if user and user.get("email"):
+                            # Versuche E-Mail zu senden
+                            try:
+                                email_service = get_email_service()
+                                
+                                if email_service:
+                                    # Bestimme Base-URL (für lokale Entwicklung leer lassen, für Produktion setzen)
+                                    base_url = st.session_state.get("base_url", "")
+                                    
+                                    # Sende E-Mail
+                                    email_success, email_message = email_service.send_verification_email(
+                                        to_email=user["email"],
+                                        token=token,
+                                        username=input_username.strip(),
+                                        base_url=base_url
+                                    )
+                                    
+                                    if email_success:
+                                        st.success("✅ Bestätigungs-E-Mail wurde erfolgreich gesendet!")
+                                        st.info("📧 Bitte prüfen Sie Ihr Postfach (auch den Spam-Ordner) und klicken Sie auf den Bestätigungslink.")
+                                        if "show_resend_verification" in st.session_state:
+                                            del st.session_state.show_resend_verification
+                                        if "resend_username" in st.session_state:
+                                            del st.session_state.resend_username
+                                    else:
+                                        st.error(f"❌ E-Mail konnte nicht gesendet werden: {email_message}")
+                                else:
+                                    st.error("❌ SMTP-Einstellungen sind nicht konfiguriert.")
+                                    st.info("""
+                                    **So konfigurieren Sie SMTP:**
+                                    1. Öffnen Sie die `.env`-Datei im Hauptverzeichnis des Projekts
+                                    2. Fügen Sie die SMTP-Einstellungen hinzu (siehe Einstellungen → SMTP-Konfigurationshilfe)
+                                    3. Speichern Sie die Datei und starten Sie die App neu
+                                    4. Starten Sie die App neu, um die Konfiguration zu aktivieren
+                                    """)
+                            except Exception as e:
+                                st.error(f"❌ Fehler beim Senden der E-Mail: {str(e)}")
+                        else:
+                            st.error("❌ Benutzer-E-Mail-Adresse nicht gefunden.")
+                    else:
+                        st.error(f"❌ {message}")
+        
+        st.markdown("---")
+        st.markdown("**Zurück zur Anmeldung?**")
+        if st.button("Zur Anmeldung", use_container_width=True, key="go_to_login_from_resend"):
+            if "show_resend_verification" in st.session_state:
+                del st.session_state.show_resend_verification
+            if "resend_username" in st.session_state:
+                del st.session_state.resend_username
+            st.session_state.show_register = False
+            st.rerun()
+
+
+def show_email_update():
+    """Zeigt E-Mail-Nachträgungs-Seite für bestehende Benutzer ohne E-Mail."""
+    st.header("📧 E-Mail-Adresse erforderlich")
+    
+    current_user = st.session_state.get("current_user")
+    if not current_user:
+        st.error("Fehler: Kein Benutzer angemeldet.")
+        return
+    
+    username = current_user.get("username", "")
+    
+    st.info("ℹ️ **Wichtig:** Eine E-Mail-Adresse ist jetzt erforderlich. Bitte tragen Sie Ihre E-Mail-Adresse ein.")
+    
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        with st.form("email_update_form"):
+            email = st.text_input(
+                "E-Mail-Adresse",
+                help="Gültige E-Mail-Adresse erforderlich",
+                key="update_email_input"
+            )
+            submit_button = st.form_submit_button("E-Mail speichern", use_container_width=True, type="primary")
+            
+            if submit_button:
+                if not email or not email.strip():
+                    st.error("E-Mail-Adresse ist erforderlich.")
+                else:
+                    # E-Mail-Format-Validierung
+                    email_valid, email_error = validate_email(email.strip())
+                    if not email_valid:
+                        st.error(email_error)
+                    else:
+                        user_db = st.session_state.user_db
+                        success, message = user_db.update_user_email(username, email.strip())
+                        
+                        if success:
+                            st.success("E-Mail-Adresse erfolgreich gespeichert!")
+                            # Aktualisiere current_user in Session State
+                            current_user['email'] = email.strip()
+                            st.session_state.current_user = current_user
+                            # Entferne needs_email_update Flag
+                            if "needs_email_update" in st.session_state:
+                                del st.session_state.needs_email_update
+                            st.rerun()
+                        else:
+                            st.error(message)
+
+
+def show_email_verification():
+    """Zeigt E-Mail-Bestätigungsseite."""
+    st.header("📧 E-Mail-Adresse bestätigen")
+    
+    # Hole Token aus Query-Parametern
+    token = st.query_params.get("token", "")
+    
+    if not token:
+        st.error("❌ Kein Bestätigungstoken gefunden. Bitte verwenden Sie den Link aus Ihrer E-Mail.")
+        st.markdown("---")
+        st.markdown("**Bereits registriert?**")
+        if st.button("Zurück zur Anmeldung", use_container_width=True, key="go_to_login_from_verify"):
+            st.session_state.show_register = False
+            st.rerun()
+        return
+    
+    # Validiere Token
+    user_db = st.session_state.user_db
+    success, message, username = user_db.verify_email_token(token)
+    
+    if success:
+        st.success(f"✅ {message}")
+        st.info(f"🎉 Willkommen, {username}! Ihre E-Mail-Adresse wurde erfolgreich bestätigt.")
+        st.markdown("---")
+        if st.button("Zur Anmeldung", use_container_width=True, type="primary", key="go_to_login_after_verify"):
+            st.session_state.show_register = False
+            st.query_params.clear()
+            st.rerun()
+    else:
+        st.error(f"❌ {message}")
+        if username:
+            st.markdown("---")
+            st.markdown("**Möchten Sie einen neuen Bestätigungslink anfordern?**")
+            if st.button("Bestätigungs-E-Mail erneut senden", use_container_width=True, key="resend_verification_from_verify"):
+                st.session_state.show_resend_verification = True
+                st.session_state.resend_username = username
+                st.rerun()
+        else:
+            st.markdown("---")
+            st.markdown("**Bereits registriert?**")
+            if st.button("Zurück zur Anmeldung", use_container_width=True, key="go_to_login_from_verify_error"):
+                st.session_state.show_register = False
+                st.rerun()
+
+
+def check_authentication() -> bool:
+    """Prüft ob Benutzer eingeloggt ist."""
+    return st.session_state.get("is_authenticated", False) and st.session_state.get("current_user") is not None
+
+
+def logout():
+    """Meldet Benutzer ab."""
+    st.session_state.is_authenticated = False
+    st.session_state.current_user = None
+    if "db" in st.session_state:
+        del st.session_state.db
+    st.rerun()
+
+
 def init_session_state():
     """Initialisiert Session State Variablen."""
-    # Prüfe lokale Datenbank beim Start
-    db_path = Path("vinyl.db")
-    if not db_path.exists():
-        # Keine lokale Datenbank vorhanden - zeige Hinweis (nur beim ersten Start)
-        if "data_upload_hint_shown" not in st.session_state:
-            st.session_state.data_upload_hint_shown = True
-            # Hinweis wird in show_settings() angezeigt, nicht hier um White Screen zu vermeiden
+    # Authentifizierungs-Variablen
+    if "is_authenticated" not in st.session_state:
+        st.session_state.is_authenticated = False
+    if "current_user" not in st.session_state:
+        st.session_state.current_user = None
+    if "user_db" not in st.session_state:
+        st.session_state.user_db = UserDatabase()
+    if "show_register" not in st.session_state:
+        st.session_state.show_register = False
+    if "show_resend_verification" not in st.session_state:
+        st.session_state.show_resend_verification = False
+    if "show_resend_button" not in st.session_state:
+        st.session_state.show_resend_button = False
+    if "resend_username" not in st.session_state:
+        st.session_state.resend_username = ""
     
+    # Datenbank nur initialisieren wenn eingeloggt
+    if st.session_state.is_authenticated and st.session_state.current_user:
+        username = st.session_state.current_user.get("username")
+        if username:
+            if "db" not in st.session_state:
+                st.session_state.db = Database(username=username)
+    
+    # Wenn nicht eingeloggt, keine Datenbank initialisieren
+    if not st.session_state.is_authenticated:
+        if "db" in st.session_state:
+            # Lösche DB-Verbindung wenn nicht mehr eingeloggt
+            del st.session_state.db
+        return
+    
+    # Ab hier: Nur wenn eingeloggt
     if "db" not in st.session_state:
-        st.session_state.db = Database()
+        return
     
     # Lade API-Einstellungen aus Datenbank
     db = st.session_state.db
@@ -763,6 +1082,14 @@ def init_session_state():
         st.session_state.scan_cat_no = ""
     if "scan_year" not in st.session_state:
         st.session_state.scan_year = None
+    if "scan_format" not in st.session_state:
+        st.session_state.scan_format = ""
+    if "scan_individual_condition_enabled" not in st.session_state:
+        st.session_state.scan_individual_condition_enabled = False
+    if "scan_individual_condition_text" not in st.session_state:
+        st.session_state.scan_individual_condition_text = ""
+    if "scan_general_condition" not in st.session_state:
+        st.session_state.scan_general_condition = "VG"
     # Trackliste als Tabelle (Liste von Dictionaries)
     if "scan_tracklist_table" not in st.session_state:
         st.session_state.scan_tracklist_table = []
@@ -830,17 +1157,13 @@ def init_session_state():
     if "settings_default_margin" not in st.session_state:
         st.session_state.settings_default_margin = 2.5  # Standard-Marge 2.5x
     
-    # Bulk-Modus Variablen
+    # Scan Session Variablen
     if "scan_quantity" not in st.session_state:
         st.session_state.scan_quantity = 1
     if "scan_media_condition" not in st.session_state:
         st.session_state.scan_media_condition = "VG"
     if "scan_sleeve_condition" not in st.session_state:
         st.session_state.scan_sleeve_condition = "VG"
-    if "bulk_batch" not in st.session_state:
-        st.session_state.bulk_batch = []  # Liste von Items, die noch nicht gespeichert wurden
-    if "bulk_mode" not in st.session_state:
-        st.session_state.bulk_mode = False  # Bulk-Modus aktiviert/deaktiviert
     
     # Inventar-Detailansicht Variablen
     if "selected_vinyl_id" not in st.session_state:
@@ -867,21 +1190,6 @@ def init_session_state():
         st.session_state.cart_selected_items = []  # Liste von Item-IDs für Mehrfachauswahl im Warenkorb-Tab
 
 
-def reset_condition_fields():
-    """
-    Setzt nur die Zustands-Felder und Stückzahl zurück, behält aber alle Metadaten.
-    Wird verwendet beim "In Stapel legen" im Bulk-Modus.
-    """
-    st.session_state.scan_quantity = 1
-    st.session_state.scan_media_condition = "VG"
-    st.session_state.scan_sleeve_condition = "VG"
-    # Preis zurücksetzen, damit er neu berechnet wird
-    st.session_state.scan_suggested_price = None
-    # Erhöhe Form-Counter um UI-Widgets zu aktualisieren
-    st.session_state.form_reset_counter += 1
-    # print("Zustands-Felder zurueckgesetzt - Metadaten bleiben erhalten")  # Deaktiviert wegen Streamlit stdout
-
-
 def reset_metadata():
     """
     Setzt alle Metadaten-Felder im Session State auf Leerwerte zurück.
@@ -894,6 +1202,7 @@ def reset_metadata():
     st.session_state.scan_label = ""
     st.session_state.scan_cat_no = ""
     st.session_state.scan_year = None
+    st.session_state.scan_format = ""
     st.session_state.scan_tracklist_table = []
     st.session_state.scan_discogs_results = None
     st.session_state.scan_selected_release = None
@@ -906,8 +1215,11 @@ def reset_metadata():
     st.session_state.deep_analysis_used = False
     st.session_state.selected_discogs_release_id = None  # Reset explizite Auswahl
     
-    # Reset Bulk-Modus Felder (aber behalte Bulk-Modus Status und Batch)
+    # Reset Zustands-Felder
     st.session_state.scan_quantity = 1
+    st.session_state.scan_individual_condition_enabled = False
+    st.session_state.scan_individual_condition_text = ""
+    st.session_state.scan_general_condition = "VG"
     st.session_state.scan_media_condition = "VG"
     st.session_state.scan_sleeve_condition = "VG"
     st.session_state.scan_purchase_price = None
@@ -1365,6 +1677,43 @@ def update_fields_from_discogs(release_id: int, respect_manual_edits: bool = Tru
             # print(f"Warnung beim Extrahieren des Jahres: {e}")  # Deaktiviert wegen Streamlit stdout
             pass
         
+        # Extrahiere Format (nur wenn nicht manuell bearbeitet)
+        try:
+            formats = release_details.get("formats", [])
+            if formats and len(formats) > 0:
+                # Nimm erstes Format (meistens das Hauptformat)
+                format_info = formats[0]
+                format_name = format_info.get("name", "")  # z.B. "LP", "Single", "EP"
+                format_descriptions = format_info.get("descriptions", [])  # z.B. ["12\"", "33 ⅓ RPM"]
+                
+                # Suche nach Größe in descriptions (z.B. "12\"", "7\"", "10\"")
+                size = None
+                for desc in format_descriptions:
+                    if '"' in desc or 'inch' in desc.lower():
+                        # Extrahiere Zahl vor " oder inch
+                        size_match = re.search(r'(\d+)["\s]*inch?', desc, re.IGNORECASE)
+                        if size_match:
+                            size = size_match.group(1) + '"'
+                            break
+                        # Fallback: Suche nach "12"", "7"" etc.
+                        size_match = re.search(r'(\d+)"', desc)
+                        if size_match:
+                            size = size_match.group(1) + '"'
+                            break
+                
+                # Kombiniere Größe und Typ
+                if size and format_name:
+                    combined_format = f"{size} {format_name}"
+                    if not respect_manual_edits or not st.session_state.manually_edited_fields.get("format", False):
+                        st.session_state.scan_format = combined_format
+                elif format_name:
+                    # Nur Typ ohne Größe
+                    if not respect_manual_edits or not st.session_state.manually_edited_fields.get("format", False):
+                        st.session_state.scan_format = format_name
+        except Exception as e:
+            # print(f"Warnung beim Extrahieren des Formats: {e}")  # Deaktiviert wegen Streamlit stdout
+            pass
+        
         # Extrahiere Trackliste (nur wenn nicht manuell bearbeitet)
         try:
             discogs_tracklist_text = st.session_state.discogs_client.extract_tracklist(release_details)
@@ -1482,49 +1831,18 @@ def show_scan_session():
             
             current_files = (front_img.name if front_img else None, back_img.name if back_img else None)
             if current_files != st.session_state.last_uploaded_files:
-                # Neue Dateien - prüfe ob Bulk-Modus aktiv ist und Metadaten vorhanden sind
-                bulk_mode_active = st.session_state.get("bulk_mode", False)
-                has_metadata = (st.session_state.get("scan_artist") or st.session_state.get("scan_title"))
-                
-                # Wenn Bulk-Modus aktiv UND Metadaten vorhanden, behalte Metadaten
-                if bulk_mode_active and has_metadata:
-                    # Nur Bildpfade und temporäre Dateien löschen, Metadaten behalten
-                    st.session_state.last_uploaded_files = current_files
-                    # Lösche temporäre Dateien wenn vorhanden
-                    if "temp_image_paths" in st.session_state:
-                        for tmp_path in st.session_state.temp_image_paths:
-                            if os.path.exists(tmp_path):
-                                try:
-                                    os.unlink(tmp_path)
-                                except:
-                                    pass
-                        del st.session_state.temp_image_paths
-                    # Reset nur Discogs-Ergebnisse und Analyse-Flags, behalte Metadaten
-                    st.session_state.scan_recognized_data = None
-                    st.session_state.scan_discogs_results = None
-                    st.session_state.scan_selected_release = None
-                    st.session_state.auto_search_performed = False
-                    st.session_state.last_processed_release_id = None
-                    st.session_state.deep_analysis_used = False
-                    st.session_state.selected_discogs_release_id = None
-                    st.session_state.discogs_release_id = None
-                    st.session_state.discogs_median_price = None
-                    # Preis zurücksetzen, damit er neu berechnet wird
-                    st.session_state.scan_suggested_price = None
-                    # print("Bilder geaendert - Metadaten bleiben erhalten (Bulk-Modus)")  # Deaktiviert wegen Streamlit stdout
-                else:
-                    # Normale Reset-Funktion wenn kein Bulk-Modus oder keine Metadaten
-                    reset_metadata()
-                    st.session_state.last_uploaded_files = current_files
-                    # Lösche temporäre Dateien wenn vorhanden
-                    if "temp_image_paths" in st.session_state:
-                        for tmp_path in st.session_state.temp_image_paths:
-                            if os.path.exists(tmp_path):
-                                try:
-                                    os.unlink(tmp_path)
-                                except:
-                                    pass
-                        del st.session_state.temp_image_paths
+                # Neue Dateien - resette alle Metadaten
+                reset_metadata()
+                st.session_state.last_uploaded_files = current_files
+                # Lösche temporäre Dateien wenn vorhanden
+                if "temp_image_paths" in st.session_state:
+                    for tmp_path in st.session_state.temp_image_paths:
+                        if os.path.exists(tmp_path):
+                            try:
+                                os.unlink(tmp_path)
+                            except:
+                                pass
+                    del st.session_state.temp_image_paths
         
         # Zeige Bilder nebeneinander an
         if front_img is not None or back_img is not None:
@@ -1747,38 +2065,47 @@ def show_scan_session():
                                     
                                     # Debug: Zeige Trackliste-Status
                                     if not tracklist_table:
-                                        st.warning("⚠️ Keine Trackliste erkannt. Versuchen Sie es mit der Discogs-Suche oder geben Sie sie manuell ein.")
+                                        st.warning("⚠️ Keine Trackliste erkannt. Versuchen Sie es mit der MusicBrainz/Discogs-Suche oder geben Sie sie manuell ein.")
                                     else:
                                         st.info(f"✅ Trackliste erkannt ({len(tracklist_table)} Tracks)")
                                     
-                                    # MusicBrainz-Verbesserung (falls aktiviert)
-                                    if st.session_state.get("musicbrainz_client") and artist_val and title_val:
+                                    # API-Reihenfolge: ZUERST MusicBrainz (mit Tracklisten), DANN Discogs
+                                    # Beide APIs werden immer aufgerufen (wenn aktiviert)
+                                    mb_data_available = False
+                                    mb_tracklist_available = False
+                                    
+                                    # 1. MusicBrainz-Aufruf (ZUERST, wenn aktiviert)
+                                    musicbrainz_enabled = st.session_state.get("musicbrainz_client") is not None
+                                    if musicbrainz_enabled and artist_val and title_val:
                                         try:
-                                            mb_results = st.session_state.musicbrainz_client.search_release(
-                                                artist_val, 
-                                                title_val, 
-                                                cat_no_val if cat_no_val else None
-                                            )
+                                            with st.spinner("🎼 Suche bei MusicBrainz..."):
+                                                mb_results = st.session_state.musicbrainz_client.search_release(
+                                                    artist_val, 
+                                                    title_val, 
+                                                    cat_no_val if cat_no_val else None
+                                                )
                                             
                                             if mb_results and len(mb_results) > 0:
                                                 # Nimm erstes/bestes Ergebnis
                                                 mb_release = mb_results[0]
+                                                mb_data_available = True
                                                 
-                                                # Verbessere/Verifiziere Felder mit MusicBrainz-Daten
-                                                # Bevorzuge MusicBrainz bei Label und Cat-No (sehr genau)
+                                                # MusicBrainz-Daten haben Priorität für Metadaten
+                                                # Label
                                                 if mb_release.get("label") and mb_release["label"]:
                                                     if not label_val or label_val.lower() != mb_release["label"].lower():
                                                         label_val = mb_release["label"]
                                                         st.session_state.scan_label = label_val
                                                         st.info(f"🎼 MusicBrainz: Label korrigiert zu '{label_val}'")
                                                 
+                                                # Cat-No
                                                 if mb_release.get("cat_no") and mb_release["cat_no"]:
                                                     if not cat_no_val or cat_no_val.lower() != mb_release["cat_no"].lower():
                                                         cat_no_val = mb_release["cat_no"]
                                                         st.session_state.scan_cat_no = cat_no_val
                                                         st.info(f"🎼 MusicBrainz: Katalog-Nr. korrigiert zu '{cat_no_val}'")
                                                 
-                                                # Verbessere Jahr falls vorhanden und plausibel
+                                                # Jahr
                                                 mb_date = mb_release.get("date", "")
                                                 if mb_date:
                                                     try:
@@ -1791,13 +2118,29 @@ def show_scan_session():
                                                                 st.info(f"🎼 MusicBrainz: Jahr korrigiert zu {mb_year}")
                                                     except (ValueError, AttributeError):
                                                         pass
+                                                
+                                                # Trackliste von MusicBrainz (wichtigster Teil!)
+                                                mb_tracklist = mb_release.get("tracklist", [])
+                                                if mb_tracklist and isinstance(mb_tracklist, list) and len(mb_tracklist) > 0:
+                                                    # Konvertiere MusicBrainz Trackliste zu String-Format
+                                                    mb_client = st.session_state.musicbrainz_client
+                                                    mb_tracklist_str = mb_client.format_tracklist_as_string(mb_tracklist)
+                                                    
+                                                    if mb_tracklist_str and not st.session_state.manually_edited_fields.get("tracklist", False):
+                                                        # Konvertiere zu Tabellenformat
+                                                        mb_tracklist_table = parse_tracklist_to_table(mb_tracklist_str)
+                                                        if mb_tracklist_table:
+                                                            st.session_state.scan_tracklist_table = mb_tracklist_table
+                                                            mb_tracklist_available = True
+                                                            st.info(f"🎼 MusicBrainz: Trackliste gefunden ({len(mb_tracklist_table)} Tracks)")
                                         except Exception as mb_error:
                                             # MusicBrainz-Fehler sind nicht kritisch, ignoriere sie
-                                            # print(f"MusicBrainz-Verbesserung fehlgeschlagen (nicht kritisch): {mb_error}")  # Deaktiviert wegen Streamlit stdout
+                                            # print(f"MusicBrainz-Suche fehlgeschlagen (nicht kritisch): {mb_error}")  # Deaktiviert wegen Streamlit stdout
                                             pass
                                     
-                                    # Automatische Discogs-Suche nach KI-Analyse (nur wenn aktiviert)
-                                    # WICHTIG: Nur suchen wenn Artist und Title vorhanden sind UND Discogs aktiviert ist
+                                    # 2. Discogs-Aufruf (DANACH, wenn aktiviert)
+                                    # Discogs wird IMMER aufgerufen (auch wenn MusicBrainz Daten lieferte)
+                                    # Discogs ergänzt MusicBrainz-Daten (z.B. Marktpreise) und überschreibt nur bei expliziter Nutzerauswahl
                                     discogs_enabled = st.session_state.get("settings_discogs_enabled", False)
                                     if not st.session_state.auto_search_performed and discogs_enabled and st.session_state.discogs_client:
                                         if artist_val and title_val:
@@ -1818,6 +2161,7 @@ def show_scan_session():
                                                             st.session_state.scan_discogs_results = results
                                                             st.session_state.deep_analysis_used = False  # Discogs gefunden
                                                             # Info wird nach st.rerun() angezeigt
+                                                            # Hinweis: Discogs-Daten überschreiben MusicBrainz-Daten nur bei expliziter Nutzerauswahl
                                                         else:
                                                             # Keine Ergebnisse gefunden - starte Deep Analysis
                                                             st.session_state.scan_discogs_results = None
@@ -1919,15 +2263,30 @@ def show_scan_session():
                                         else:
                                             st.info("ℹ️ **Hinweis**: Automatische Discogs-Suche übersprungen, da Artist oder Title leer sind. Bitte füllen Sie diese Felder manuell aus und suchen Sie dann manuell bei Discogs.")
                                     elif not discogs_enabled:
-                                        st.info("ℹ️ Discogs-Suche ist in den Einstellungen deaktiviert. Alle Daten werden ausschließlich durch KI-Analyse extrahiert.")
+                                        if musicbrainz_enabled:
+                                            st.info("ℹ️ Discogs-Suche ist deaktiviert. Daten wurden von KI und MusicBrainz extrahiert.")
+                                        else:
+                                            st.info("ℹ️ Discogs-Suche ist in den Einstellungen deaktiviert. Alle Daten werden ausschließlich durch KI-Analyse extrahiert.")
                                     elif not st.session_state.discogs_client:
-                                        st.info("ℹ️ Discogs-Client nicht verfügbar. Bitte konfigurieren Sie den Token in den Einstellungen.")
+                                        if musicbrainz_enabled:
+                                            st.info("ℹ️ Discogs-Client nicht verfügbar. Daten wurden von KI und MusicBrainz extrahiert.")
+                                        else:
+                                            st.info("ℹ️ Discogs-Client nicht verfügbar. Bitte konfigurieren Sie den Token in den Einstellungen.")
                                     
                                     # Erhöhe Form-Counter um Widgets zu aktualisieren
                                     st.session_state.form_reset_counter += 1
                                     
-                                    # Zeige Erfolgsmeldung und Discogs-Status
-                                    st.success("✅ Cover erfolgreich analysiert! Die Daten wurden in die Felder übernommen.")
+                                    # Zeige Erfolgsmeldung und API-Status
+                                    api_status_parts = []
+                                    if musicbrainz_enabled:
+                                        api_status_parts.append("MusicBrainz")
+                                    if discogs_enabled and st.session_state.discogs_client:
+                                        api_status_parts.append("Discogs")
+                                    
+                                    if api_status_parts:
+                                        st.success(f"✅ Cover erfolgreich analysiert! APIs verwendet: {', '.join(api_status_parts)}")
+                                    else:
+                                        st.success("✅ Cover erfolgreich analysiert! Die Daten wurden in die Felder übernommen.")
                                     
                                     # Zeige Discogs-Status nach automatischer Suche (wenn durchgeführt)
                                     if st.session_state.auto_search_performed:
@@ -1971,7 +2330,7 @@ def show_scan_session():
                 </style>
             """, unsafe_allow_html=True)
         
-        artist = st.text_input("👤 Artist", value=st.session_state.scan_artist, key=f"form_artist_{form_key_suffix}")
+        artist = st.text_input("👤 Künstler", value=st.session_state.scan_artist, key=f"form_artist_{form_key_suffix}")
         # Aktualisiere Session State wenn geändert - markiere als manuell bearbeitet wenn Nutzer geändert hat
         if artist != st.session_state.scan_artist:
             # Wenn Wert geändert wurde UND nicht leer ist UND vorher leer war, könnte es KI-Füllung sein
@@ -2020,7 +2379,7 @@ def show_scan_session():
             display_value = placeholder_value
         
         year_input = st.number_input(
-            "📅 Year", 
+            "📅 Jahr", 
             min_value=0, 
             max_value=current_year,
             value=display_value,
@@ -2039,6 +2398,40 @@ def show_scan_session():
             if year is not None and st.session_state.scan_year is not None and year != st.session_state.scan_year:
                 st.session_state.manually_edited_fields["year"] = True
             st.session_state.scan_year = year
+        
+        # Format-Eingabe
+        format_options = ["12\" LP", "12\" Single", "12\" EP", "10\" LP", "10\" EP", "7\" Single", "7\" EP", "Sonstiges"]
+        current_format = st.session_state.get("scan_format", "")
+        current_format_index = format_options.index(current_format) if current_format in format_options else 0
+        
+        format_selection = st.selectbox(
+            "💿 Format",
+            format_options,
+            index=current_format_index if current_format_index < len(format_options) else 0,
+            key=f"form_format_{form_key_suffix}",
+            help="Format der Schallplatte (Größe und Typ)"
+        )
+        
+        # Wenn "Sonstiges" ausgewählt, zeige Textfeld für freie Eingabe
+        custom_format = ""
+        if format_selection == "Sonstiges":
+            custom_format = st.text_input(
+                "Format (frei)",
+                value=current_format if current_format not in format_options else "",
+                key=f"form_format_custom_{form_key_suffix}",
+                help="Freie Eingabe für Format (z.B. '12\" Maxi-Single')"
+            )
+            if custom_format:
+                st.session_state.scan_format = custom_format
+            else:
+                st.session_state.scan_format = ""
+        else:
+            st.session_state.scan_format = format_selection
+        
+        # Markiere als manuell bearbeitet wenn geändert
+        if st.session_state.scan_format != current_format:
+            if st.session_state.scan_format and current_format and st.session_state.scan_format != current_format:
+                st.session_state.manually_edited_fields["format"] = True
         
         # Trackliste - Gruppierte Anzeige mit separaten Tabellen für Seite 1 und Seite 2
         with st.expander("🎵 Trackliste & Details", expanded=True):
@@ -2078,10 +2471,12 @@ def show_scan_session():
             tracks_by_seite = {}
             for track in st.session_state.scan_tracklist_table:
                 seite = str(track.get("Seite", "")).strip()
-                if seite:
-                    if seite not in tracks_by_seite:
-                        tracks_by_seite[seite] = []
-                    tracks_by_seite[seite].append(track)
+                # Wenn Seite leer ist, verwende "1" als Standard
+                if not seite:
+                    seite = "1"
+                if seite not in tracks_by_seite:
+                    tracks_by_seite[seite] = []
+                tracks_by_seite[seite].append(track)
             
             # Sortiere Seiten numerisch (1, 2, 3, 4, ...)
             sorted_seiten = sorted(tracks_by_seite.keys(), key=lambda x: int(x) if x.isdigit() else 999)
@@ -2185,7 +2580,7 @@ def show_scan_session():
         )
         st.session_state.scan_quantity = quantity
         
-        # Zustandsbewertung - zwei separate Dropdowns für Medium und Cover (auf Deutsch)
+        # Zustandsbewertung - Allgemeine Zustandsbewertung und optionale individuelle Felder
         condition_options = ["M", "NM", "VG+", "VG", "G", "P"]
         condition_labels_de = {
             "M": "M - Neuwertig (Mint)",
@@ -2196,40 +2591,125 @@ def show_scan_session():
             "P": "P - Schlecht (Poor)"
         }
         
-        col_media, col_sleeve = st.columns(2)
-        with col_media:
-            # Bestimme aktuellen Index
-            current_media = st.session_state.get("scan_media_condition", "VG")
-            try:
-                current_index = condition_options.index(current_media)
-            except ValueError:
-                current_index = 3  # Default: VG
-            
-            media_condition = st.selectbox(
-                "💿 Zustand Medium (Vinyl)",
-                condition_options,
-                index=current_index,
-                format_func=lambda x: condition_labels_de.get(x, x),
-                key=f"form_media_condition_{form_key_suffix}"
-            )
-            st.session_state.scan_media_condition = media_condition
+        # Lade Einstellungen aus Datenbank
+        db = st.session_state.db
+        company_settings = db.get_company_settings() or {}
+        default_condition = company_settings.get("default_condition", "VG")
+        default_condition_text = company_settings.get("default_condition_text", "")
+        show_individual = company_settings.get("show_individual_conditions", 1) == 1
+        condition_note = company_settings.get("condition_note", "")
+        show_condition_rating = company_settings.get("show_condition_rating", 1) == 1
         
-        with col_sleeve:
-            # Bestimme aktuellen Index
-            current_sleeve = st.session_state.get("scan_sleeve_condition", "VG")
+        # Lade Zustandstexte
+        condition_texts_json = company_settings.get("condition_texts", "{}")
+        try:
+            condition_texts = json.loads(condition_texts_json) if condition_texts_json else {}
+        except:
+            condition_texts = {}
+        
+        # Zustandsbewertung (nur wenn aktiviert)
+        if show_condition_rating:
+            # Allgemeine Zustandsbewertung
+            st.markdown("### 💿 Allgemeine Zustandsbewertung")
+            
+            # Bestimme aktuellen Index für Dropdown
+            current_general_condition = st.session_state.get("scan_general_condition", "VG")
             try:
-                current_index = condition_options.index(current_sleeve)
+                current_index = condition_options.index(current_general_condition)
             except ValueError:
                 current_index = 3  # Default: VG
             
-            sleeve_condition = st.selectbox(
-                "📄 Zustand Cover (Sleeve)",
+            general_condition = st.selectbox(
+                "Allgemeine Zustandsbewertung",
                 condition_options,
                 index=current_index,
                 format_func=lambda x: condition_labels_de.get(x, x),
-                key=f"form_sleeve_condition_{form_key_suffix}"
+                help="Wählen Sie den allgemeinen Zustand dieser Platte aus",
+                key=f"form_general_condition_{form_key_suffix}"
             )
-            st.session_state.scan_sleeve_condition = sleeve_condition
+            st.session_state.scan_general_condition = general_condition
+            
+            # Zeige Text für ausgewählten Zustand
+            selected_condition = st.session_state.scan_general_condition
+            condition_text = condition_texts.get(selected_condition, "")
+            if condition_text:
+                st.caption(f"ℹ️ {condition_text}")
+            
+            if default_condition_text:
+                st.caption(f"ℹ️ {default_condition_text}")
+            
+            # Optionaler Text unter allgemeiner Zustandsbewertung
+            if condition_note:
+                st.markdown(f"<div style='padding: 10px; background-color: #f0f2f6; border-radius: 5px; margin-top: 10px;'>{condition_note}</div>", unsafe_allow_html=True)
+            
+            # Individuelle Zustandsbewertung pro Platte
+            individual_condition_enabled = st.checkbox(
+                "📝 Individuelle Zustandsbewertung aktivieren",
+                value=st.session_state.scan_individual_condition_enabled,
+                help="Aktivieren Sie diese Option, um individuelle Zustandsfelder (Medium/Cover) und optional einen Text für diese Platte hinzuzufügen",
+                key=f"individual_condition_enabled_{form_key_suffix}"
+            )
+            st.session_state.scan_individual_condition_enabled = individual_condition_enabled
+            
+            # Individuelle Zustandsfelder (nur wenn Einstellungen UND pro-Platte aktiviert)
+            if show_individual and individual_condition_enabled:
+                st.markdown("#### Individuelle Zustandsbewertung")
+                col_media, col_sleeve = st.columns(2)
+                with col_media:
+                    # Bestimme aktuellen Index
+                    current_media = st.session_state.get("scan_media_condition", "VG")
+                    try:
+                        current_index = condition_options.index(current_media)
+                    except ValueError:
+                        current_index = 3  # Default: VG
+                    
+                    media_condition = st.selectbox(
+                        "💿 Zustand Medium (Vinyl)",
+                        condition_options,
+                        index=current_index,
+                        format_func=lambda x: condition_labels_de.get(x, x),
+                        key=f"form_media_condition_{form_key_suffix}"
+                    )
+                    st.session_state.scan_media_condition = media_condition
+                
+                with col_sleeve:
+                    # Bestimme aktuellen Index
+                    current_sleeve = st.session_state.get("scan_sleeve_condition", "VG")
+                    try:
+                        current_index = condition_options.index(current_sleeve)
+                    except ValueError:
+                        current_index = 3  # Default: VG
+                    
+                    sleeve_condition = st.selectbox(
+                        "📄 Zustand Cover (Sleeve)",
+                        condition_options,
+                        index=current_index,
+                        format_func=lambda x: condition_labels_de.get(x, x),
+                        key=f"form_sleeve_condition_{form_key_suffix}"
+                    )
+                    st.session_state.scan_sleeve_condition = sleeve_condition
+                
+                # Optionaler Textfeld nach Media/Sleeve Feldern
+                individual_condition_text = st.text_area(
+                    "Individueller Zustandstext (optional)",
+                    value=st.session_state.scan_individual_condition_text,
+                    help="Geben Sie hier optional eine individuelle Beschreibung des Zustands dieser Platte ein",
+                    height=100,
+                    key=f"individual_condition_text_{form_key_suffix}"
+                )
+                st.session_state.scan_individual_condition_text = individual_condition_text
+            else:
+                # Wenn individuelle Felder nicht angezeigt werden, verwende Standard-Zustand
+                st.session_state.scan_media_condition = default_condition
+                st.session_state.scan_sleeve_condition = default_condition
+                if not individual_condition_enabled:
+                    st.session_state.scan_individual_condition_text = ""
+        else:
+            # Wenn Zustandsbewertung deaktiviert ist, verwende Standard-Werte
+            st.session_state.scan_media_condition = default_condition
+            st.session_state.scan_sleeve_condition = default_condition
+            st.session_state.scan_individual_condition_enabled = False
+            st.session_state.scan_individual_condition_text = ""
         
         # Legacy condition_grading für Rückwärtskompatibilität (nutze media_condition)
         condition = condition_en_to_de("Very Good")  # Standard für Legacy
@@ -2491,41 +2971,10 @@ def show_scan_session():
                 key="form_pricing"
             )
         
-        st.markdown("---")
-        
-        # Bulk-Modus Toggle
-        bulk_mode = st.checkbox(
-            "📦 Bulk-Modus aktivieren",
-            value=st.session_state.get("bulk_mode", False),
-            help="Aktivieren Sie den Bulk-Modus, um mehrere Platten nacheinander zu erfassen, bevor sie gespeichert werden",
-            key="bulk_mode_toggle"
-        )
-        st.session_state.bulk_mode = bulk_mode
-        
-        # Zeige Bulk-Batch Status wenn aktiv
-        if bulk_mode and st.session_state.get("bulk_batch"):
-            st.info(f"📦 **Bulk-Batch:** {len(st.session_state.bulk_batch)} Platte(n) im Stapel")
-            if st.button("🗑️ Batch leeren", key="clear_batch"):
-                st.session_state.bulk_batch = []
-                st.rerun()
-        
-        st.markdown("---")
-        
-        # Speichern in Inventar oder In Stapel legen
-        if bulk_mode:
-            save_col1, save_col2 = st.columns(2)
-            with save_col1:
-                add_to_batch_btn = st.button("📦 In Stapel legen", type="primary", use_container_width=True)
-            with save_col2:
-                save_all_btn = st.button("💾 Alle speichern", use_container_width=True, key="save_all_bulk")
-                # Erfolgsmeldung unter Button anzeigen
-                show_success_message("", "save_all_bulk")
-        else:
-            save_all_btn = None
-            add_to_batch_btn = None
-            save_all_btn = st.button("💾 In Inventar speichern", type="primary", use_container_width=True, key="save_inventory")
-            # Erfolgsmeldung unter Button anzeigen
-            show_success_message("", "save_inventory")
+        # Speichern in Inventar
+        save_all_btn = st.button("💾 In Inventar speichern", type="primary", use_container_width=True, key="save_inventory")
+        # Erfolgsmeldung unter Button anzeigen
+        show_success_message("", "save_inventory")
         
         # Kopiere Bilder in permanentes Verzeichnis
         def copy_images_to_permanent(image_paths, record_id=None, artist=None, title=None):
@@ -2626,40 +3075,7 @@ def show_scan_session():
                 st.warning(f"⚠️ Warnung beim Serialisieren der Bildpfade: {e}")
                 return None
         
-        # In Stapel legen (Bulk-Modus)
-        if add_to_batch_btn:
-            if not artist or not title:
-                st.error("❌ Bitte füllen Sie mindestens Artist und Title aus!")
-            else:
-                # Bereite Item-Daten vor
-                quantity_int = int(quantity)
-                item_data = {
-                    "artist": artist,
-                    "title": title,
-                    "label": label if label else None,
-                    "cat_no": cat_no if cat_no else None,
-                    "year": int(year) if year else None,
-                    "pricing": float(pricing) if pricing else None,
-                    "purchase_price": float(purchase_price) if purchase_price else None,
-                    "quantity": quantity_int,
-                    "max_quantity": quantity_int,  # Beim ersten Hinzufügen: max_quantity = quantity
-                    "media_condition": media_condition,
-                    "sleeve_condition": sleeve_condition,
-                    "condition_grading": condition,  # Legacy für Rückwärtskompatibilität
-                    "status": "available",
-                    "image_paths": serialize_image_paths(st.session_state.get("scan_image_path")),
-                    "tracklist": table_to_tracklist_string(st.session_state.scan_tracklist_table) if st.session_state.scan_tracklist_table else None
-                }
-                
-                # Füge zum Batch hinzu
-                st.session_state.bulk_batch.append(item_data)
-                st.success(f"✅ Platte zum Stapel hinzugefügt! ({len(st.session_state.bulk_batch)} im Stapel)")
-                
-                # Reset nur Zustands-Felder für nächste Platte (Metadaten bleiben erhalten)
-                reset_condition_fields()
-                st.rerun()
-        
-        # Alle speichern (Bulk-Modus oder Einzelmodus)
+        # Speichern in Inventar
         if save_all_btn:
             items_to_save = []
             
@@ -2683,51 +3099,31 @@ def show_scan_session():
                     st.warning(f"⚠️ Warnung beim Serialisieren der Bildpfade: {e}")
                     return None
             
-            # Wenn Bulk-Modus: Speichere Batch + aktuelles Item
-            if bulk_mode:
-                items_to_save = st.session_state.get("bulk_batch", []).copy()
-                # Füge aktuelles Item hinzu wenn ausgefüllt
-                if artist and title:
-                    quantity_int = int(quantity)
-                    current_item = {
-                        "artist": artist,
-                        "title": title,
-                        "label": label if label else None,
-                        "cat_no": cat_no if cat_no else None,
-                        "year": int(year) if year else None,
-                        "pricing": float(pricing) if pricing else None,
-                        "quantity": quantity_int,
-                        "max_quantity": quantity_int,  # Beim ersten Hinzufügen: max_quantity = quantity
-                        "media_condition": media_condition,
-                        "sleeve_condition": sleeve_condition,
-                        "condition_grading": condition,
-                        "status": "available",
-                        "image_paths": serialize_image_paths(st.session_state.get("scan_image_path")),
-                        "tracklist": table_to_tracklist_string(st.session_state.scan_tracklist_table) if st.session_state.scan_tracklist_table else None
-                    }
-                    items_to_save.append(current_item)
+            # Einzelmodus: Nur aktuelles Item
+            if not artist or not title:
+                st.error("❌ Bitte füllen Sie mindestens Artist und Title aus!")
             else:
-                # Einzelmodus: Nur aktuelles Item
-                if not artist or not title:
-                    st.error("❌ Bitte füllen Sie mindestens Artist und Title aus!")
-                else:
-                    quantity_int = int(quantity)
-                    items_to_save = [{
-                        "artist": artist,
-                        "title": title,
-                        "label": label if label else None,
-                        "cat_no": cat_no if cat_no else None,
-                        "year": int(year) if year else None,
-                        "pricing": float(pricing) if pricing else None,
-                        "quantity": quantity_int,
-                        "max_quantity": quantity_int,  # Beim ersten Hinzufügen: max_quantity = quantity
-                        "media_condition": media_condition,
-                        "sleeve_condition": sleeve_condition,
-                        "condition_grading": condition,
-                        "status": "available",
-                        "image_paths": serialize_image_paths(st.session_state.get("scan_image_path")),
-                        "tracklist": table_to_tracklist_string(st.session_state.scan_tracklist_table) if st.session_state.scan_tracklist_table else None
-                    }]
+                quantity_int = int(quantity)
+                items_to_save = [{
+                    "artist": artist,
+                    "title": title,
+                    "label": label if label else None,
+                    "cat_no": cat_no if cat_no else None,
+                    "year": int(year) if year else None,
+                    "format": st.session_state.scan_format if st.session_state.scan_format else None,
+                    "pricing": float(pricing) if pricing else None,
+                    "quantity": quantity_int,
+                    "max_quantity": quantity_int,  # Beim ersten Hinzufügen: max_quantity = quantity
+                    "media_condition": media_condition,
+                    "sleeve_condition": sleeve_condition,
+                    "general_condition": st.session_state.scan_general_condition if st.session_state.scan_general_condition else "VG",
+                    "individual_condition_enabled": 1 if st.session_state.scan_individual_condition_enabled else 0,
+                    "individual_condition_text": st.session_state.scan_individual_condition_text.strip() if st.session_state.scan_individual_condition_text else None,
+                    "condition_grading": condition,
+                    "status": "available",
+                    "image_paths": serialize_image_paths(st.session_state.get("scan_image_path")),
+                    "tracklist": table_to_tracklist_string(st.session_state.scan_tracklist_table) if st.session_state.scan_tracklist_table else None
+                }]
             
             # Speichere alle Items mit Dubletten-Prüfung
             if items_to_save:
@@ -2978,10 +3374,7 @@ def show_scan_session():
                     if saved_count > 0:
                         if not items_with_duplicates:
                             # Setze Erfolgsmeldung für Anzeige unter Button
-                            if bulk_mode:
-                                set_success_message(f"✅ {saved_count} Platte(n) erfolgreich gespeichert!", "save_all_bulk")
-                            else:
-                                set_success_message(f"✅ {saved_count} Platte(n) erfolgreich gespeichert!", "save_inventory")
+                            set_success_message(f"✅ {saved_count} Platte(n) erfolgreich gespeichert!", "save_inventory")
                         else:
                             st.info(f"ℹ️ {saved_count} Platte(n) gespeichert. {len(items_with_duplicates)} Dublette(n) gefunden - bitte Aktion wählen.")
                         
@@ -2991,7 +3384,6 @@ def show_scan_session():
                             reset_metadata()
                             st.session_state.last_uploaded_files = (None, None)
                             st.session_state.scan_image_path = None
-                            st.session_state.bulk_batch = []  # Leere Batch nach erfolgreichem Speichern
                             
                             # Navigiere automatisch zur Lager-Verwaltung
                             st.session_state.navigate_to = "Lager-Verwaltung"
@@ -3009,10 +3401,7 @@ def show_scan_session():
                     with st.expander("🔍 Fehlerdetails anzeigen"):
                         st.code(traceback.format_exc())
             else:
-                if bulk_mode:
-                    st.warning("⚠️ Keine Items im Stapel zum Speichern.")
-                else:
-                    st.error("❌ Bitte füllen Sie mindestens Artist und Title aus!")
+                st.error("❌ Bitte füllen Sie mindestens Artist und Title aus!")
 
 
 def show_inventory():
@@ -3060,18 +3449,6 @@ def show_inventory():
             "G": "G - Gut (Good)",
             "P": "P - Schlecht (Poor)"
         }
-        
-        media_condition_filter = st.selectbox(
-            "💿 Zustand Medium",
-            condition_options,
-            format_func=lambda x: condition_labels.get(x, x) if x != "Alle" else x
-        )
-        
-        sleeve_condition_filter = st.selectbox(
-            "📄 Zustand Cover",
-            condition_options,
-            format_func=lambda x: condition_labels.get(x, x) if x != "Alle" else x
-        )
         
         st.markdown("---")
         
@@ -3130,14 +3507,12 @@ def show_inventory():
             "Katalog-Nr. (Z-A)": "cat_no DESC",
             "Jahr (aufsteigend)": "year ASC",
             "Jahr (absteigend)": "year DESC",
+            "Format (A-Z)": "format ASC",
+            "Format (Z-A)": "format DESC",
             "Preis (niedrig → hoch)": "pricing ASC",
             "Preis (hoch → niedrig)": "pricing DESC",
             "Stückzahl (aufsteigend)": "quantity ASC",
             "Stückzahl (absteigend)": "quantity DESC",
-            "Zustand Medium (A-Z)": "media_condition ASC",
-            "Zustand Medium (Z-A)": "media_condition DESC",
-            "Zustand Cover (A-Z)": "sleeve_condition ASC",
-            "Zustand Cover (Z-A)": "sleeve_condition DESC",
             "Erfasst am (aufsteigend)": "created_at ASC",
             "Erfasst am (absteigend)": "created_at DESC"
         }
@@ -3172,12 +3547,6 @@ def show_inventory():
     if status_filter != "Alle":
         filters["status"] = status_filter
     
-    if media_condition_filter != "Alle":
-        filters["media_condition"] = media_condition_filter
-    
-    if sleeve_condition_filter != "Alle":
-        filters["sleeve_condition"] = sleeve_condition_filter
-    
     # Preis-Filter nur anwenden wenn nicht auf Standard-Werte
     if price_range and (price_range[0] > min_price_db or price_range[1] < max_price_db):
         filters["price_min"] = price_range[0]
@@ -3206,14 +3575,12 @@ def show_inventory():
         "Katalog-Nr. (Z-A)": "cat_no DESC",
         "Jahr (aufsteigend)": "year ASC",
         "Jahr (absteigend)": "year DESC",
+        "Format (A-Z)": "format ASC",
+        "Format (Z-A)": "format DESC",
         "Preis (niedrig → hoch)": "pricing ASC",
         "Preis (hoch → niedrig)": "pricing DESC",
         "Stückzahl (aufsteigend)": "quantity ASC",
         "Stückzahl (absteigend)": "quantity DESC",
-        "Zustand Medium (A-Z)": "media_condition ASC",
-        "Zustand Medium (Z-A)": "media_condition DESC",
-        "Zustand Cover (A-Z)": "sleeve_condition ASC",
-        "Zustand Cover (Z-A)": "sleeve_condition DESC",
         "Erfasst am (aufsteigend)": "created_at ASC",
         "Erfasst am (absteigend)": "created_at DESC"
     }
@@ -3310,11 +3677,14 @@ def show_inventory():
         if "year" in df.columns:
             df["year"] = df["year"].apply(lambda x: int(x) if pd.notna(x) and x else "")
         
-        if "media_condition" in df.columns:
-            df["media_condition"] = df["media_condition"].apply(lambda x: condition_labels.get(x, x) if x else "N/A")
+        # Lade Einstellung für Zustandsbewertung (vor Formatierung)
+        company_settings = db.get_company_settings() or {}
+        show_condition_rating = company_settings.get("show_condition_rating", 1) == 1
         
-        if "sleeve_condition" in df.columns:
-            df["sleeve_condition"] = df["sleeve_condition"].apply(lambda x: condition_labels.get(x, x) if x else "N/A")
+        # Formatierung für Zustands-Spalten nur wenn aktiviert
+        if show_condition_rating:
+            if "general_condition" in df.columns:
+                df["general_condition"] = df["general_condition"].apply(lambda x: condition_labels.get(x, x) if x else "VG")
         
         # Status auf Deutsch konvertieren
         # WICHTIG: Speichere ursprünglichen Status vor Formatierung für Button-Logik
@@ -3332,9 +3702,14 @@ def show_inventory():
         
         # WICHTIG: ID Spalte ausblenden, aber im Hintergrund behalten für Auswahl
         # Wähle relevante Spalten für Anzeige (OHNE "id" und "max_quantity" - wird ausgeblendet, da in quantity integriert)
-        display_columns = ["artist", "title", "label", "cat_no", "year", 
-                          "purchase_price", "pricing", "quantity", "sold_quantity", "media_condition", "sleeve_condition", 
-                          "status", "created_at"]
+        
+        display_columns = ["artist", "title", "label", "cat_no", "year", "format",
+                          "purchase_price", "pricing", "quantity", "sold_quantity", "status", "created_at"]
+        
+        # Füge Zustands-Spalten nur hinzu wenn aktiviert
+        if show_condition_rating:
+            display_columns.extend(["general_condition"])
+        
         available_columns = [col for col in display_columns if col in df.columns]
         
         # Spaltennamen auf Deutsch umbenennen
@@ -3344,12 +3719,12 @@ def show_inventory():
             "label": "Label",
             "cat_no": "Katalog-Nr.",
             "year": "Jahr",
+            "format": "Format",
             "purchase_price": "Einkaufspreis",
             "pricing": "Verkaufspreis",
             "quantity": "Stückzahl",
             "sold_quantity": "Verkaufte Einheiten",
-            "media_condition": "Zustand Medium",
-            "sleeve_condition": "Zustand Cover",
+            "general_condition": "Allgemeiner Zustand",
             "status": "Status",
             "created_at": "Erfasst am"
         }
@@ -3657,12 +4032,16 @@ def show_vinyl_detail_view(item_id: int, db: Database):
             "label": item.get("label", ""),
             "cat_no": item.get("cat_no", ""),
             "year": item.get("year"),
+            "format": item.get("format", ""),
             "pricing": item.get("pricing", 0.0),
             "purchase_price": item.get("purchase_price"),
             "quantity": quantity_from_db,  # WICHTIG: Verwende rohe, nicht formatierte Werte
             "max_quantity": int(max_quantity_from_db) if max_quantity_from_db is not None else quantity_from_db,
             "media_condition": item.get("media_condition", "VG"),
             "sleeve_condition": item.get("sleeve_condition", "VG"),
+            "general_condition": item.get("general_condition", "VG"),
+            "individual_condition_enabled": item.get("individual_condition_enabled", 0) == 1,
+            "individual_condition_text": item.get("individual_condition_text", ""),
             "status": item.get("status", "available"),
             "tracklist": item.get("tracklist", "")
         }
@@ -3687,6 +4066,35 @@ def show_vinyl_detail_view(item_id: int, db: Database):
             key="edit_year"
         )
         edit_data["year"] = year if year > 0 else None
+        
+        # Format-Eingabe
+        format_options = ["12\" LP", "12\" Single", "12\" EP", "10\" LP", "10\" EP", "7\" Single", "7\" EP", "Sonstiges"]
+        current_format = edit_data.get("format", "")
+        current_format_index = format_options.index(current_format) if current_format in format_options else 0
+        
+        format_selection = st.selectbox(
+            "💿 Format",
+            format_options,
+            index=current_format_index if current_format_index < len(format_options) else 0,
+            key="edit_format",
+            help="Format der Schallplatte (Größe und Typ)"
+        )
+        
+        # Wenn "Sonstiges" ausgewählt, zeige Textfeld für freie Eingabe
+        custom_format = ""
+        if format_selection == "Sonstiges":
+            custom_format = st.text_input(
+                "Format (frei)",
+                value=current_format if current_format not in format_options else "",
+                key="edit_format_custom",
+                help="Freie Eingabe für Format (z.B. '12\" Maxi-Single')"
+            )
+            if custom_format:
+                edit_data["format"] = custom_format
+            else:
+                edit_data["format"] = ""
+        else:
+            edit_data["format"] = format_selection
         
         # Hole rohe quantity und max_quantity Werte (nicht formatiert)
         quantity_raw = edit_data.get("quantity", 1)
@@ -3778,26 +4186,114 @@ def show_vinyl_detail_view(item_id: int, db: Database):
         "P": "P - Schlecht (Poor)"
     }
     
-    col_media, col_sleeve = st.columns(2)
-    with col_media:
-        media_condition = st.selectbox(
-            "💿 Zustand Medium (Vinyl)",
-            condition_options,
-            index=condition_options.index(edit_data.get("media_condition", "VG")) if edit_data.get("media_condition", "VG") in condition_options else 3,
-            format_func=lambda x: condition_labels_de.get(x, x),
-            key="edit_media_condition"
-        )
-        edit_data["media_condition"] = media_condition
+    # Lade Einstellungen aus Datenbank
+    db = st.session_state.db
+    company_settings = db.get_company_settings() or {}
+    default_condition = company_settings.get("default_condition", "VG")
+    default_condition_text = company_settings.get("default_condition_text", "")
+    show_individual = company_settings.get("show_individual_conditions", 1) == 1
+    condition_note = company_settings.get("condition_note", "")
+    show_condition_rating = company_settings.get("show_condition_rating", 1) == 1
     
-    with col_sleeve:
-        sleeve_condition = st.selectbox(
-            "📄 Zustand Cover (Sleeve)",
+    # Lade Zustandstexte
+    condition_texts_json = company_settings.get("condition_texts", "{}")
+    try:
+        condition_texts = json.loads(condition_texts_json) if condition_texts_json else {}
+    except:
+        condition_texts = {}
+    
+    # Zustandsbewertung (nur wenn aktiviert)
+    if show_condition_rating:
+        # Allgemeine Zustandsbewertung
+        st.markdown("### 💿 Allgemeine Zustandsbewertung")
+        
+        # Bestimme aktuellen Index für Dropdown
+        current_general_condition = edit_data.get("general_condition", "VG")
+        try:
+            current_index = condition_options.index(current_general_condition)
+        except ValueError:
+            current_index = 3  # Default: VG
+        
+        general_condition = st.selectbox(
+            "Allgemeine Zustandsbewertung",
             condition_options,
-            index=condition_options.index(edit_data.get("sleeve_condition", "VG")) if edit_data.get("sleeve_condition", "VG") in condition_options else 3,
+            index=current_index,
             format_func=lambda x: condition_labels_de.get(x, x),
-            key="edit_sleeve_condition"
+            help="Wählen Sie den allgemeinen Zustand dieser Platte aus",
+            key="edit_general_condition"
         )
-        edit_data["sleeve_condition"] = sleeve_condition
+        edit_data["general_condition"] = general_condition
+        
+        # Zeige Text für ausgewählten Zustand
+        selected_condition = edit_data.get("general_condition", "VG")
+        condition_text = condition_texts.get(selected_condition, "")
+        if condition_text:
+            st.caption(f"ℹ️ {condition_text}")
+        
+        if default_condition_text:
+            st.caption(f"ℹ️ {default_condition_text}")
+        
+        # Optionaler Text unter allgemeiner Zustandsbewertung
+        if condition_note:
+            st.markdown(f"<div style='padding: 10px; background-color: #f0f2f6; border-radius: 5px; margin-top: 10px;'>{condition_note}</div>", unsafe_allow_html=True)
+        
+        # Individuelle Zustandsbewertung pro Platte
+        st.markdown("---")
+        individual_condition_enabled = st.checkbox(
+            "📝 Individuelle Zustandsbewertung aktivieren",
+            value=edit_data.get("individual_condition_enabled", False),
+            help="Aktivieren Sie diese Option, um individuelle Zustandsfelder (Medium/Cover) und optional einen Text für diese Platte hinzuzufügen",
+            key="edit_individual_condition_enabled"
+        )
+        edit_data["individual_condition_enabled"] = individual_condition_enabled
+        
+        # Individuelle Zustandsfelder (nur wenn Einstellungen UND pro-Platte aktiviert)
+        if show_individual and individual_condition_enabled:
+            st.markdown("#### Individuelle Zustandsbewertung")
+            col_media, col_sleeve = st.columns(2)
+            with col_media:
+                media_condition = st.selectbox(
+                    "💿 Zustand Medium (Vinyl)",
+                    condition_options,
+                    index=condition_options.index(edit_data.get("media_condition", "VG")) if edit_data.get("media_condition", "VG") in condition_options else 3,
+                    format_func=lambda x: condition_labels_de.get(x, x),
+                    key="edit_media_condition"
+                )
+                edit_data["media_condition"] = media_condition
+            
+            with col_sleeve:
+                sleeve_condition = st.selectbox(
+                    "📄 Zustand Cover (Sleeve)",
+                    condition_options,
+                    index=condition_options.index(edit_data.get("sleeve_condition", "VG")) if edit_data.get("sleeve_condition", "VG") in condition_options else 3,
+                    format_func=lambda x: condition_labels_de.get(x, x),
+                    key="edit_sleeve_condition"
+                )
+                edit_data["sleeve_condition"] = sleeve_condition
+            
+            # Optionaler Textfeld nach Media/Sleeve Feldern
+            individual_condition_text = st.text_area(
+                "Individueller Zustandstext (optional)",
+                value=edit_data.get("individual_condition_text", ""),
+                help="Geben Sie hier optional eine individuelle Beschreibung des Zustands dieser Platte ein",
+                height=100,
+                key="edit_individual_condition_text"
+            )
+            edit_data["individual_condition_text"] = individual_condition_text
+        else:
+            # Wenn individuelle Felder nicht angezeigt werden, verwende Standard-Zustand
+            edit_data["media_condition"] = default_condition
+            edit_data["sleeve_condition"] = default_condition
+            if not individual_condition_enabled:
+                edit_data["individual_condition_text"] = ""
+        
+        st.markdown("---")
+    else:
+        # Wenn Zustandsbewertung deaktiviert ist, verwende Standard-Werte
+        edit_data["media_condition"] = default_condition
+        edit_data["sleeve_condition"] = default_condition
+        edit_data["individual_condition_enabled"] = False
+        edit_data["individual_condition_text"] = ""
     
     st.markdown("---")
     
@@ -3826,10 +4322,12 @@ def show_vinyl_detail_view(item_id: int, db: Database):
     tracks_by_seite = {}
     for track in st.session_state.edit_tracklist_table.get("tracks", tracklist_table):
         seite = str(track.get("Seite", "")).strip()
-        if seite:
-            if seite not in tracks_by_seite:
-                tracks_by_seite[seite] = []
-            tracks_by_seite[seite].append(track)
+        # Wenn Seite leer ist, verwende "1" als Standard
+        if not seite:
+            seite = "1"
+        if seite not in tracks_by_seite:
+            tracks_by_seite[seite] = []
+        tracks_by_seite[seite].append(track)
     
     sorted_seiten = sorted(tracks_by_seite.keys(), key=lambda x: int(x) if x.isdigit() else 999)
     updated_tracks = []
@@ -3967,12 +4465,16 @@ def show_vinyl_detail_view(item_id: int, db: Database):
                 "label": label if label else None,
                 "cat_no": cat_no if cat_no else None,
                 "year": year if year and year > 0 else None,
+                "format": edit_data.get("format") if edit_data.get("format") else None,
                 "pricing": float(pricing) if pricing else None,
                 "purchase_price": float(purchase_price) if purchase_price else None,
                 "quantity": new_quantity,
                 "max_quantity": new_max_quantity,
                 "media_condition": media_condition,
                 "sleeve_condition": sleeve_condition,
+                "general_condition": edit_data.get("general_condition", "VG"),
+                "individual_condition_enabled": 1 if edit_data.get("individual_condition_enabled", False) else 0,
+                "individual_condition_text": edit_data.get("individual_condition_text", "").strip() if edit_data.get("individual_condition_text") else None,
                 "status": manual_status,  # WICHTIG: Verwende den manuell ausgewählten Status
                 "tracklist": table_to_tracklist_string(updated_tracks) if updated_tracks else None,
                 "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -4354,418 +4856,524 @@ def show_settings():
     st.markdown("---")
     
     # Externe API-Einstellungen
-    st.subheader("🔌 Externe API-Verbindungen")
-    st.markdown("Aktivieren Sie optional externe Datenquellen für erweiterte Metadaten und Preise.")
-    
-    # API-Einstellungen
-    st.subheader("🔑 API-Einstellungen")
-    
-    # Lade aktuelle API-Einstellungen aus Datenbank
-    # #region agent log
-    try:
-        import json as json_log
-        import os as os_log
-        log_path = os.path.join(BASE_DIR, ".cursor", "debug.log")
-        with open(log_path, "a", encoding="utf-8") as f_log:
-            f_log.write(json_log.dumps({"sessionId":"debug-session","runId":"pre-fix","hypothesisId":"A","location":"app.py:3265","message":"Before loading company_settings","data":{"db_in_session_state":"db" in st.session_state},"timestamp":int(os_log.path.getmtime(log_path) if os_log.path.exists(log_path) else 0)}) + "\n")
-    except: pass
-    # #endregion
-    db = st.session_state.db
-    company_settings = db.get_company_settings()
-    # #region agent log
-    try:
-        with open(log_path, "a", encoding="utf-8") as f_log:
-            f_log.write(json_log.dumps({"sessionId":"debug-session","runId":"pre-fix","hypothesisId":"A","location":"app.py:3267","message":"After loading company_settings","data":{"company_settings_is_none":company_settings is None,"has_gemini_key":"gemini_api_key" in (company_settings or {})},"timestamp":int(os_log.path.getmtime(log_path) if os_log.path.exists(log_path) else 0)}) + "\n")
-    except: pass
-    # #endregion
-    api_settings = company_settings or {}
-    
-    # Gemini API
-    gemini_enabled = st.checkbox(
-        "🤖 Gemini API aktivieren",
-        value=api_settings.get("gemini_enabled", 0) == 1 if api_settings else False,
-        help="Aktiviert die Google Gemini Vision API für Cover-Analyse (empfohlen)"
-    )
-    
-    if gemini_enabled:
-        gemini_api_key = st.text_input(
-            "🔑 Gemini API Key",
-            value=api_settings.get("gemini_api_key", "") if api_settings else "",
-            type="password",
-            help="Ihr Google Gemini API Key (erhältlich unter makersuite.google.com/app/apikey)",
-            placeholder="Ihr Gemini API Key hier eingeben...",
-            key="gemini_api_key_input"
+    with st.expander("🔌 Externe API-Verbindungen", expanded=True):
+        st.markdown("Aktivieren Sie optional externe Datenquellen für erweiterte Metadaten und Preise.")
+        
+        # API-Einstellungen
+        st.markdown("#### 🔑 API-Einstellungen")
+        
+        # Lade aktuelle API-Einstellungen aus Datenbank
+        # #region agent log
+        try:
+            import json as json_log
+            import os as os_log
+            log_path = os.path.join(BASE_DIR, ".cursor", "debug.log")
+            with open(log_path, "a", encoding="utf-8") as f_log:
+                f_log.write(json_log.dumps({"sessionId":"debug-session","runId":"pre-fix","hypothesisId":"A","location":"app.py:3265","message":"Before loading company_settings","data":{"db_in_session_state":"db" in st.session_state},"timestamp":int(os_log.path.getmtime(log_path) if os_log.path.exists(log_path) else 0)}) + "\n")
+        except: pass
+        # #endregion
+        db = st.session_state.db
+        company_settings = db.get_company_settings()
+        # #region agent log
+        try:
+            with open(log_path, "a", encoding="utf-8") as f_log:
+                f_log.write(json_log.dumps({"sessionId":"debug-session","runId":"pre-fix","hypothesisId":"A","location":"app.py:3267","message":"After loading company_settings","data":{"company_settings_is_none":company_settings is None,"has_gemini_key":"gemini_api_key" in (company_settings or {})},"timestamp":int(os_log.path.getmtime(log_path) if os_log.path.exists(log_path) else 0)}) + "\n")
+        except: pass
+        # #endregion
+        api_settings = company_settings or {}
+        
+        # Gemini API
+        gemini_enabled = st.checkbox(
+            "🤖 Gemini API aktivieren",
+            value=api_settings.get("gemini_enabled", 0) == 1 if api_settings else False,
+            help="Aktiviert die Google Gemini Vision API für Cover-Analyse (empfohlen)"
         )
         
-        if gemini_api_key:
-            # Teste Verbindung
-            try:
-                from logic.vision_ocr import VisionOCR
-                test_ocr = VisionOCR(api_key=gemini_api_key)
-                st.success("✅ Gemini-Verbindung erfolgreich!")
-            except Exception as e:
-                st.error(f"❌ Gemini-Verbindung fehlgeschlagen: {e}")
+        if gemini_enabled:
+            gemini_api_key = st.text_input(
+                "🔑 Gemini API Key",
+                value=api_settings.get("gemini_api_key", "") if api_settings else "",
+                type="password",
+                help="Ihr Google Gemini API Key (erhältlich unter makersuite.google.com/app/apikey)",
+                placeholder="Ihr Gemini API Key hier eingeben...",
+                key="gemini_api_key_input"
+            )
+            
+            if gemini_api_key:
+                # Teste Verbindung
+                try:
+                    from logic.vision_ocr import VisionOCR
+                    test_ocr = VisionOCR(api_key=gemini_api_key)
+                    st.success("✅ Gemini-Verbindung erfolgreich!")
+                except Exception as e:
+                    st.error(f"❌ Gemini-Verbindung fehlgeschlagen: {e}")
+            else:
+                st.warning("⚠️ Bitte geben Sie einen Gemini API Key ein.")
         else:
-            st.warning("⚠️ Bitte geben Sie einen Gemini API Key ein.")
-    else:
-        gemini_api_key = ""
-        st.info("ℹ️ Gemini API ist deaktiviert. Cover-Analyse wird nicht verfügbar sein.")
-    
-    st.markdown("---")
-    
-    # OpenAI/ChatGPT API
-    openai_enabled = st.checkbox(
-        "🤖 OpenAI API aktivieren",
-        value=api_settings.get("openai_enabled", 0) == 1 if api_settings else False,
-        help="Aktiviert die OpenAI GPT-4 Vision API für Cover-Analyse"
-    )
-    
-    if openai_enabled:
-        openai_api_key = st.text_input(
-            "🔑 OpenAI API Key",
-            value=api_settings.get("openai_api_key", "") if api_settings else "",
-            type="password",
-            help="Ihr OpenAI API Key (erhältlich unter platform.openai.com/api-keys)",
-            placeholder="Ihr OpenAI API Key hier eingeben...",
-            key="openai_api_key_input"
+            gemini_api_key = ""
+            st.info("ℹ️ Gemini API ist deaktiviert. Cover-Analyse wird nicht verfügbar sein.")
+        
+        st.markdown("---")
+        
+        # OpenAI/ChatGPT API
+        openai_enabled = st.checkbox(
+            "🤖 OpenAI API aktivieren",
+            value=api_settings.get("openai_enabled", 0) == 1 if api_settings else False,
+            help="Aktiviert die OpenAI GPT-4 Vision API für Cover-Analyse"
         )
         
-        if openai_api_key:
-            # Teste Verbindung
-            try:
-                from logic.openai_vision_ocr import OpenAIVisionOCR
-                test_ocr = OpenAIVisionOCR(api_key=openai_api_key)
-                st.success("✅ OpenAI-Verbindung erfolgreich!")
-            except Exception as e:
-                st.error(f"❌ OpenAI-Verbindung fehlgeschlagen: {e}")
+        if openai_enabled:
+            openai_api_key = st.text_input(
+                "🔑 OpenAI API Key",
+                value=api_settings.get("openai_api_key", "") if api_settings else "",
+                type="password",
+                help="Ihr OpenAI API Key (erhältlich unter platform.openai.com/api-keys)",
+                placeholder="Ihr OpenAI API Key hier eingeben...",
+                key="openai_api_key_input"
+            )
+            
+            if openai_api_key:
+                # Teste Verbindung
+                try:
+                    from logic.openai_vision_ocr import OpenAIVisionOCR
+                    test_ocr = OpenAIVisionOCR(api_key=openai_api_key)
+                    st.success("✅ OpenAI-Verbindung erfolgreich!")
+                except Exception as e:
+                    st.error(f"❌ OpenAI-Verbindung fehlgeschlagen: {e}")
+            else:
+                st.warning("⚠️ Bitte geben Sie einen OpenAI API Key ein.")
         else:
-            st.warning("⚠️ Bitte geben Sie einen OpenAI API Key ein.")
-    else:
-        openai_api_key = ""
-        st.info("ℹ️ OpenAI API ist deaktiviert.")
-    
-    st.markdown("---")
-    
-    # MusicBrainz API
-    musicbrainz_enabled = st.checkbox(
-        "🎼 MusicBrainz API aktivieren",
-        value=api_settings.get("musicbrainz_enabled", 0) == 1 if api_settings else False,
-        help="Aktiviert MusicBrainz zur Verbesserung der Cover-Analyse (optional, aber empfohlen)"
-    )
-    
-    if musicbrainz_enabled:
-        musicbrainz_api_key = st.text_input(
-            "🔑 MusicBrainz API Key (optional)",
-            value=api_settings.get("musicbrainz_api_key", "") if api_settings else "",
-            type="password",
-            help="Ihr MusicBrainz API Key (optional, für höhere Rate Limits - erhältlich unter musicbrainz.org)",
-            placeholder="Ihr MusicBrainz API Key hier eingeben (optional)...",
-            key="musicbrainz_api_key_input"
+            openai_api_key = ""
+            st.info("ℹ️ OpenAI API ist deaktiviert.")
+        
+        st.markdown("---")
+        
+        # MusicBrainz API
+        musicbrainz_enabled = st.checkbox(
+            "🎼 MusicBrainz API aktivieren",
+            value=api_settings.get("musicbrainz_enabled", 0) == 1 if api_settings else False,
+            help="Aktiviert MusicBrainz zur Verbesserung der Cover-Analyse (optional, aber empfohlen)"
         )
         
-        if musicbrainz_api_key:
-            # Teste Verbindung
-            try:
-                from logic.musicbrainz_client import MusicBrainzClient
-                test_mb = MusicBrainzClient(api_key=musicbrainz_api_key)
-                # Teste mit einer einfachen Suche
-                test_result = test_mb.search_release("The Beatles", "Abbey Road")
-                if test_result:
-                    st.success("✅ MusicBrainz-Verbindung erfolgreich!")
-                else:
-                    st.warning("⚠️ MusicBrainz-Verbindung getestet, aber keine Ergebnisse gefunden.")
-            except Exception as e:
-                st.error(f"❌ MusicBrainz-Verbindung fehlgeschlagen: {e}")
+        if musicbrainz_enabled:
+            musicbrainz_api_key = st.text_input(
+                "🔑 MusicBrainz API Key (optional)",
+                value=api_settings.get("musicbrainz_api_key", "") if api_settings else "",
+                type="password",
+                help="Ihr MusicBrainz API Key (optional, für höhere Rate Limits - erhältlich unter musicbrainz.org)",
+                placeholder="Ihr MusicBrainz API Key hier eingeben (optional)...",
+                key="musicbrainz_api_key_input"
+            )
+            
+            if musicbrainz_api_key:
+                # Teste Verbindung
+                try:
+                    from logic.musicbrainz_client import MusicBrainzClient
+                    test_mb = MusicBrainzClient(api_key=musicbrainz_api_key)
+                    # Teste mit einer einfachen Suche
+                    test_result = test_mb.search_release("The Beatles", "Abbey Road")
+                    if test_result:
+                        st.success("✅ MusicBrainz-Verbindung erfolgreich!")
+                    else:
+                        st.warning("⚠️ MusicBrainz-Verbindung getestet, aber keine Ergebnisse gefunden.")
+                except Exception as e:
+                    st.error(f"❌ MusicBrainz-Verbindung fehlgeschlagen: {e}")
+            else:
+                st.info("ℹ️ MusicBrainz kann auch ohne API Key verwendet werden (niedrigere Rate Limits).")
         else:
-            st.info("ℹ️ MusicBrainz kann auch ohne API Key verwendet werden (niedrigere Rate Limits).")
-    else:
-        musicbrainz_api_key = ""
-        st.info("ℹ️ MusicBrainz ist deaktiviert. Cover-Analyse verwendet nur Gemini.")
-    
-    st.markdown("---")
-    
-    # Discogs-Einstellungen
-    discogs_enabled = st.checkbox(
-        "🎵 Discogs Suche aktivieren",
-        value=api_settings.get("discogs_enabled", 0) == 1 if api_settings else st.session_state.get("settings_discogs_enabled", False),
-        help="Aktiviert die Suche nach Releases und Preisen bei Discogs"
-    )
-    
-    if discogs_enabled:
-        discogs_token = st.text_input(
-            "🔑 Discogs Token",
-            value=api_settings.get("discogs_api_key", "") if api_settings else st.session_state.get("settings_discogs_token", ""),
-            type="password",
-            help="Ihr Discogs User-Token (erhältlich unter discogs.com/settings/developers)",
-            placeholder="Ihr Discogs Token hier eingeben...",
-            key="discogs_token_input"
+            musicbrainz_api_key = ""
+            st.info("ℹ️ MusicBrainz ist deaktiviert. Cover-Analyse verwendet nur Gemini.")
+        
+        st.markdown("---")
+        
+        # Discogs-Einstellungen
+        discogs_enabled = st.checkbox(
+            "🎵 Discogs Suche aktivieren",
+            value=api_settings.get("discogs_enabled", 0) == 1 if api_settings else st.session_state.get("settings_discogs_enabled", False),
+            help="Aktiviert die Suche nach Releases und Preisen bei Discogs"
         )
         
-        if discogs_token:
-            # Versuche Client zu initialisieren/aktualisieren
-            try:
-                test_client = DiscogsClient(token=discogs_token)
-                st.success("✅ Discogs-Verbindung erfolgreich!")
-                # Aktualisiere Session State Client
-                st.session_state.discogs_client = test_client
-            except Exception as e:
-                st.error(f"❌ Discogs-Verbindung fehlgeschlagen: {e}")
+        if discogs_enabled:
+            discogs_token = st.text_input(
+                "🔑 Discogs Token",
+                value=api_settings.get("discogs_api_key", "") if api_settings else st.session_state.get("settings_discogs_token", ""),
+                type="password",
+                help="Ihr Discogs User-Token (erhältlich unter discogs.com/settings/developers)",
+                placeholder="Ihr Discogs Token hier eingeben...",
+                key="discogs_token_input"
+            )
+            
+            if discogs_token:
+                # Versuche Client zu initialisieren/aktualisieren
+                try:
+                    test_client = DiscogsClient(token=discogs_token)
+                    st.success("✅ Discogs-Verbindung erfolgreich!")
+                    # Aktualisiere Session State Client
+                    st.session_state.discogs_client = test_client
+                except Exception as e:
+                    st.error(f"❌ Discogs-Verbindung fehlgeschlagen: {e}")
+                    st.session_state.discogs_client = None
+            else:
+                st.warning("⚠️ Bitte geben Sie einen Discogs Token ein.")
                 st.session_state.discogs_client = None
         else:
-            st.warning("⚠️ Bitte geben Sie einen Discogs Token ein.")
+            discogs_token = ""
+            # Deaktiviere Client wenn Checkbox deaktiviert
             st.session_state.discogs_client = None
-    else:
-        discogs_token = ""
-        # Deaktiviere Client wenn Checkbox deaktiviert
-        st.session_state.discogs_client = None
-        st.info("ℹ️ Discogs-Suche ist deaktiviert. Es wird nur die lokale KI-Analyse verwendet.")
+            st.info("ℹ️ Discogs-Suche ist deaktiviert. Es wird nur die lokale KI-Analyse verwendet.")
     
     st.markdown("---")
     
     # Steuer-Einstellungen
-    st.subheader("📋 Steuer-Einstellungen")
-    # db und company_settings bereits oben geladen (Zeile 3274-3275), verwende vorhandene Variablen
-    current_tax_status = company_settings.get("tax_status", "kleinunternehmer") if company_settings else "kleinunternehmer"
-    
-    # Steuer-Status-Auswahl
-    tax_status_options = ["Kleinunternehmer (§ 19 UStG)", "Regelbesteuerung / Differenzbesteuerung (§ 25a UStG)"]
-    tax_status_map = {
-        "Kleinunternehmer (§ 19 UStG)": "kleinunternehmer",
-        "Regelbesteuerung / Differenzbesteuerung (§ 25a UStG)": "differenzbesteuerung"
-    }
-    
-    current_tax_index = 0 if current_tax_status == "kleinunternehmer" else 1
-    
-    tax_status_display = st.radio(
-        "Steuer-Status",
-        tax_status_options,
-        index=current_tax_index,
-        key="tax_status_radio"
-    )
-    tax_status_value = tax_status_map[tax_status_display]
+    with st.expander("📋 Steuer-Einstellungen", expanded=False):
+        # db und company_settings bereits oben geladen (Zeile 3274-3275), verwende vorhandene Variablen
+        current_tax_status = company_settings.get("tax_status", "kleinunternehmer") if company_settings else "kleinunternehmer"
+        
+        # Steuer-Status-Auswahl
+        tax_status_options = ["Kleinunternehmer (§ 19 UStG)", "Regelbesteuerung / Differenzbesteuerung (§ 25a UStG)"]
+        tax_status_map = {
+            "Kleinunternehmer (§ 19 UStG)": "kleinunternehmer",
+            "Regelbesteuerung / Differenzbesteuerung (§ 25a UStG)": "differenzbesteuerung"
+        }
+        
+        current_tax_index = 0 if current_tax_status == "kleinunternehmer" else 1
+        
+        tax_status_display = st.radio(
+            "Steuer-Status",
+            tax_status_options,
+            index=current_tax_index,
+            key="tax_status_radio"
+        )
+        tax_status_value = tax_status_map[tax_status_display]
     
     st.markdown("---")
     
     # Firmendaten
-    st.subheader("🏢 Firmendaten")
-    
-    company_name = st.text_input(
-        "Firmenname",
-        value=company_settings.get("company_name", "") if company_settings else "",
-        key="company_name_input"
-    )
-    
-    # Alte Adressfelder laden (für Migration)
-    old_address = company_settings.get("company_address", "") if company_settings else ""
-    
-    # Neue Adressfelder laden
-    company_street = company_settings.get("company_street", "") if company_settings else ""
-    company_house_number = company_settings.get("company_house_number", "") if company_settings else ""
-    company_postal_code = company_settings.get("company_postal_code", "") if company_settings else ""
-    company_city = company_settings.get("company_city", "") if company_settings else ""
-    company_state = company_settings.get("company_state", "") if company_settings else ""
-    company_country = company_settings.get("company_country", "Deutschland") if company_settings else "Deutschland"
-    
-    # Falls neue Felder leer, versuche aus altem address Feld zu parsen
-    if not company_street and old_address:
-        parsed = db.parse_address(old_address)
-        company_street = parsed.get('street', '') or ''
-        company_house_number = parsed.get('house_number', '') or ''
-        company_postal_code = parsed.get('postal_code', '') or ''
-        company_city = parsed.get('city', '') or ''
-        company_state = parsed.get('state', '') or ''
-        company_country = parsed.get('country', 'Deutschland') or 'Deutschland'
-    
-    st.markdown("**Adresse:**")
-    col_street, col_house = st.columns([3, 1])
-    with col_street:
-        company_street = st.text_input("Straße", value=company_street, key="company_street_input")
-    with col_house:
-        company_house_number = st.text_input("Hausnummer", value=company_house_number, key="company_house_number_input")
-    
-    col_plz, col_city = st.columns([1, 3])
-    with col_plz:
-        company_postal_code = st.text_input("PLZ", value=company_postal_code, key="company_postal_code_input")
-    with col_city:
-        company_city = st.text_input("Ort", value=company_city, key="company_city_input")
-    
-    col_state, col_country = st.columns([2, 2])
-    with col_state:
-        company_state = st.text_input("Bundesland/Region", value=company_state if company_state else "", key="company_state_input")
-    with col_country:
-        company_country = st.text_input("Land", value=company_country if company_country else "Deutschland", key="company_country_input")
-    
-    tax_number = st.text_input(
-        "Steuernummer",
-        value=company_settings.get("tax_number", "") if company_settings else "",
-        key="tax_number_input"
-    )
-    
-    invoice_prefix = st.text_input(
-        "Rechnungsnummer-Präfix",
-        value=company_settings.get("invoice_prefix", "RE") if company_settings else "RE",
-        key="invoice_prefix_input",
-        help="Präfix für Rechnungsnummern (z.B. 'RE' für RE-2024-0001)"
-    )
+    with st.expander("🏢 Firmendaten", expanded=False):
+        company_name = st.text_input(
+            "Firmenname",
+            value=company_settings.get("company_name", "") if company_settings else "",
+            key="company_name_input"
+        )
+        
+        # Alte Adressfelder laden (für Migration)
+        old_address = company_settings.get("company_address", "") if company_settings else ""
+        
+        # Neue Adressfelder laden
+        company_street = company_settings.get("company_street", "") if company_settings else ""
+        company_house_number = company_settings.get("company_house_number", "") if company_settings else ""
+        company_postal_code = company_settings.get("company_postal_code", "") if company_settings else ""
+        company_city = company_settings.get("company_city", "") if company_settings else ""
+        company_state = company_settings.get("company_state", "") if company_settings else ""
+        company_country = company_settings.get("company_country", "Deutschland") if company_settings else "Deutschland"
+        
+        # Falls neue Felder leer, versuche aus altem address Feld zu parsen
+        if not company_street and old_address:
+            parsed = db.parse_address(old_address)
+            company_street = parsed.get('street', '') or ''
+            company_house_number = parsed.get('house_number', '') or ''
+            company_postal_code = parsed.get('postal_code', '') or ''
+            company_city = parsed.get('city', '') or ''
+            company_state = parsed.get('state', '') or ''
+            company_country = parsed.get('country', 'Deutschland') or 'Deutschland'
+        
+        st.markdown("**Adresse:**")
+        col_street, col_house = st.columns([3, 1])
+        with col_street:
+            company_street = st.text_input("Straße", value=company_street, key="company_street_input")
+        with col_house:
+            company_house_number = st.text_input("Hausnummer", value=company_house_number, key="company_house_number_input")
+        
+        col_plz, col_city = st.columns([1, 3])
+        with col_plz:
+            company_postal_code = st.text_input("PLZ", value=company_postal_code, key="company_postal_code_input")
+        with col_city:
+            company_city = st.text_input("Ort", value=company_city, key="company_city_input")
+        
+        col_state, col_country = st.columns([2, 2])
+        with col_state:
+            company_state = st.text_input("Bundesland/Region", value=company_state if company_state else "", key="company_state_input")
+        with col_country:
+            company_country = st.text_input("Land", value=company_country if company_country else "Deutschland", key="company_country_input")
+        
+        tax_number = st.text_input(
+            "Steuernummer",
+            value=company_settings.get("tax_number", "") if company_settings else "",
+            key="tax_number_input"
+        )
+        
+        invoice_prefix = st.text_input(
+            "Rechnungsnummer-Präfix",
+            value=company_settings.get("invoice_prefix", "RE") if company_settings else "RE",
+            key="invoice_prefix_input",
+            help="Präfix für Rechnungsnummern (z.B. 'RE' für RE-2024-0001)"
+        )
     
     st.markdown("---")
     
     # Versandeinstellungen
-    st.subheader("🚚 Versandeinstellungen")
-    
-    # Lade bestehende Versandoptionen
-    default_shipping_options = {
-        "standard": {"name": "Standardversand", "cost": 5.00},
-        "express": {"name": "Expressversand", "cost": 10.00},
-        "pickup": {"name": "Abholung", "cost": 0.00}
-    }
-    
-    shipping_options_json = company_settings.get("shipping_options") if company_settings else None
-    if shipping_options_json:
-        try:
-            current_shipping_options = json.loads(shipping_options_json)
-        except (json.JSONDecodeError, TypeError):
+    with st.expander("🚚 Versandeinstellungen", expanded=False):
+        # Lade bestehende Versandoptionen
+        default_shipping_options = {
+            "standard": {"name": "Standardversand", "cost": 5.00},
+            "express": {"name": "Expressversand", "cost": 10.00},
+            "pickup": {"name": "Abholung", "cost": 0.00}
+        }
+        
+        shipping_options_json = company_settings.get("shipping_options") if company_settings else None
+        if shipping_options_json:
+            try:
+                current_shipping_options = json.loads(shipping_options_json)
+            except (json.JSONDecodeError, TypeError):
+                current_shipping_options = default_shipping_options
+        else:
             current_shipping_options = default_shipping_options
-    else:
-        current_shipping_options = default_shipping_options
-    
-    # Formular für Versandoptionen
-    col_std_name, col_std_cost = st.columns([2, 1])
-    with col_std_name:
-        shipping_standard_name = st.text_input(
-            "Standardversand - Name",
-            value=current_shipping_options.get("standard", {}).get("name", "Standardversand"),
-            key="shipping_standard_name"
-        )
-    with col_std_cost:
-        shipping_standard_cost = st.number_input(
-            "Preis (EUR)",
-            min_value=0.0,
-            value=float(current_shipping_options.get("standard", {}).get("cost", 5.00)),
-            step=0.01,
-            key="shipping_standard_cost"
-        )
-    
-    col_exp_name, col_exp_cost = st.columns([2, 1])
-    with col_exp_name:
-        shipping_express_name = st.text_input(
-            "Expressversand - Name",
-            value=current_shipping_options.get("express", {}).get("name", "Expressversand"),
-            key="shipping_express_name"
-        )
-    with col_exp_cost:
-        shipping_express_cost = st.number_input(
-            "Preis (EUR)",
-            min_value=0.0,
-            value=float(current_shipping_options.get("express", {}).get("cost", 10.00)),
-            step=0.01,
-            key="shipping_express_cost"
-        )
-    
-    col_pick_name, col_pick_cost = st.columns([2, 1])
-    with col_pick_name:
-        shipping_pickup_name = st.text_input(
-            "Abholung - Name",
-            value=current_shipping_options.get("pickup", {}).get("name", "Abholung"),
-            key="shipping_pickup_name"
-        )
-    with col_pick_cost:
-        shipping_pickup_cost = st.number_input(
-            "Preis (EUR)",
-            min_value=0.0,
-            value=float(current_shipping_options.get("pickup", {}).get("cost", 0.00)),
-            step=0.01,
-            key="shipping_pickup_cost"
-        )
+        
+        # Formular für Versandoptionen
+        col_std_name, col_std_cost = st.columns([2, 1])
+        with col_std_name:
+            shipping_standard_name = st.text_input(
+                "Standardversand - Name",
+                value=current_shipping_options.get("standard", {}).get("name", "Standardversand"),
+                key="shipping_standard_name"
+            )
+        with col_std_cost:
+            shipping_standard_cost = st.number_input(
+                "Preis (EUR)",
+                min_value=0.0,
+                value=float(current_shipping_options.get("standard", {}).get("cost", 5.00)),
+                step=0.01,
+                key="shipping_standard_cost"
+            )
+        
+        col_exp_name, col_exp_cost = st.columns([2, 1])
+        with col_exp_name:
+            shipping_express_name = st.text_input(
+                "Expressversand - Name",
+                value=current_shipping_options.get("express", {}).get("name", "Expressversand"),
+                key="shipping_express_name"
+            )
+        with col_exp_cost:
+            shipping_express_cost = st.number_input(
+                "Preis (EUR)",
+                min_value=0.0,
+                value=float(current_shipping_options.get("express", {}).get("cost", 10.00)),
+                step=0.01,
+                key="shipping_express_cost"
+            )
+        
+        col_pick_name, col_pick_cost = st.columns([2, 1])
+        with col_pick_name:
+            shipping_pickup_name = st.text_input(
+                "Abholung - Name",
+                value=current_shipping_options.get("pickup", {}).get("name", "Abholung"),
+                key="shipping_pickup_name"
+            )
+        with col_pick_cost:
+            shipping_pickup_cost = st.number_input(
+                "Preis (EUR)",
+                min_value=0.0,
+                value=float(current_shipping_options.get("pickup", {}).get("cost", 0.00)),
+                step=0.01,
+                key="shipping_pickup_cost"
+            )
     
     st.markdown("---")
     
     # Daten-Synchronisation
-    st.subheader("💾 Daten-Synchronisation")
-    st.markdown("Laden Sie Ihre Datenbank, Bilder und Rechnungen herunter oder hoch, um sie lokal zu speichern oder zu synchronisieren.")
-    
-    # Status-Anzeige
-    status = check_local_data_status()
-    
-    col_status1, col_status2, col_status3 = st.columns(3)
-    
-    with col_status1:
-        if status["db_exists"]:
-            db_size_mb = status["db_size"] / (1024 * 1024)
-            st.metric("📊 Datenbank", f"{db_size_mb:.2f} MB", "Vorhanden")
-        else:
-            st.metric("📊 Datenbank", "Nicht vorhanden", "Leer")
-    
-    with col_status2:
-        if status["images_exists"]:
-            st.metric("🖼️ Bilder", f"{status['images_count']} Dateien", "Vorhanden")
-        else:
-            st.metric("🖼️ Bilder", "0 Dateien", "Leer")
-    
-    with col_status3:
-        if status["invoices_exists"]:
-            st.metric("🧾 Rechnungen", f"{status['invoices_count']} PDFs", "Vorhanden")
-        else:
-            st.metric("🧾 Rechnungen", "0 PDFs", "Leer")
-    
-    if status["total_size"] > 0:
-        total_size_mb = status["total_size"] / (1024 * 1024)
-        st.info(f"💾 Gesamtgröße aller Daten: {total_size_mb:.2f} MB")
-    
-    st.markdown("---")
-    
-    # Download-Bereich
-    st.markdown("#### 📥 Daten herunterladen")
-    st.markdown("Erstellen Sie eine Sicherungskopie aller Daten (Datenbank, Bilder, Rechnungen) als ZIP-Datei.")
-    
-    if st.button("📥 Alle Daten herunterladen", type="primary", use_container_width=True, key="download_data"):
-        zip_data = download_database_zip()
-        if zip_data:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"vinyllocal_backup_{timestamp}.zip"
-            st.download_button(
-                label="⬇️ ZIP-Datei herunterladen",
-                data=zip_data,
-                file_name=filename,
-                mime="application/zip",
-                type="primary",
-                use_container_width=True,
-                key="download_zip_button"
-            )
-            st.success("✅ ZIP-Datei erstellt! Klicken Sie auf den Download-Button.")
-        else:
-            st.error("❌ Fehler beim Erstellen der ZIP-Datei.")
-    
-    st.markdown("---")
-    
-    # Upload-Bereich
-    st.markdown("#### 📤 Daten hochladen")
-    st.markdown("Laden Sie eine zuvor heruntergeladene ZIP-Datei hoch, um Ihre Daten zu synchronisieren oder wiederherzustellen.")
-    st.warning("⚠️ **Wichtig:** Beim Hochladen werden die aktuellen Daten durch die hochgeladene Version ersetzt. Ein automatisches Backup wird erstellt.")
-    
-    uploaded_file = st.file_uploader(
-        "Wählen Sie eine ZIP-Datei aus",
-        type=['zip'],
-        help="Wählen Sie eine zuvor heruntergeladene Backup-ZIP-Datei aus.",
-        key="upload_database_zip"
-    )
-    
-    if uploaded_file is not None:
-        file_size_mb = len(uploaded_file.getvalue()) / (1024 * 1024)
-        st.info(f"📁 Datei: {uploaded_file.name} ({file_size_mb:.2f} MB)")
+    with st.expander("💾 Daten-Synchronisation", expanded=False):
+        st.markdown("Laden Sie Ihre Datenbank, Bilder und Rechnungen herunter oder hoch, um sie lokal zu speichern oder zu synchronisieren.")
         
-        if st.button("📤 Daten hochladen und ersetzen", type="primary", use_container_width=True, key="upload_data"):
-            with st.spinner("Daten werden hochgeladen und extrahiert..."):
-                result = upload_database_zip(uploaded_file)
-            
-            if result["success"]:
-                st.success(f"✅ {result['message']}")
-                if "backup_file" in result:
-                    st.info(f"💾 Backup gespeichert in: {result['backup_file']}")
-                st.info("🔄 Die App wird neu geladen...")
-                st.rerun()
+        # Status-Anzeige
+        status = check_local_data_status()
+        
+        col_status1, col_status2, col_status3 = st.columns(3)
+        
+        with col_status1:
+            if status["db_exists"]:
+                db_size_mb = status["db_size"] / (1024 * 1024)
+                st.metric("📊 Datenbank", f"{db_size_mb:.2f} MB", "Vorhanden")
             else:
-                st.error(f"❌ {result['message']}")
+                st.metric("📊 Datenbank", "Nicht vorhanden", "Leer")
+        
+        with col_status2:
+            if status["images_exists"]:
+                st.metric("🖼️ Bilder", f"{status['images_count']} Dateien", "Vorhanden")
+            else:
+                st.metric("🖼️ Bilder", "0 Dateien", "Leer")
+        
+        with col_status3:
+            if status["invoices_exists"]:
+                st.metric("🧾 Rechnungen", f"{status['invoices_count']} PDFs", "Vorhanden")
+            else:
+                st.metric("🧾 Rechnungen", "0 PDFs", "Leer")
+        
+        if status["total_size"] > 0:
+            total_size_mb = status["total_size"] / (1024 * 1024)
+            st.info(f"💾 Gesamtgröße aller Daten: {total_size_mb:.2f} MB")
+        
+        st.markdown("---")
+        
+        # Download-Bereich
+        st.markdown("#### 📥 Daten herunterladen")
+        st.markdown("Erstellen Sie eine Sicherungskopie aller Daten (Datenbank, Bilder, Rechnungen) als ZIP-Datei.")
+        
+        if st.button("📥 Alle Daten herunterladen", type="primary", use_container_width=True, key="download_data"):
+            zip_data = download_database_zip()
+            if zip_data:
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                filename = f"vinyllocal_backup_{timestamp}.zip"
+                st.download_button(
+                    label="⬇️ ZIP-Datei herunterladen",
+                    data=zip_data,
+                    file_name=filename,
+                    mime="application/zip",
+                    type="primary",
+                    use_container_width=True,
+                    key="download_zip_button"
+                )
+                st.success("✅ ZIP-Datei erstellt! Klicken Sie auf den Download-Button.")
+            else:
+                st.error("❌ Fehler beim Erstellen der ZIP-Datei.")
+        
+        st.markdown("---")
+        
+        # Upload-Bereich
+        st.markdown("#### 📤 Daten hochladen")
+        st.markdown("Laden Sie eine zuvor heruntergeladene ZIP-Datei hoch, um Ihre Daten zu synchronisieren oder wiederherzustellen.")
+        st.warning("⚠️ **Wichtig:** Beim Hochladen werden die aktuellen Daten durch die hochgeladene Version ersetzt. Ein automatisches Backup wird erstellt.")
+        
+        uploaded_file = st.file_uploader(
+            "Wählen Sie eine ZIP-Datei aus",
+            type=['zip'],
+            help="Wählen Sie eine zuvor heruntergeladene Backup-ZIP-Datei aus.",
+            key="upload_database_zip"
+        )
+        
+        if uploaded_file is not None:
+            file_size_mb = len(uploaded_file.getvalue()) / (1024 * 1024)
+            st.info(f"📁 Datei: {uploaded_file.name} ({file_size_mb:.2f} MB)")
+            
+            if st.button("📤 Daten hochladen und ersetzen", type="primary", use_container_width=True, key="upload_data"):
+                with st.spinner("Daten werden hochgeladen und extrahiert..."):
+                    result = upload_database_zip(uploaded_file)
+                
+                if result["success"]:
+                    st.success(f"✅ {result['message']}")
+                    if "backup_file" in result:
+                        st.info(f"💾 Backup gespeichert in: {result['backup_file']}")
+                    st.info("🔄 Die App wird neu geladen...")
+                    st.rerun()
+                else:
+                    st.error(f"❌ {result['message']}")
+    
+    st.markdown("---")
+    
+    # Zustandsbewertung
+    with st.expander("💿 Zustandsbewertung", expanded=False):
+        condition_options = ["M", "NM", "VG+", "VG", "G", "P"]
+        condition_labels_de = {
+            "M": "M - Neuwertig (Mint)",
+            "NM": "NM - Fast neuwertig (Near Mint)",
+            "VG+": "VG+ - Sehr gut plus (Very Good Plus)",
+            "VG": "VG - Sehr gut (Very Good)",
+            "G": "G - Gut (Good)",
+            "P": "P - Schlecht (Poor)"
+        }
+        
+        # Standard-Zustand
+        current_default_condition = company_settings.get("default_condition", "VG") if company_settings else "VG"
+        default_condition_index = condition_options.index(current_default_condition) if current_default_condition in condition_options else 3
+        
+        default_condition = st.selectbox(
+            "Standard-Zustand",
+            condition_options,
+            index=default_condition_index,
+            format_func=lambda x: condition_labels_de.get(x, x),
+            help="Standard-Zustand, der für alle Platten gilt"
+        )
+        
+        # Beschreibung zur Zustandsbewertung
+        default_condition_text = st.text_input(
+            "Beschreibung zur Zustandsbewertung",
+            value=company_settings.get("default_condition_text", "") if company_settings else "",
+            help="Zusätzliche Beschreibung zur allgemeinen Zustandsbewertung (z.B. 'Alle Platten werden vor dem Verkauf geprüft')"
+        )
+        
+        # Individuelle Zustandsfelder anzeigen
+        show_individual_conditions = st.checkbox(
+            "Individuelle Zustandsfelder anzeigen",
+            value=company_settings.get("show_individual_conditions", 1) == 1 if company_settings else True,
+            help="Wenn aktiviert, werden die Felder 'Zustand Medium' und 'Zustand Cover' in der Scan Session angezeigt"
+        )
+        
+        # Optionaler Text
+        condition_note = st.text_area(
+            "Optionaler Text",
+            value=company_settings.get("condition_note", "") if company_settings else "",
+            help="Optionaler Text, der unter der allgemeinen Zustandsbewertung angezeigt wird",
+            height=100
+        )
+        
+        # Zustandsbewertung anzeigen
+        show_condition_rating = st.checkbox(
+            "Zustandsbewertung anzeigen",
+            value=company_settings.get("show_condition_rating", 1) == 1 if company_settings else True,
+            help="Wenn aktiviert, wird die Zustandsbewertung in der Scan Session und Detailansicht angezeigt"
+        )
+        
+        # Zustandstexte pro Zustand
+        st.markdown("#### Zustandstexte")
+        st.markdown("Definieren Sie für jeden Zustand einen Text, der automatisch angezeigt wird, wenn dieser Zustand bei einer Platte ausgewählt wird.")
+        
+        # Lade bestehende Zustandstexte
+        condition_texts_json = company_settings.get("condition_texts", "{}") if company_settings else "{}"
+        try:
+            condition_texts_dict = json.loads(condition_texts_json) if condition_texts_json else {}
+        except:
+            condition_texts_dict = {}
+        
+        condition_text_m = st.text_input(
+            f"Text für {condition_labels_de.get('M', 'M')}",
+            value=condition_texts_dict.get("M", ""),
+            help="Text der angezeigt wird, wenn Zustand 'M' ausgewählt wird",
+            key="condition_text_m"
+        )
+        
+        condition_text_nm = st.text_input(
+            f"Text für {condition_labels_de.get('NM', 'NM')}",
+            value=condition_texts_dict.get("NM", ""),
+            help="Text der angezeigt wird, wenn Zustand 'NM' ausgewählt wird",
+            key="condition_text_nm"
+        )
+        
+        condition_text_vg_plus = st.text_input(
+            f"Text für {condition_labels_de.get('VG+', 'VG+')}",
+            value=condition_texts_dict.get("VG+", ""),
+            help="Text der angezeigt wird, wenn Zustand 'VG+' ausgewählt wird",
+            key="condition_text_vg_plus"
+        )
+        
+        condition_text_vg = st.text_input(
+            f"Text für {condition_labels_de.get('VG', 'VG')}",
+            value=condition_texts_dict.get("VG", ""),
+            help="Text der angezeigt wird, wenn Zustand 'VG' ausgewählt wird",
+            key="condition_text_vg"
+        )
+        
+        condition_text_g = st.text_input(
+            f"Text für {condition_labels_de.get('G', 'G')}",
+            value=condition_texts_dict.get("G", ""),
+            help="Text der angezeigt wird, wenn Zustand 'G' ausgewählt wird",
+            key="condition_text_g"
+        )
+        
+        condition_text_p = st.text_input(
+            f"Text für {condition_labels_de.get('P', 'P')}",
+            value=condition_texts_dict.get("P", ""),
+            help="Text der angezeigt wird, wenn Zustand 'P' ausgewählt wird",
+            key="condition_text_p"
+        )
     
     st.markdown("---")
     
@@ -4810,7 +5418,21 @@ def show_settings():
             "musicbrainz_api_key": musicbrainz_api_key.strip() if musicbrainz_api_key else None,
             "musicbrainz_enabled": 1 if musicbrainz_enabled else 0,
             "discogs_api_key": discogs_token.strip() if discogs_token else None,
-            "discogs_enabled": 1 if discogs_enabled else 0
+            "discogs_enabled": 1 if discogs_enabled else 0,
+            # Zustandsbewertung
+            "default_condition": default_condition,
+            "default_condition_text": default_condition_text.strip() if default_condition_text else None,
+            "show_individual_conditions": 1 if show_individual_conditions else 0,
+            "condition_note": condition_note.strip() if condition_note else None,
+            "show_condition_rating": 1 if show_condition_rating else 0,
+            "condition_texts": json.dumps({
+                "M": condition_text_m.strip() if condition_text_m else "",
+                "NM": condition_text_nm.strip() if condition_text_nm else "",
+                "VG+": condition_text_vg_plus.strip() if condition_text_vg_plus else "",
+                "VG": condition_text_vg.strip() if condition_text_vg else "",
+                "G": condition_text_g.strip() if condition_text_g else "",
+                "P": condition_text_p.strip() if condition_text_p else ""
+            })
         }
         # #region agent log
         try:
@@ -6301,6 +6923,39 @@ def main():
         st.code(traceback.format_exc())
         return
     
+    # Prüfe Query-Parameter für E-Mail-Bestätigung
+    page_param = st.query_params.get("page", "")
+    if page_param == "verify_email":
+        show_email_verification()
+        return
+    
+    # Prüfe ob erneutes Senden der Bestätigungs-E-Mail angezeigt werden soll
+    if st.session_state.get("show_resend_verification", False):
+        show_resend_verification()
+        return
+    
+    # Prüfe Authentifizierung
+    if not check_authentication():
+        # Nicht eingeloggt - zeige Login oder Registrierung
+        if st.session_state.get("show_register", False):
+            show_register()
+        else:
+            show_login()
+        return
+    
+    # Ab hier: Benutzer ist eingeloggt
+    
+    # Prüfe ob E-Mail-Adresse vorhanden ist
+    current_user = st.session_state.get("current_user")
+    needs_email_update = st.session_state.get("needs_email_update", False)
+    
+    if needs_email_update or (current_user and (not current_user.get("email") or not current_user.get("email").strip())):
+        # E-Mail fehlt - zeige E-Mail-Nachträgungs-Seite
+        show_email_update()
+        return
+    
+    # Ab hier: Benutzer ist eingeloggt und hat E-Mail
+    
     # Sidebar Navigation
     # #region agent log
     try:
@@ -6309,6 +6964,19 @@ def main():
     except: pass
     # #endregion
     st.sidebar.title("🎵 VinylLocal AI")
+    
+    # Zeige eingeloggten Benutzer
+    current_user = st.session_state.current_user
+    if current_user:
+        st.sidebar.markdown(f"**👤 {current_user.get('username', 'Benutzer')}**")
+    
+    st.sidebar.markdown("---")
+    
+    # Logout-Button
+    if st.sidebar.button("🚪 Abmelden", use_container_width=True):
+        logout()
+        return
+    
     st.sidebar.markdown("---")
     
     # Navigation mit Session State für programmatische Navigation
@@ -6333,7 +7001,11 @@ def main():
         index=default_index
     )
     
-    # Seiteninhalt anzeigen
+    # Seiteninhalt anzeigen (nur wenn eingeloggt)
+    if not check_authentication():
+        show_login()
+        return
+    
     if page == "Dashboard":
         show_dashboard()
     elif page == "Scan-Session":

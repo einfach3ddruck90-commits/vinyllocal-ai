@@ -98,6 +98,22 @@ Oder falls `python` nicht funktioniert:
 py test_run.py
 ```
 
+### E-Mail-Registrierung testen
+
+Nach der SMTP-Konfiguration können Sie die E-Mail-Funktionalität testen:
+
+1. Starten Sie die App
+2. Gehen Sie zu **Einstellungen → SMTP-Diagnose**
+3. Geben Sie eine Test-E-Mail-Adresse ein
+4. Klicken Sie auf "Test-E-Mail senden"
+5. Prüfen Sie Ihr Postfach (auch den Spam-Ordner)
+
+**Troubleshooting:**
+- Falls die E-Mail nicht ankommt, überprüfen Sie die SMTP-Einstellungen in der `.env`-Datei
+- Stellen Sie sicher, dass Sie für Gmail ein App-Passwort verwenden
+- Prüfen Sie, ob die Firewall den SMTP-Port blockiert
+- Überprüfen Sie die Fehlermeldungen in der SMTP-Diagnose-Seite
+
 ### Starten der Anwendung
 
 Starte die Streamlit-Anwendung:
