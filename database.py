@@ -39,14 +39,22 @@ def _debug_log(location: str, message: str, data: dict = None, hypothesis_id: st
 class Database:
     """Verwaltet die SQLite-Datenbank für Inventar und Rechnungen."""
     
-    def __init__(self, db_path: str = "vinyl.db"):
+    def __init__(self, db_path: str = "vinyl.db", username: Optional[str] = None):
         """
         Initialisiert die Datenbankverbindung.
         
         Args:
-            db_path: Pfad zur SQLite-Datenbankdatei
+            db_path: Pfad zur SQLite-Datenbankdatei (Standard: "vinyl.db")
+            username: Optional: Benutzername für benutzerspezifische Datenbank
+                      Wenn angegeben, wird "vinyl_{username}.db" verwendet
         """
-        self.db_path = db_path
+        # Wenn username angegeben, verwende benutzerspezifische Datenbank
+        if username:
+            # Sanitize username für Dateinamen (nur alphanumerisch + Unterstriche)
+            safe_username = re.sub(r'[^a-zA-Z0-9_]', '_', username)
+            self.db_path = f"vinyl_{safe_username}.db"
+        else:
+            self.db_path = db_path
         self._local = threading.local()  # Thread-lokaler Storage
         self._initialize_database()
     
@@ -122,6 +130,27 @@ class Database:
             cursor.execute("ALTER TABLE inventory ADD COLUMN sleeve_condition TEXT")
             conn.commit()
         
+        # Prüfe ob individual_condition_enabled Spalte existiert, falls nicht hinzufügen
+        try:
+            cursor.execute("SELECT individual_condition_enabled FROM inventory LIMIT 1")
+        except sqlite3.OperationalError:
+            cursor.execute("ALTER TABLE inventory ADD COLUMN individual_condition_enabled INTEGER DEFAULT 0")
+            conn.commit()
+        
+        # Prüfe ob individual_condition_text Spalte existiert, falls nicht hinzufügen
+        try:
+            cursor.execute("SELECT individual_condition_text FROM inventory LIMIT 1")
+        except sqlite3.OperationalError:
+            cursor.execute("ALTER TABLE inventory ADD COLUMN individual_condition_text TEXT")
+            conn.commit()
+        
+        # Prüfe ob general_condition Spalte existiert, falls nicht hinzufügen
+        try:
+            cursor.execute("SELECT general_condition FROM inventory LIMIT 1")
+        except sqlite3.OperationalError:
+            cursor.execute("ALTER TABLE inventory ADD COLUMN general_condition TEXT DEFAULT 'VG'")
+            conn.commit()
+        
         # Prüfe ob purchase_price Spalte existiert, falls nicht hinzufügen
         try:
             cursor.execute("SELECT purchase_price FROM inventory LIMIT 1")
@@ -139,6 +168,13 @@ class Database:
             cursor.execute("UPDATE inventory SET max_quantity = quantity WHERE max_quantity IS NULL")
             # Falls quantity auch NULL ist, setze beide auf 1
             cursor.execute("UPDATE inventory SET max_quantity = 1, quantity = 1 WHERE max_quantity IS NULL OR quantity IS NULL")
+            conn.commit()
+        
+        # Prüfe ob format Spalte existiert, falls nicht hinzufügen
+        try:
+            cursor.execute("SELECT format FROM inventory LIMIT 1")
+        except sqlite3.OperationalError:
+            cursor.execute("ALTER TABLE inventory ADD COLUMN format TEXT")
             conn.commit()
         
         # Tabelle: invoices (Rechnungen für Differenzbesteuerung §25a UStG)
@@ -291,6 +327,28 @@ class Database:
         ]
         
         for column_name, column_type in api_key_columns:
+            try:
+                cursor.execute(f"SELECT {column_name} FROM company_settings LIMIT 1")
+            except sqlite3.OperationalError:
+                try:
+                    cursor.execute(f"ALTER TABLE company_settings ADD COLUMN {column_name} {column_type}")
+                    conn.commit()
+                except Exception as migration_err:
+                    conn.rollback()
+                    # Ignoriere Fehler falls Spalte bereits existiert
+                    pass
+        
+        # Prüfe ob Zustandsbewertungs-Spalten existieren, falls nicht hinzufügen
+        condition_columns = [
+            ("default_condition", "TEXT DEFAULT 'VG'"),
+            ("default_condition_text", "TEXT"),
+            ("show_individual_conditions", "INTEGER DEFAULT 1"),
+            ("condition_note", "TEXT"),
+            ("show_condition_rating", "INTEGER DEFAULT 1"),
+            ("condition_texts", "TEXT")
+        ]
+        
+        for column_name, column_type in condition_columns:
             try:
                 cursor.execute(f"SELECT {column_name} FROM company_settings LIMIT 1")
             except sqlite3.OperationalError:
@@ -630,9 +688,10 @@ class Database:
                 artist LIKE ? OR 
                 title LIKE ? OR 
                 label LIKE ? OR 
-                cat_no LIKE ?
+                cat_no LIKE ? OR
+                format LIKE ?
             )"""
-            params.extend([search_term, search_term, search_term, search_term])
+            params.extend([search_term, search_term, search_term, search_term, search_term])
         
         # Filter anwenden
         if filters:
@@ -677,7 +736,7 @@ class Database:
         # Sortierung
         if order_by:
             # Sicherheitsprüfung: Nur erlaubte Spalten und Richtungen
-            allowed_columns = ["created_at", "artist", "title", "pricing", "year", "label", "cat_no", "id", "quantity", "media_condition", "sleeve_condition"]
+            allowed_columns = ["created_at", "artist", "title", "pricing", "year", "label", "cat_no", "id", "quantity", "media_condition", "sleeve_condition", "format"]
             order_parts = order_by.strip().split()
             if len(order_parts) >= 2:
                 column = order_parts[0]
