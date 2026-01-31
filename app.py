@@ -10,6 +10,7 @@ import os as os_log
 # Relativer Pfad für Log-Datei (funktioniert auf jedem Rechner)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_DIR = os.path.join(BASE_DIR, ".cursor")
+REMEMBER_ME_PATH = os.path.join(BASE_DIR, ".streamlit", "remember_me.json")
 os.makedirs(LOG_DIR, exist_ok=True)
 log_path = os.path.join(LOG_DIR, "debug.log")
 try:
@@ -128,7 +129,9 @@ try:
 except: pass
 # #endregion
 
-from logic.vision_ocr import VisionOCR
+from core.vision_ocr import VisionOCR
+from core.tracklist import parse_tracklist_to_table, table_to_tracklist_string, table_to_readable_string
+from core.health import run_full_system_check
 from logic.discogs_client import DiscogsClient
 from logic.pricing import PricingWizard
 from logic.pdf_gen import InvoicePDFGenerator
@@ -329,250 +332,6 @@ st.set_page_config(
 )
 
 
-def side_to_seite(side_str: str) -> str:
-    """
-    Konvertiert Side-Bezeichnungen (A, B, C, D...) in Seiten-Nummern (1, 2, 3, 4...).
-    Unterstützt jetzt Multi-LP Sets (C=3, D=4, etc.).
-    
-    Args:
-        side_str: Side-Bezeichnung (z.B. "A", "B", "C", "D", "Side A", "LP 2 Side A", etc.)
-        
-    Returns:
-        Seiten-Nummer als String ("1", "2", "3", "4", ...)
-    """
-    if not side_str:
-        return ""
-    
-    side_str = str(side_str).strip().upper()
-    
-    # Entferne "Side" Präfix falls vorhanden
-    side_str = re.sub(r'^SIDE\s+', '', side_str, flags=re.IGNORECASE).strip()
-    
-    # Erkenne "LP 2 Side A" oder ähnliche Formate - extrahiere nur den Side-Buchstaben
-    lp_match = re.search(r'LP\s*\d+\s*SIDE\s*([A-Z])', side_str, re.IGNORECASE)
-    if lp_match:
-        side_str = lp_match.group(1)
-    
-    # Konvertiere Buchstaben zu Zahlen: A=1, B=2, C=3, D=4, etc.
-    if side_str and side_str[0].isalpha():
-        return str(ord(side_str[0]) - ord('A') + 1)
-    
-    # Wenn bereits eine Zahl, return als String
-    if side_str.isdigit():
-        return side_str
-    
-    return ""
-
-
-def parse_tracklist_to_table(tracklist_text: str) -> List[Dict[str, str]]:
-    """
-    Konvertiert rohen Trackliste-Text (von KI oder Discogs) in Tabellenformat.
-    Unterstützt jetzt explizite Seiten-Zuordnung für beliebig viele Seiten (1LP, 2LP, 3LP, etc.).
-    
-    Args:
-        tracklist_text: String mit Trackliste (z.B. "A1. Song Title (3:45)\\nA2. ..." oder "Seite 1: A1. ...")
-        
-    Returns:
-        Liste von Dictionaries: [{"Seite": "1", "Position": "A1", "Titel": "Song Title", "Länge": "3:45"}, ...]
-    """
-    if not tracklist_text or not tracklist_text.strip():
-        return []
-    
-    tracks = []
-    lines = tracklist_text.strip().split('\n')
-    current_seite = ""  # Aktuelle Seite (wird während des Parsens verfolgt)
-    # Dynamische Zähler für Auto-Nummerierung pro Seite
-    position_counters = {}  # Dictionary: {"1": 0, "2": 0, "3": 0, ...}
-    
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-        
-        # Entferne Bullet-Points oder andere Prefixes
-        line = re.sub(r'^[\•\-\*]\s*', '', line)
-        
-        # Erkenne Seiten-Marker: "Seite 1:", "Side A:", "A:", "Seite 3:", "Side C:", "LP 2 Side A:", etc.
-        # Erweitert für Multi-LP: Unterstützt "Seite 3", "Seite 4", "LP 2", "Side C", "Side D", "C", "D"
-        seite_match = re.match(r'^(Seite|Side|LP\s*\d+\s*Side)\s+([A-Z0-9]+)\s*[:]?\s*(.*)$', line, re.IGNORECASE)
-        if seite_match:
-            seite_str = seite_match.group(2).strip()
-            new_seite = side_to_seite(seite_str)
-            current_seite = new_seite
-            # Reset Zähler wenn Seite wechselt (dynamisch für beliebige Seiten)
-            if new_seite not in position_counters:
-                position_counters[new_seite] = 0
-            else:
-                position_counters[new_seite] = 0  # Reset bei Seitenwechsel
-            # Wenn nach dem Seiten-Marker noch Text kommt, verarbeite ihn weiter
-            remaining = seite_match.group(3).strip()
-            if remaining:
-                line = remaining
-            else:
-                continue  # Nur Seiten-Marker, keine Track-Info
-        
-        # Pattern 1: "A1. Song Title (3:45)" oder "1. Song Title (3:45)" - mit Seiten-Buchstaben im Position
-        # Erweiterte Regex für bessere Längen-Erkennung: Unterstützt (3:45), (3:45:12), 3:45, (2'33"), 2'33", etc.
-        pattern1 = re.match(r'^([A-Z])?(\d+[a-z]?)\s*[\.:]\s*(.+?)(?:\s*[\(]?(\d{1,2}(?::|\')\d{2}(?::\d{2})?)[\)"]?)?\s*$', line)
-        if pattern1:
-            side_letter = pattern1.group(1) if pattern1.group(1) else None
-            position_num = pattern1.group(2).strip()
-            title = pattern1.group(3).strip()
-            length = pattern1.group(4) if pattern1.group(4) else ""
-            
-            # Extrahiere Länge auch wenn sie im Titel versteckt ist (z.B. "Title 3:45" oder "Title (2'33")")
-            if not length:
-                # Suche nach Zeitformat im gesamten String - unterstützt sowohl : als auch '
-                time_match = re.search(r'\(?(\d{1,2}(?::|\')\d{2}(?::\d{2})?)[\)"]?', title)
-                if time_match:
-                    length = time_match.group(1)
-                    # Konvertiere ' zu : für einheitliches Format
-                    length = length.replace("'", ":")
-                    # Entferne die Länge aus dem Titel (sowohl mit : als auch mit ')
-                    title = re.sub(r'\s*\(?\d{1,2}(?::|\')\d{2}(?::\d{2})?[\)"]?\s*', '', title).strip()
-            
-            # Konvertiere ' zu : für einheitliches Format
-            if length:
-                length = length.replace("'", ":")
-            
-            # Bestimme Seite: Wenn Side-Letter vorhanden, nutze das, sonst aktuelle Seite
-            if side_letter:
-                seite = side_to_seite(side_letter)
-            else:
-                seite = current_seite if current_seite else "1"
-            
-            # Position: Side-Letter + Nummer oder nur Nummer
-            if side_letter:
-                position = f"{side_letter}{position_num}"
-            else:
-                position = position_num
-            
-            # Entferne mögliche zusätzliche Längen-Angaben am Ende des Titels (sowohl mit : als auch mit ')
-            title = re.sub(r'\s*\(?\d{1,2}(?::|\')\d{2}(?::\d{2})?[\)"]?\s*$', '', title).strip()
-            
-            # Auto-Nummerierung: Wenn Position leer, nutze automatische Nummerierung (dynamisch für beliebige Seiten)
-            if not position:
-                if seite not in position_counters:
-                    position_counters[seite] = 0
-                position_counters[seite] += 1
-                position = str(position_counters[seite])
-            
-            if title:
-                tracks.append({
-                    "Seite": seite,
-                    "Position": position,
-                    "Titel": title,
-                    "Länge": length
-                })
-            continue
-        
-        # Pattern 2: "Seite 1: 1. Song Title (3:45)" oder "Seite 3:", "Seite 4:" etc. - mit expliziter Seiten-Angabe am Anfang
-        pattern2 = re.match(r'^Seite\s+([0-9]+)\s*[:]\s*(.+)$', line, re.IGNORECASE)
-        if pattern2:
-            seite = pattern2.group(1).strip()
-            current_seite = seite
-            remaining_line = pattern2.group(2).strip()
-            # Verarbeite den Rest der Zeile - erweiterte Regex für bessere Längen-Erkennung
-            track_match = re.match(r'^([A-Z]?\d+[a-z]?)\s*[\.:]\s*(.+?)(?:\s*[\(]?(\d{1,2}(?::|\')\d{2}(?::\d{2})?)[\)"]?)?\s*$', remaining_line)
-            if track_match:
-                position = track_match.group(1).strip()
-                title = track_match.group(2).strip()
-                length = track_match.group(3) if track_match.group(3) else ""
-                
-                # Extrahiere Länge auch wenn sie im Titel versteckt ist (sowohl mit : als auch mit ')
-                if not length:
-                    time_match = re.search(r'\(?(\d{1,2}(?::|\')\d{2}(?::\d{2})?)[\)"]?', title)
-                    if time_match:
-                        length = time_match.group(1)
-                        # Konvertiere ' zu : für einheitliches Format
-                        length = length.replace("'", ":")
-                        title = re.sub(r'\s*\(?\d{1,2}(?::|\')\d{2}(?::\d{2})?[\)"]?\s*', '', title).strip()
-                
-                # Konvertiere ' zu : für einheitliches Format
-                if length:
-                    length = length.replace("'", ":")
-                
-                # Entferne mögliche zusätzliche Längen-Angaben am Ende des Titels (sowohl mit : als auch mit ')
-                title = re.sub(r'\s*\(?\d{1,2}(?::|\')\d{2}(?::\d{2})?[\)"]?\s*$', '', title).strip()
-                
-                # Auto-Nummerierung: Wenn Position leer, nutze automatische Nummerierung (dynamisch für beliebige Seiten)
-                if not position:
-                    if seite not in position_counters:
-                        position_counters[seite] = 0
-                    position_counters[seite] += 1
-                    position = str(position_counters[seite])
-                
-                if title:
-                    tracks.append({
-                        "Seite": seite,
-                        "Position": position,
-                        "Titel": title,
-                        "Länge": length
-                    })
-            continue
-        
-        # Pattern 3: "Song Title (3:45)" oder "Song Title 3:45" ohne Position - nutze aktuelle Seite
-        # Erweiterte Regex für bessere Längen-Erkennung - unterstützt sowohl : als auch '
-        pattern3 = re.match(r'^(.+?)(?:\s*[\(]?(\d{1,2}(?::|\')\d{2}(?::\d{2})?)[\)"]?)?\s*$', line)
-        if pattern3:
-            title = pattern3.group(1).strip()
-            length = pattern3.group(2) if pattern3.group(2) else ""
-            
-            # Extrahiere Länge auch wenn sie im Titel versteckt ist (z.B. am Ende) - unterstützt sowohl : als auch '
-            if not length:
-                time_match = re.search(r'\(?(\d{1,2}(?::|\')\d{2}(?::\d{2})?)[\)"]?', title)
-                if time_match:
-                    length = time_match.group(1)
-                    # Konvertiere ' zu : für einheitliches Format
-                    length = length.replace("'", ":")
-                    # Entferne die Länge aus dem Titel
-                    title = re.sub(r'\s*\(?\d{1,2}(?::|\')\d{2}(?::\d{2})?[\)"]?\s*$', '', title).strip()
-            
-            # Konvertiere ' zu : für einheitliches Format
-            if length:
-                length = length.replace("'", ":")
-            
-            # Entferne mögliche zusätzliche Längen-Angaben am Ende des Titels (sowohl mit : als auch mit ')
-            title = re.sub(r'\s*\(?\d{1,2}(?::|\')\d{2}(?::\d{2})?[\)"]?\s*$', '', title).strip()
-            
-            # Ignoriere Zeilen, die nur Zahlen oder Sonderzeichen sind
-            if title and not re.match(r'^[\d\s\-:\.]+$', title) and len(title) > 2:
-                # Auto-Nummerierung: Wenn Position leer, nutze automatische Nummerierung (dynamisch für beliebige Seiten)
-                position = ""
-                if current_seite:
-                    if current_seite not in position_counters:
-                        position_counters[current_seite] = 0
-                    position_counters[current_seite] += 1
-                    position = str(position_counters[current_seite])
-                
-                tracks.append({
-                    "Seite": current_seite if current_seite else "1",
-                    "Position": position,
-                    "Titel": title,
-                    "Länge": length
-                })
-            continue
-    
-    return tracks
-
-
-def table_to_tracklist_string(tracklist_table: List[Dict[str, str]]) -> str:
-    """
-    Konvertiert Tabellenformat zurück in String-Format für Datenbank-Speicherung.
-    
-    Args:
-        tracklist_table: Liste von Dictionaries mit Position, Titel, Länge
-        
-    Returns:
-        Formatierter String für Datenbank-Speicherung (als JSON)
-    """
-    if not tracklist_table:
-        return ""
-    
-    # Konvertiere zu JSON für saubere Speicherung
-    return json.dumps(tracklist_table, ensure_ascii=False)
-
-
 def condition_de_to_en(condition_de: str) -> str:
     """
     Konvertiert deutschen Zustand zu englischem Wert (für Datenbank-Kompatibilität).
@@ -619,39 +378,6 @@ def condition_en_to_de(condition_en: str) -> str:
     return condition_map.get(condition_en, "Sehr gut")
 
 
-def table_to_readable_string(tracklist_table: List[Dict[str, str]]) -> str:
-    """
-    Konvertiert Tabellenformat in lesbaren Text-String (für Kompatibilität).
-    
-    Args:
-        tracklist_table: Liste von Dictionaries mit Position, Titel, Länge
-        
-    Returns:
-        Formatierter lesbarer String (z.B. "A1. Song Title (3:45)\\n...")
-    """
-    if not tracklist_table:
-        return ""
-    
-    lines = []
-    for track in tracklist_table:
-        position = track.get("Position", "").strip()
-        title = track.get("Titel", "").strip()
-        length = track.get("Länge", "").strip()
-        
-        if title:
-            if position:
-                line = f"{position}. {title}"
-            else:
-                line = title
-            
-            if length:
-                line += f" ({length})"
-            
-            lines.append(line)
-    
-    return "\n".join(lines)
-
-
 def show_login():
     """Zeigt Login-Seite."""
     st.header("🔐 Anmelden")
@@ -674,6 +400,7 @@ def show_login():
                         st.session_state.current_user = user_data
                         # Initialisiere benutzerspezifische Datenbank
                         st.session_state.db = Database(username=username)
+                        _save_remember_me(username)
                         
                         # Prüfe ob E-Mail vorhanden ist
                         if not user_data.get("email") or not user_data.get("email").strip():
@@ -745,6 +472,7 @@ def show_register():
                                 st.session_state.current_user = user_data
                                 # Initialisiere benutzerspezifische Datenbank
                                 st.session_state.db = Database(username=username)
+                                _save_remember_me(username)
                                 st.success("✅ Registrierung erfolgreich! Willkommen bei VinylLocal AI!")
                                 st.rerun()
                             else:
@@ -937,8 +665,28 @@ def check_authentication() -> bool:
     return st.session_state.get("is_authenticated", False) and st.session_state.get("current_user") is not None
 
 
+def _save_remember_me(username: str) -> None:
+    """Speichert Benutzername in Session-Datei für Login nach Browser-Refresh."""
+    try:
+        os.makedirs(os.path.dirname(REMEMBER_ME_PATH), exist_ok=True)
+        with open(REMEMBER_ME_PATH, "w", encoding="utf-8") as f:
+            json.dump({"username": username}, f)
+    except Exception:
+        pass
+
+
+def _clear_remember_me() -> None:
+    """Löscht Session-Datei (z. B. beim Logout)."""
+    try:
+        if os.path.exists(REMEMBER_ME_PATH):
+            os.remove(REMEMBER_ME_PATH)
+    except Exception:
+        pass
+
+
 def logout():
     """Meldet Benutzer ab."""
+    _clear_remember_me()
     st.session_state.is_authenticated = False
     st.session_state.current_user = None
     if "db" in st.session_state:
@@ -963,6 +711,23 @@ def init_session_state():
         st.session_state.show_resend_button = False
     if "resend_username" not in st.session_state:
         st.session_state.resend_username = ""
+    
+    # Login aus Session-Datei wiederherstellen (z. B. nach Browser-Refresh)
+    if not st.session_state.is_authenticated or not st.session_state.current_user:
+        try:
+            if os.path.exists(REMEMBER_ME_PATH):
+                with open(REMEMBER_ME_PATH, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                username = data.get("username")
+                if username:
+                    user_db = st.session_state.user_db
+                    user_data = user_db.get_user(username)
+                    if user_data:
+                        st.session_state.is_authenticated = True
+                        st.session_state.current_user = user_data
+                        st.session_state.db = Database(username=username)
+        except Exception:
+            pass
     
     # Datenbank initialisieren wenn eingeloggt (oder localhost-Modus)
     if st.session_state.get("pending_delete_localhost"):
@@ -1019,7 +784,12 @@ def init_session_state():
         st.session_state.vision_ocr = None
     
     gemini_enabled = api_settings.get("gemini_enabled", 0) == 1
-    gemini_api_key = api_settings.get("gemini_api_key", "")
+    # Cloud: Key aus config/st.secrets; Desktop: aus Einstellungen/DB (BYOK)
+    try:
+        from config import get_gemini_api_key
+        gemini_api_key = get_gemini_api_key() or api_settings.get("gemini_api_key", "") or ""
+    except Exception:
+        gemini_api_key = api_settings.get("gemini_api_key", "") or ""
     
     # Prüfe, ob Einstellungen in DB existieren (für Fallback-Entscheidung)
     has_settings_in_db = bool(api_settings) and "gemini_enabled" in api_settings
@@ -1051,7 +821,7 @@ def init_session_state():
     
     if openai_enabled and openai_api_key:
         try:
-            from logic.openai_vision_ocr import OpenAIVisionOCR
+            from core.openai_vision_ocr import OpenAIVisionOCR
             st.session_state.openai_vision_ocr = OpenAIVisionOCR(api_key=openai_api_key)
         except Exception as e:
             st.session_state.openai_vision_ocr = None
@@ -1224,6 +994,8 @@ def init_session_state():
         st.session_state.items_with_duplicates = []
     if "duplicate_success_message" not in st.session_state:
         st.session_state.duplicate_success_message = None
+    if "scan_success_message_shown_at" not in st.session_state:
+        st.session_state.scan_success_message_shown_at = 0
 
 
 def reset_metadata():
@@ -1287,6 +1059,8 @@ def reset_metadata():
     st.session_state.duplicate_found = False
     st.session_state.items_with_duplicates = []
     st.session_state.duplicate_success_message = None
+    st.session_state.inventory_success_message = None
+    st.session_state.scan_success_message_shown_at = 0
     
     # print("Metadaten zurueckgesetzt - bereit fuer neue Analyse")  # Deaktiviert wegen Streamlit stdout
 
@@ -1827,14 +1601,10 @@ def update_fields_from_discogs(release_id: int, respect_manual_edits: bool = Tru
 
 def show_scan_session():
     """Interface für Vinyl-Cover Scan und Inventar-Aufnahme."""
+    import time as _time_module  # Lokaler Import, damit "time" in dieser Funktion nicht von Nested-Funktion überschrieben wird
+    time = _time_module  # Bindung, damit alle time.time()-Aufrufe in dieser Funktion das Modul verwenden
     st.header("📸 Scan-Session")
     st.markdown("Laden Sie ein Bild eines Vinyl-Covers hoch, um Metadaten automatisch zu erkennen.")
-    
-    # Zeige persistierte Erfolgsmeldung falls vorhanden (am Anfang der Seite)
-    if st.session_state.get("duplicate_success_message"):
-        st.success(st.session_state.duplicate_success_message)
-    if st.session_state.get("inventory_success_message"):
-        st.success(st.session_state.inventory_success_message)
     
     # Prüfe ob Services verfügbar sind
     # Prüfe welche APIs verfügbar sind
@@ -3054,12 +2824,6 @@ def show_scan_session():
         # Speichern in Inventar
         save_all_btn = st.button("💾 In Inventar speichern", type="primary", use_container_width=True, key="save_inventory")
         
-        # Zeige persistierte Erfolgsmeldung direkt unter dem Button (bleibt bestehen bis neue Aktion)
-        if st.session_state.get("duplicate_success_message"):
-            st.success(st.session_state.duplicate_success_message)
-        if st.session_state.get("inventory_success_message"):
-            st.success(st.session_state.inventory_success_message)
-        
         # Kopiere Bilder in permanentes Verzeichnis
         def copy_images_to_permanent(image_paths, record_id=None, artist=None, title=None):
             """
@@ -3271,11 +3035,16 @@ def show_scan_session():
         
         # Speichern in Inventar
         if save_all_btn:
-            # Lösche alte Erfolgsmeldungen vor neuem Speichern, damit neue Meldung angezeigt wird
+            first_sync_done = False
+            # Lösche alte Erfolgsmeldungen und Sync-Fehler vor neuem Speichern
             if "duplicate_success_message" in st.session_state:
                 del st.session_state.duplicate_success_message
             if "inventory_success_message" in st.session_state:
                 del st.session_state.inventory_success_message
+            if "sync_error_message" in st.session_state:
+                del st.session_state.sync_error_message
+            if "sync_error_traceback" in st.session_state:
+                del st.session_state.sync_error_traceback
             
             items_to_save = []
             
@@ -3423,6 +3192,7 @@ def show_scan_session():
                             success_msg = f"Duplikat gefunden, Stückzahl erweitert um {added_quantity} (von {old_quantity} auf {new_quantity})"
                             st.session_state.duplicate_success_message = success_msg
                             st.session_state.inventory_success_message = success_msg
+                            st.session_state.scan_success_message_shown_at = _time_module.time()
                             
                             # Aktualisiere Dateinamen mit echter Record-ID falls nötig
                             record_id = result.get("id")
@@ -3486,16 +3256,26 @@ def show_scan_session():
                                 except Exception as e:
                                     pass
                     
+                    first_sync_done = True
                     # Erfolgsmeldung und Navigation
                     if saved_count > 0:
-                        st.success(f"✅ {saved_count} {'Item' if saved_count == 1 else 'Items'} erfolgreich synchronisiert!")
-                        reset_metadata()
-                        st.session_state.inventory_refresh_needed = True
-                        st.session_state.navigate_to = "Lager-Verwaltung"
-                        st.rerun()
+                        current_dups = st.session_state.get("items_with_duplicates", [])
+                        if not current_dups:
+                            # Meldung unter Speicher-Button anzeigen, nicht sofort navigieren
+                            st.session_state.inventory_refresh_needed = True
+                            st.rerun()
+                        else:
+                            st.success(f"✅ {saved_count} {'Item' if saved_count == 1 else 'Items'} erfolgreich synchronisiert!")
+                            reset_metadata()
+                            st.session_state.inventory_refresh_needed = True
+                            st.session_state.navigate_to = "Lager-Verwaltung"
+                            st.rerun()
                     
                 except Exception as e:
                     import traceback
+                    first_sync_done = True  # Verhindert zweite Sync-Schleife und Rerun, damit Fehlermeldung sichtbar bleibt
+                    st.session_state.sync_error_message = str(e)
+                    st.session_state.sync_error_traceback = traceback.format_exc()
                     st.error(f"❌ Fehler beim Synchronisieren: {e}")
                     with st.expander("🔍 Fehlerdetails anzeigen"):
                         st.code(traceback.format_exc())
@@ -3531,11 +3311,6 @@ def show_scan_session():
                     for dup_info in current_duplicates_for_ui:
                         item_data = dup_info["item"]
                         duplicate = dup_info["duplicate"]
-                        
-                        # Zeige persistierte Erfolgsmeldung falls vorhanden (wird nicht automatisch gelöscht)
-                        if st.session_state.get("duplicate_success_message"):
-                            st.success(st.session_state.duplicate_success_message)
-                            # Meldung bleibt bestehen bis neue Aktion ausgeführt wird
                         
                         # Prüfe Qualitätsunterschiede für Anzeige
                         existing_media = duplicate.get('media_condition', 'N/A')
@@ -3646,6 +3421,7 @@ def show_scan_session():
                                         success_msg = f"Duplikat gefunden, Stückzahl erweitert um {added_quantity} (von {old_quantity} auf {new_quantity})"
                                         st.session_state.duplicate_success_message = success_msg
                                         st.session_state.inventory_success_message = success_msg
+                                        st.session_state.scan_success_message_shown_at = _time_module.time()
                                         
                                         # Aktualisiere Dateinamen mit echter Record-ID falls nötig
                                         record_id = result.get("id")
@@ -3677,6 +3453,7 @@ def show_scan_session():
                                         success_msg = f"✅ Neuer Eintrag erstellt (ID: {record_id})"
                                         st.session_state.duplicate_success_message = success_msg
                                         st.session_state.inventory_success_message = success_msg
+                                        st.session_state.scan_success_message_shown_at = _time_module.time()
                                         
                                         # Aktualisiere Dateinamen mit echter Record-ID
                                         if item_data.get("image_paths"):
@@ -3755,9 +3532,8 @@ def show_scan_session():
                     
                     st.markdown("---")
             
-            # Speichere alle Items ohne Dubletten (oder solche, die trotzdem gespeichert werden sollen)
-            # Dies wird nur ausgeführt, wenn items_to_save existiert (d.h. wenn "Alle speichern" geklickt wurde)
-            if items_to_save:
+            # Speichere verbleibende Items nur wenn erste Sync-Schleife in diesem Run nicht gelaufen ist (verhindert Doppel-Speichern)
+            if items_to_save and not first_sync_done:
                 try:
                     items_to_save_filtered = items_to_save
                     # Verwende Session State für items_with_duplicates
@@ -3901,14 +3677,13 @@ def show_scan_session():
                             raise
                     
                     # Erfolgsmeldung und Reset
+                    current_items_with_duplicates = st.session_state.get("items_with_duplicates", [])
                     # #region agent log
                     try:
                         with open(log_path, "a", encoding="utf-8") as f_log:
-                            f_log.write(json_log.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"D","location":"app.py:3285","message":"Before success/error message","data":{"saved_count":saved_count,"items_with_duplicates_count":len(items_with_duplicates),"items_with_duplicates_empty":not items_with_duplicates},"timestamp":int(os_log.path.getmtime(log_path) if os_log.path.exists(log_path) else 0)}) + "\n")
+                            f_log.write(json_log.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"D","location":"app.py:3285","message":"Before success/error message","data":{"saved_count":saved_count,"items_with_duplicates_count":len(current_items_with_duplicates),"items_with_duplicates_empty":not current_items_with_duplicates},"timestamp":int(os_log.path.getmtime(log_path) if os_log.path.exists(log_path) else 0)}) + "\n")
                     except: pass
                     # #endregion
-                    # Verwende Session State für items_with_duplicates
-                    current_items_with_duplicates = st.session_state.get("items_with_duplicates", [])
                     if saved_count > 0:
                         if not current_items_with_duplicates:
                             # Erfolgsmeldung wurde bereits für jedes Item einzeln angezeigt
@@ -3953,6 +3728,25 @@ def show_scan_session():
                         st.code(traceback.format_exc())
             else:
                 st.error("❌ Bitte füllen Sie mindestens Artist und Title aus!")
+        
+        # Persistierte Sync-Fehlermeldung anzeigen (bleibt bis zum nächsten Speicher-Versuch)
+        if st.session_state.get("sync_error_message"):
+            st.error(f"❌ Fehler beim Synchronisieren: {st.session_state.sync_error_message}")
+            if st.session_state.get("sync_error_traceback"):
+                with st.expander("🔍 Fehlerdetails anzeigen"):
+                    st.code(st.session_state.sync_error_traceback)
+        
+        # Erfolgsmeldung unter Speicher-Button (ca. 15 Sekunden sichtbar)
+        msg = st.session_state.get("duplicate_success_message") or st.session_state.get("inventory_success_message")
+        shown_at = st.session_state.get("scan_success_message_shown_at") or 0
+        if msg and shown_at and (_time_module.time() - shown_at) < 15:
+            st.success(msg)
+        elif msg and shown_at and (_time_module.time() - shown_at) >= 15:
+            if "duplicate_success_message" in st.session_state:
+                del st.session_state.duplicate_success_message
+            if "inventory_success_message" in st.session_state:
+                del st.session_state.inventory_success_message
+            st.session_state.scan_success_message_shown_at = 0
 
 
 def show_inventory():
@@ -5907,7 +5701,7 @@ def show_settings():
             if gemini_api_key:
                 # Teste Verbindung
                 try:
-                    from logic.vision_ocr import VisionOCR
+                    from core.vision_ocr import VisionOCR
                     test_ocr = VisionOCR(api_key=gemini_api_key)
                     st.success("✅ Gemini-Verbindung erfolgreich!")
                 except Exception as e:
@@ -5940,7 +5734,7 @@ def show_settings():
             if openai_api_key:
                 # Teste Verbindung
                 try:
-                    from logic.openai_vision_ocr import OpenAIVisionOCR
+                    from core.openai_vision_ocr import OpenAIVisionOCR
                     test_ocr = OpenAIVisionOCR(api_key=openai_api_key)
                     st.success("✅ OpenAI-Verbindung erfolgreich!")
                 except Exception as e:
@@ -8135,10 +7929,55 @@ def main():
         except: pass
         # #endregion
     
+    # System- und Speicher-Status (Sidebar)
+    try:
+        result = run_full_system_check(
+            project_root=BASE_DIR,
+            db=st.session_state.get("db"),
+            gemini_key_loaded=st.session_state.get("vision_ocr") is not None,
+        )
+    except Exception as e:
+        result = {
+            "structure": {"ok": False, "message": str(e)},
+            "database": {"ok": False, "message": str(e)},
+            "disk": {"ok": False, "status": "red", "message": str(e), "free_mb": 0.0, "total_mb": 0.0, "used_mb": 0.0},
+            "api": {"ok": None, "message": str(e)},
+        }
+    with st.sidebar.expander("🛠️ System & Speicher Status"):
+        for label, key in [("Struktur & Pfade", "structure"), ("Datenbank", "database"), ("API (Gemini)", "api")]:
+            item = result.get(key, {})
+            ok = item.get("ok")
+            msg = item.get("message", "")
+            icon = "✅" if ok is True else ("❌" if ok is False else "⚠️")
+            st.markdown(f"{icon} **{label}:** {msg}")
+        disk = result.get("disk", {})
+        ok = disk.get("ok")
+        status = disk.get("status", "green")
+        icon = "✅" if ok is True else ("❌" if ok is False else "⚠️")
+        st.markdown(f"{icon} **Speicherplatz:** {disk.get('message', '')}")
+        total_mb = disk.get("total_mb") or 0
+        used_mb = disk.get("used_mb") or 0
+        if total_mb > 0:
+            used_ratio = used_mb / total_mb
+            st.progress(min(1.0, max(0.0, used_ratio)))
+    
     # Seiteninhalt anzeigen (nur wenn eingeloggt)
     if not check_authentication():
         show_login()
         return
+    
+    # Duplikat-Meldung ausblenden, sobald Nutzer zu anderer Seite navigiert
+    if page != "Scan-Session":
+        if "duplicate_success_message" in st.session_state:
+            del st.session_state.duplicate_success_message
+        if "inventory_success_message" in st.session_state:
+            del st.session_state.inventory_success_message
+        if "sync_error_message" in st.session_state:
+            del st.session_state.sync_error_message
+        if "sync_error_traceback" in st.session_state:
+            del st.session_state.sync_error_traceback
+        st.session_state.duplicate_found = False
+        st.session_state.items_with_duplicates = []
     
     if page == "Dashboard":
         show_dashboard()

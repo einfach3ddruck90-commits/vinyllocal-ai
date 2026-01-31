@@ -35,7 +35,7 @@ load_dotenv(dotenv_path=env_path)
 # Importe der Logic-Module
 try:
     from logic.discogs_client import DiscogsClient
-    from logic.vision_ocr import VisionOCR
+    from core.vision_ocr import VisionOCR
 except ImportError as e:
     print(f"❌ FEHLER beim Importieren der Module: {e}")
     print("Stellen Sie sicher, dass alle Abhängigkeiten installiert sind: pip install -r requirements.txt")

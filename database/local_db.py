@@ -13,8 +13,8 @@ from typing import Optional, List, Dict, Any
 from pathlib import Path
 from datetime import datetime
 
-# Debug logging - relativer Pfad (funktioniert auf jedem Rechner)
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# Debug logging - Projektroot (database/ ist Unterordner)
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LOG_DIR = os.path.join(BASE_DIR, ".cursor")
 os.makedirs(LOG_DIR, exist_ok=True)
 DEBUG_LOG_PATH = os.path.join(LOG_DIR, "debug.log")

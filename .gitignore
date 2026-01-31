@@ -41,6 +41,7 @@ wheels/
 # Streamlit (config.toml wird mitcommittet für Cloud-Deployment)
 # .streamlit/secrets.toml nicht committen
 .streamlit/secrets.toml
+.streamlit/remember_me.json
 
 # Backups (ZIPs mit lokalen Daten)
 backups/
