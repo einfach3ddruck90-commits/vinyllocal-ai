@@ -16,6 +16,7 @@ class InvoicePDFGenerator:
     def __init__(self):
         """Initialisiert den PDF-Generator."""
         self.pdf = None
+        self.company_info = None
     
     def generate_invoice(self, 
                         invoice_data: Dict[str, Any],
@@ -40,13 +41,68 @@ class InvoicePDFGenerator:
         Returns:
             Pfad zur generierten PDF-Datei
         """
-        self.pdf = FPDF()
+        # Erstelle PDF mit explizitem A4-Format (Hochformat, Millimeter)
+        self.pdf = FPDF(orientation='P', unit='mm', format='A4')
+        
+        # Setze Randabstände (links, oben, rechts) - unterer Rand wird durch set_auto_page_break gesetzt
+        self.pdf.set_margins(left=15, top=15, right=15)
+        
+        # Speichere company_info für Footer-Zugriff
+        self.company_info = invoice_data.get("company_info")
+        
+        # Aktiviere automatische Seitenzahl-Erkennung für "Seite X von Y"
+        self.pdf.alias_nb_pages()
+        
+        # Überschreibe footer() Methode für automatischen Footer auf jeder Seite
+        # Erstelle eine Closure, die Zugriff auf self hat
+        pdf_instance = self.pdf
+        company_info_ref = self.company_info
+        
+        def footer():
+            """Footer-Funktion die auf jeder Seite aufgerufen wird."""
+            # Positioniere Footer am unteren Rand der Seite (berücksichtigt unteren Rand)
+            pdf_instance.set_y(-20)
+            pdf_instance.set_font("Arial", "", 8)
+            
+            # Bankverbindung (falls vorhanden)
+            bank_lines = []
+            if company_info_ref:
+                bank_name = company_info_ref.get("bank_name", "")
+                bank_account_holder = company_info_ref.get("bank_account_holder", "")
+                bank_iban = company_info_ref.get("bank_iban", "")
+                bank_bic = company_info_ref.get("bank_bic", "")
+                
+                if bank_name or bank_account_holder or bank_iban or bank_bic:
+                    if bank_account_holder:
+                        bank_lines.append(f"Kontoinhaber: {bank_account_holder}")
+                    if bank_name:
+                        bank_lines.append(f"Bank: {bank_name}")
+                    if bank_iban:
+                        bank_lines.append(f"IBAN: {bank_iban}")
+                    if bank_bic:
+                        bank_lines.append(f"BIC: {bank_bic}")
+            
+            # Zeige Bankverbindung
+            if bank_lines:
+                for line in bank_lines:
+                    pdf_instance.cell(0, 4, line, ln=True, align="C")
+                pdf_instance.ln(2)
+            
+            # Erstellungsdatum und Seitenzahl (Format: "Seite X von Y")
+            # Verwende {nb} Platzhalter für Gesamtseitenzahl (wird beim Output ersetzt)
+            current_page = pdf_instance.page_no()
+            footer_text = f"Erstellt am {datetime.now().strftime('%d.%m.%Y %H:%M')} | Seite {current_page} von " + "{nb}"
+            pdf_instance.cell(0, 4, footer_text, ln=True, align="C")
+        
+        self.pdf.footer = footer
+        
+        # Setze automatischen Seitenumbruch mit unterem Rand (15mm)
         self.pdf.set_auto_page_break(auto=True, margin=15)
         self.pdf.add_page()
         
         # Firmendaten-Header
-        if invoice_data.get("company_info"):
-            self._add_company_header(invoice_data["company_info"])
+        if self.company_info:
+            self._add_company_header(self.company_info)
         
         # Rechnungs-Header
         self._add_invoice_header(invoice_data)
@@ -65,11 +121,9 @@ class InvoicePDFGenerator:
         # Steuerhinweis (abhängig vom Status)
         self._add_tax_note(invoice_data)
         
-        # Footer
-        self._add_footer()
-        
         # Speichern
         self.pdf.output(output_path)
+        
         return output_path
     
     def _add_company_header(self, company_info: Dict[str, Any]) -> None:
@@ -146,16 +200,49 @@ class InvoicePDFGenerator:
         
         self.pdf.set_font("Arial", "", 10)
         name = customer_info.get("Name", "")
-        address = customer_info.get("Adresse", "")
         
         if name:
             self.pdf.cell(0, 5, name, ln=True)
         
-        if address:
-            address_lines = address.split('\n')
-            for line in address_lines:
-                if line.strip():
-                    self.pdf.cell(0, 5, line.strip(), ln=True)
+        # Prüfe ob einzelne Adressfelder vorhanden sind
+        street = customer_info.get("Straße", "")
+        house_number = customer_info.get("Hausnummer", "")
+        postal_code = customer_info.get("PLZ", "")
+        city = customer_info.get("Ort", "")
+        state = customer_info.get("Bundesland", "")
+        country = customer_info.get("Land", "")
+        
+        # Verwende einzelne Felder falls vorhanden
+        if street or postal_code or city:
+            # Zeile 1: Straße + Hausnummer
+            if street:
+                street_line = street
+                if house_number:
+                    street_line = f"{street} {house_number}"
+                self.pdf.cell(0, 5, street_line, ln=True)
+            
+            # Zeile 2: PLZ + Ort
+            if postal_code and city:
+                self.pdf.cell(0, 5, f"{postal_code} {city}", ln=True)
+            elif city:
+                self.pdf.cell(0, 5, city, ln=True)
+            elif postal_code:
+                self.pdf.cell(0, 5, postal_code, ln=True)
+            
+            # Weitere Zeilen: Bundesland und Land
+            if state:
+                self.pdf.cell(0, 5, state, ln=True)
+            
+            if country and country != 'Deutschland':
+                self.pdf.cell(0, 5, country, ln=True)
+        else:
+            # Fallback: Verwende "Adresse"-Feld falls einzelne Felder nicht vorhanden sind
+            address = customer_info.get("Adresse", "")
+            if address:
+                address_lines = address.split('\n')
+                for line in address_lines:
+                    if line.strip():
+                        self.pdf.cell(0, 5, line.strip(), ln=True)
         
         self.pdf.ln(5)
     
@@ -301,7 +388,5 @@ class InvoicePDFGenerator:
             self.pdf.cell(0, 5, f"Marge: {margin:.2f} EUR, Umsatzsteuer ({tax_rate*100:.0f}%): {tax_amount:.2f} EUR", ln=True)
     
     def _add_footer(self) -> None:
-        """Fügt Footer zur PDF hinzu."""
-        self.pdf.ln(10)
-        self.pdf.set_font("Arial", "", 8)
-        self.pdf.cell(0, 5, f"Erstellt am {datetime.now().strftime('%d.%m.%Y %H:%M')}", ln=True, align="C")
+        """Legacy-Methode - wird nicht mehr verwendet, da footer() automatisch aufgerufen wird."""
+        pass

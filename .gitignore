@@ -38,8 +38,12 @@ wheels/
 *.swo
 *~
 
-# Streamlit
-.streamlit/
+# Streamlit (config.toml wird mitcommittet für Cloud-Deployment)
+# .streamlit/secrets.toml nicht committen
+.streamlit/secrets.toml
+
+# Backups (ZIPs mit lokalen Daten)
+backups/
 
 # PDFs
 invoices/

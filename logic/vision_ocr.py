@@ -81,17 +81,22 @@ class VisionOCR:
                 raise FileNotFoundError(f"Bild nicht gefunden: {image_path}")
             
             # Lade Bild
-                try:
-                    image = Image.open(image_path)
-                    # Wende Bildvorverarbeitung an (Kontrast & Schärfe)
-                    image = self._preprocess_image(image)
-                    # Konvertiere Bild zu Bytes
-                    import io
-                    buffer = io.BytesIO()
-                    image.save(buffer, format='JPEG', quality=95)
-                    image_bytes = buffer.getvalue()
-                except Exception as e:
-                    raise ValueError(f"Fehler beim Laden des Bildes {image_path}: {e}")
+            image_bytes = None
+            try:
+                image = Image.open(image_path)
+                # Wende Bildvorverarbeitung an (Kontrast & Schärfe)
+                image = self._preprocess_image(image)
+                # Konvertiere Bild zu Bytes
+                import io
+                buffer = io.BytesIO()
+                image.save(buffer, format='JPEG', quality=95)
+                image_bytes = buffer.getvalue()
+            except Exception as e:
+                raise ValueError(f"Fehler beim Laden des Bildes {image_path}: {e}")
+            
+            # Stelle sicher, dass image_bytes definiert ist
+            if image_bytes is None:
+                raise ValueError(f"Konnte Bild nicht in Bytes konvertieren: {image_path}")
             
             # Prompt für Gemini Vision API
             prompt = """Analysiere dieses Vinyl-Schallplatten-Cover und extrahiere die folgenden Informationen im JSON-Format:
@@ -112,7 +117,8 @@ WICHTIGE HINWEISE:
 - Wenn Artist und Title zusammen stehen, trenne sie deutlich
 - Label ist der Name des Plattenlabels (z.B. "EMI", "Atlantic Records")
 - Katalog-Nummer kann als "CAT", "Cat.No.", "Catalog No.", "Cat#" etc. erscheinen
-- TRACKLISTE: Falls auf dem Cover sichtbar, extrahiere alle Songtitel mit Laufzeiten (Format: "Titel (Laufzeit)" oder "Nummer. Titel - Laufzeit")
+- TRACKLISTE: Suche AKRIBISCH auf dem gesamten Cover (auch auf der Frontseite) nach Songtiteln und Laufzeiten. Viele Cover zeigen die Trackliste auch auf der Vorderseite. Falls Trackliste auf dem Cover sichtbar ist (Front ODER Rückseite), extrahiere ALLE Songtitel mit Laufzeiten im Format "Titel (Laufzeit)" oder "Nummer. Titel - Laufzeit"
+- WICHTIG: Wenn mehrere Seiten auf dem Cover sichtbar sind (z.B. "Seite 1", "Seite 2", "Side A", "Side B", "LP 2", "Seite 3", "Seite 4", etc.), extrahiere ALLE Seiten und formatiere sie als "Seite 1: Track 1 (Laufzeit)\nSeite 2: Track 1 (Laufzeit)" oder "Side A: Track 1 (Laufzeit)\nSide B: Track 1 (Laufzeit)". Bei Doppelalben oder Multi-LPs können alle Seiten auf einem Cover sichtbar sein - erkenne und extrahiere sie alle mit ihren entsprechenden Seiten-Markierungen
 - Wenn eine Information nicht erkennbar ist, verwende einen leeren String "" oder null für das Jahr
 - Extrahiere nur Informationen, die tatsächlich auf dem Cover sichtbar sind
 - Antworte NUR mit dem JSON-Objekt, ohne zusätzlichen Text oder Erklärungen

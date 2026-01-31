@@ -934,7 +934,20 @@ def show_email_verification():
 
 def check_authentication() -> bool:
     """Prüft ob Benutzer eingeloggt ist."""
-    return st.session_state.get("is_authenticated", False) and st.session_state.get("current_user") is not None
+    # VORÜBERGEHEND: Login für localhost deaktiviert
+    # TODO: Wieder aktivieren für Produktion
+    # Setze Standard-Benutzer falls nicht vorhanden
+    if not st.session_state.get("current_user"):
+        st.session_state.current_user = {
+            "username": "localhost",
+            "email": "localhost@local",
+            "id": 1
+        }
+        st.session_state.is_authenticated = True
+    return True  # Login deaktiviert für localhost
+    
+    # Original-Code (auskommentiert):
+    # return st.session_state.get("is_authenticated", False) and st.session_state.get("current_user") is not None
 
 
 def logout():
@@ -964,12 +977,50 @@ def init_session_state():
     if "resend_username" not in st.session_state:
         st.session_state.resend_username = ""
     
-    # Datenbank nur initialisieren wenn eingeloggt
+    # Datenbank initialisieren wenn eingeloggt (oder localhost-Modus)
+    if st.session_state.get("pending_delete_localhost"):
+        base = Path.cwd()
+        for name in ["vinyl_localhost.db", "vinyl_localhost.db-shm", "vinyl_localhost.db-wal"]:
+            p = base / name
+            if p.exists():
+                try:
+                    p.unlink()
+                except Exception:
+                    pass
+        del st.session_state["pending_delete_localhost"]
+    
+    # Wiederherstellung aus hochgeladener ZIP: erst im nächsten Run (keine DB offen)
+    if st.session_state.get("pending_restore"):
+        restore_dir = Path.cwd() / "pending_restore"
+        if restore_dir.exists():
+            cwd = Path.cwd()
+            for item in restore_dir.iterdir():
+                dst = cwd / item.name
+                if item.is_file():
+                    shutil.copy2(item, dst)
+                else:
+                    if dst.exists():
+                        shutil.copytree(item, dst, dirs_exist_ok=True)
+                    else:
+                        shutil.copytree(item, dst)
+            shutil.rmtree(restore_dir)
+        del st.session_state["pending_restore"]
+    
     if st.session_state.is_authenticated and st.session_state.current_user:
         username = st.session_state.current_user.get("username")
         if username:
             if "db" not in st.session_state:
                 st.session_state.db = Database(username=username)
+    # VORÜBERGEHEND: Auch für localhost ohne Login initialisieren
+    elif not st.session_state.get("is_authenticated") and "db" not in st.session_state:
+        # Setze Standard-Benutzer und initialisiere DB
+        st.session_state.current_user = {
+            "username": "localhost",
+            "email": "localhost@local",
+            "id": 1
+        }
+        st.session_state.is_authenticated = True
+        st.session_state.db = Database(username="localhost")
     
     # Wenn nicht eingeloggt, keine Datenbank initialisieren
     if not st.session_state.is_authenticated:
@@ -1188,6 +1239,14 @@ def init_session_state():
         st.session_state.cart_add_success = False  # Flag für persistente Erfolgsmeldung beim Hinzufügen zum Warenkorb
     if "cart_selected_items" not in st.session_state:
         st.session_state.cart_selected_items = []  # Liste von Item-IDs für Mehrfachauswahl im Warenkorb-Tab
+    
+    # Dubletten-Verarbeitung Variablen
+    if "duplicate_found" not in st.session_state:
+        st.session_state.duplicate_found = False
+    if "items_with_duplicates" not in st.session_state:
+        st.session_state.items_with_duplicates = []
+    if "duplicate_success_message" not in st.session_state:
+        st.session_state.duplicate_success_message = None
 
 
 def reset_metadata():
@@ -1247,6 +1306,11 @@ def reset_metadata():
     # Erhöhe Form-Counter um UI-Widgets zu aktualisieren
     st.session_state.form_reset_counter += 1
     
+    # Reset Dubletten-Zustand beim neuen Scan
+    st.session_state.duplicate_found = False
+    st.session_state.items_with_duplicates = []
+    st.session_state.duplicate_success_message = None
+    
     # print("Metadaten zurueckgesetzt - bereit fuer neue Analyse")  # Deaktiviert wegen Streamlit stdout
 
 
@@ -1302,7 +1366,24 @@ def show_dashboard():
             for item in valid_inventory 
             if item.get("status") == "available" or (item.get("quantity", 0) or 0) > 0
         )
-        sold_items = len([item for item in valid_inventory if item.get("status") == "sold"])
+        # Zähle verkaufte Einheiten aus Rechnungen (präziser als nur Status "sold")
+        # #region agent log
+        try:
+            import time
+            log_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cursor", "debug.log")
+            with open(log_file_path, "a", encoding="utf-8") as f_log:
+                f_log.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"A","location":"app.py:show_dashboard","message":"Before get_total_sold_quantity","data":{},"timestamp":int(time.time()*1000)}) + "\n")
+        except: pass
+        # #endregion
+        sold_items = db.get_total_sold_quantity()
+        # #region agent log
+        try:
+            import time
+            log_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cursor", "debug.log")
+            with open(log_file_path, "a", encoding="utf-8") as f_log:
+                f_log.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"A","location":"app.py:show_dashboard","message":"After get_total_sold_quantity","data":{"sold_items":sold_items},"timestamp":int(time.time()*1000)}) + "\n")
+        except: pass
+        # #endregion
         
         total_value = sum(float(item.get("pricing", 0) or 0) * float(item.get("quantity", 1) or 1) for item in valid_inventory if item.get("status") == "available")
         
@@ -1772,6 +1853,12 @@ def show_scan_session():
     st.header("📸 Scan-Session")
     st.markdown("Laden Sie ein Bild eines Vinyl-Covers hoch, um Metadaten automatisch zu erkennen.")
     
+    # Zeige persistierte Erfolgsmeldung falls vorhanden (am Anfang der Seite)
+    if st.session_state.get("duplicate_success_message"):
+        st.success(st.session_state.duplicate_success_message)
+    if st.session_state.get("inventory_success_message"):
+        st.success(st.session_state.inventory_success_message)
+    
     # Prüfe ob Services verfügbar sind
     # Prüfe welche APIs verfügbar sind
     gemini_available = st.session_state.vision_ocr is not None
@@ -1928,8 +2015,24 @@ def show_scan_session():
                             # WICHTIG: Speichere Bildpfade auch in scan_image_path für späteres Speichern
                             if len(temp_paths) == 1:
                                 st.session_state.scan_image_path = temp_paths[0]
+                                # #region agent log
+                                try:
+                                    import time
+                                    log_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cursor", "debug.log")
+                                    with open(log_file_path, "a", encoding="utf-8") as f_log:
+                                        f_log.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H5","location":"app.py:1930","message":"scan_image_path set to string","data":{"value":str(temp_paths[0])[:100],"type":"str"},"timestamp":int(time.time()*1000)}) + "\n")
+                                except: pass
+                                # #endregion
                             else:
                                 st.session_state.scan_image_path = temp_paths
+                                # #region agent log
+                                try:
+                                    import time
+                                    log_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cursor", "debug.log")
+                                    with open(log_file_path, "a", encoding="utf-8") as f_log:
+                                        f_log.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H5","location":"app.py:1938","message":"scan_image_path set to list","data":{"list_len":len(temp_paths),"type":"list"},"timestamp":int(time.time()*1000)}) + "\n")
+                                except: pass
+                                # #endregion
                             
                             # Analysiere Bilder mit verfügbarer API (OpenAI zuerst, dann Gemini als Fallback)
                             recognized_data = None
@@ -2973,8 +3076,12 @@ def show_scan_session():
         
         # Speichern in Inventar
         save_all_btn = st.button("💾 In Inventar speichern", type="primary", use_container_width=True, key="save_inventory")
-        # Erfolgsmeldung unter Button anzeigen
-        show_success_message("", "save_inventory")
+        
+        # Zeige persistierte Erfolgsmeldung direkt unter dem Button (bleibt bestehen bis neue Aktion)
+        if st.session_state.get("duplicate_success_message"):
+            st.success(st.session_state.duplicate_success_message)
+        if st.session_state.get("inventory_success_message"):
+            st.success(st.session_state.inventory_success_message)
         
         # Kopiere Bilder in permanentes Verzeichnis
         def copy_images_to_permanent(image_paths, record_id=None, artist=None, title=None):
@@ -3035,21 +3142,71 @@ def show_scan_session():
             # Kopiere Bilder in den Ordner
             import shutil
             for idx, temp_path in enumerate(image_paths):
-                if temp_path and os.path.exists(temp_path):
+                if not temp_path:
+                    continue
+                
+                # Prüfe, ob temporäre Datei noch existiert
+                temp_path_str = str(temp_path).strip()
+                if not os.path.exists(temp_path_str):
+                    # Versuche, temporäre Datei aus Session State zu verwenden
+                    if "temp_image_paths" in st.session_state and idx < len(st.session_state.temp_image_paths):
+                        alt_path = st.session_state.temp_image_paths[idx]
+                        if alt_path and os.path.exists(alt_path):
+                            temp_path_str = str(alt_path)
+                        else:
+                            st.warning(f"⚠️ Temporäre Bilddatei nicht gefunden: {temp_path}. Überspringe dieses Bild.")
+                            continue
+                    else:
+                        st.warning(f"⚠️ Temporäre Bilddatei nicht gefunden: {temp_path}. Überspringe dieses Bild.")
+                        continue
+                
+                try:
+                    # Einfacher Dateiname, da bereits im eigenen Ordner
+                    ext = Path(temp_path_str).suffix or ".jpg"
+                    filename = f"cover_{idx}{ext}"
+                    
+                    permanent_path = target_folder / filename
+                    
+                    # Kopiere Datei
+                    shutil.copy2(temp_path_str, permanent_path)
+                    # Speichere relativen Pfad
+                    # Prüfe, ob der Pfad tatsächlich relativ ist, bevor relative_to() verwendet wird
                     try:
-                        # Einfacher Dateiname, da bereits im eigenen Ordner
-                        ext = Path(temp_path).suffix or ".jpg"
-                        filename = f"cover_{idx}{ext}"
-                        
-                        permanent_path = target_folder / filename
-                        
-                        # Kopiere Datei
-                        shutil.copy2(temp_path, permanent_path)
-                        # Speichere relativen Pfad
-                        relative_path = permanent_path.relative_to(Path.cwd())
-                        permanent_paths.append(str(relative_path))
+                        # Versuche relativen Pfad zu erstellen
+                        if permanent_path.is_absolute():
+                            # Prüfe ob Pfad innerhalb des Arbeitsverzeichnisses liegt
+                            try:
+                                relative_path = permanent_path.relative_to(Path.cwd())
+                                permanent_paths.append(str(relative_path))
+                            except ValueError:
+                                # Pfad liegt nicht innerhalb des Arbeitsverzeichnisses
+                                # Verwende relativen Pfad basierend auf vinyl_images/
+                                if "vinyl_images" in str(permanent_path):
+                                    # Extrahiere den Teil nach vinyl_images/
+                                    parts = permanent_path.parts
+                                    vinyl_idx = None
+                                    for i, part in enumerate(parts):
+                                        if part == "vinyl_images":
+                                            vinyl_idx = i
+                                            break
+                                    if vinyl_idx is not None:
+                                        relative_parts = parts[vinyl_idx:]
+                                        relative_path = Path(*relative_parts)
+                                        permanent_paths.append(str(relative_path))
+                                    else:
+                                        # Fallback: Verwende absoluten Pfad
+                                        permanent_paths.append(str(permanent_path))
+                                else:
+                                    # Fallback: Verwende absoluten Pfad
+                                    permanent_paths.append(str(permanent_path))
+                        else:
+                            # Pfad ist bereits relativ
+                            permanent_paths.append(str(permanent_path))
                     except Exception as e:
-                        st.warning(f"⚠️ Fehler beim Kopieren des Bildes {temp_path}: {e}")
+                        # Fallback bei Fehler: Verwende absoluten Pfad
+                        permanent_paths.append(str(permanent_path))
+                except Exception as e:
+                    st.warning(f"⚠️ Fehler beim Kopieren des Bildes {temp_path_str}: {e}")
             
             if permanent_paths:
                 return json.dumps(permanent_paths)
@@ -3058,25 +3215,91 @@ def show_scan_session():
         # Serialisiere image_paths sicher
         def serialize_image_paths(paths):
             """Serialisiert Bildpfade sicher zu JSON-String."""
+            # #region agent log
+            try:
+                import time
+                log_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cursor", "debug.log")
+                with open(log_file_path, "a", encoding="utf-8") as f_log:
+                    f_log.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H1","location":"app.py:3071","message":"serialize_image_paths entry","data":{"input_type":str(type(paths)),"input_is_none":paths is None,"input_value":str(paths)[:100] if paths else None},"timestamp":int(time.time()*1000)}) + "\n")
+            except: pass
+            # #endregion
             if not paths:
+                # #region agent log
+                try:
+                    import time
+                    log_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cursor", "debug.log")
+                    with open(log_file_path, "a", encoding="utf-8") as f_log:
+                        f_log.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H1","location":"app.py:3079","message":"serialize_image_paths return None","data":{},"timestamp":int(time.time()*1000)}) + "\n")
+                except: pass
+                # #endregion
                 return None
             try:
                 if isinstance(paths, list):
                     # Filtere None-Werte aus der Liste
                     filtered_paths = [p for p in paths if p]
                     if filtered_paths:
-                        return json.dumps(filtered_paths)
+                        result = json.dumps(filtered_paths)
+                        # #region agent log
+                        try:
+                            import time
+                            log_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cursor", "debug.log")
+                            with open(log_file_path, "a", encoding="utf-8") as f_log:
+                                f_log.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H1","location":"app.py:3088","message":"serialize_image_paths list->json","data":{"input_len":len(paths),"filtered_len":len(filtered_paths),"output_type":str(type(result)),"output_preview":result[:100]},"timestamp":int(time.time()*1000)}) + "\n")
+                        except: pass
+                        # #endregion
+                        return result
+                    # #region agent log
+                    try:
+                        import time
+                        log_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cursor", "debug.log")
+                        with open(log_file_path, "a", encoding="utf-8") as f_log:
+                            f_log.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H1","location":"app.py:3091","message":"serialize_image_paths empty list","data":{},"timestamp":int(time.time()*1000)}) + "\n")
+                    except: pass
+                    # #endregion
                     return None
                 elif isinstance(paths, str):
-                    return json.dumps([paths])
+                    result = json.dumps([paths])
+                    # #region agent log
+                    try:
+                        import time
+                        log_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cursor", "debug.log")
+                        is_json_str = paths.strip().startswith('[') and paths.strip().endswith(']')
+                        with open(log_file_path, "a", encoding="utf-8") as f_log:
+                            f_log.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H2","location":"app.py:3107","message":"serialize_image_paths str->json","data":{"input_preview":paths[:100],"output_type":str(type(result)),"output_preview":result[:100],"is_json_string":is_json_str},"timestamp":int(time.time()*1000)}) + "\n")
+                    except: pass
+                    # #endregion
+                    return result
                 else:
-                    return json.dumps(paths)
+                    result = json.dumps(paths)
+                    # #region agent log
+                    try:
+                        import time
+                        log_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cursor", "debug.log")
+                        with open(log_file_path, "a", encoding="utf-8") as f_log:
+                            f_log.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H1","location":"app.py:3116","message":"serialize_image_paths other->json","data":{"input_type":str(type(paths)),"output_preview":result[:100]},"timestamp":int(time.time()*1000)}) + "\n")
+                    except: pass
+                    # #endregion
+                    return result
             except Exception as e:
+                # #region agent log
+                try:
+                    import time
+                    log_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cursor", "debug.log")
+                    with open(log_file_path, "a", encoding="utf-8") as f_log:
+                        f_log.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H3","location":"app.py:3125","message":"serialize_image_paths exception","data":{"error":str(e)},"timestamp":int(time.time()*1000)}) + "\n")
+                except: pass
+                # #endregion
                 st.warning(f"⚠️ Warnung beim Serialisieren der Bildpfade: {e}")
                 return None
         
         # Speichern in Inventar
         if save_all_btn:
+            # Lösche alte Erfolgsmeldungen vor neuem Speichern, damit neue Meldung angezeigt wird
+            if "duplicate_success_message" in st.session_state:
+                del st.session_state.duplicate_success_message
+            if "inventory_success_message" in st.session_state:
+                del st.session_state.inventory_success_message
+            
             items_to_save = []
             
             # Serialisiere image_paths sicher
@@ -3104,6 +3327,69 @@ def show_scan_session():
                 st.error("❌ Bitte füllen Sie mindestens Artist und Title aus!")
             else:
                 quantity_int = int(quantity)
+                # #region agent log
+                try:
+                    log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cursor", "debug.log")
+                    with open(log_path, "a", encoding="utf-8") as f_log:
+                        import json as json_log
+                        from datetime import datetime
+                        f_log.write(json_log.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H1","location":"app.py:3106","message":"Before items_to_save creation","data":{"has_media_condition_local":"media_condition" in locals(),"has_sleeve_condition_local":"sleeve_condition" in locals(),"scan_media_condition":st.session_state.get("scan_media_condition"),"scan_sleeve_condition":st.session_state.get("scan_sleeve_condition")},"timestamp":int(datetime.now().timestamp()*1000)}) + "\n")
+                except: pass
+                # #endregion
+                # Verwende Session State Werte für media_condition und sleeve_condition
+                media_condition_value = st.session_state.get("scan_media_condition", "VG")
+                sleeve_condition_value = st.session_state.get("scan_sleeve_condition", "VG")
+                # #region agent log
+                try:
+                    with open(log_path, "a", encoding="utf-8") as f_log:
+                        f_log.write(json_log.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H4","location":"app.py:3112","message":"Using session state values","data":{"media_condition_value":media_condition_value,"sleeve_condition_value":sleeve_condition_value},"timestamp":int(datetime.now().timestamp()*1000)}) + "\n")
+                except: pass
+                # #endregion
+                # Hole purchase_price aus Session State
+                purchase_price_value = st.session_state.get("scan_purchase_price")
+                purchase_price_float = float(purchase_price_value) if purchase_price_value and purchase_price_value > 0 else None
+                
+                # Hole scan_image_path und kopiere Bilder BEVOR dem Speichern in permanente Pfade
+                scan_image_path_raw = st.session_state.get("scan_image_path")
+                
+                # Konvertiere zu Liste falls einzelner Pfad
+                temp_image_paths_list = []
+                if scan_image_path_raw:
+                    if isinstance(scan_image_path_raw, str):
+                        temp_image_paths_list = [scan_image_path_raw]
+                    elif isinstance(scan_image_path_raw, list):
+                        temp_image_paths_list = scan_image_path_raw
+                
+                # Prüfe, ob temporäre Dateien noch existieren, falls nicht verwende temp_image_paths aus Session State
+                valid_temp_paths = []
+                for temp_path in temp_image_paths_list:
+                    if temp_path and os.path.exists(temp_path):
+                        valid_temp_paths.append(temp_path)
+                
+                # Falls keine temporären Dateien mehr existieren, versuche temp_image_paths aus Session State
+                if not valid_temp_paths and "temp_image_paths" in st.session_state:
+                    for temp_path in st.session_state.temp_image_paths:
+                        if temp_path and os.path.exists(temp_path):
+                            valid_temp_paths.append(temp_path)
+                
+                # Kopiere Bilder in permanente Pfade BEVOR dem Speichern
+                permanent_image_paths_json = None
+                if valid_temp_paths:
+                    try:
+                        # Verwende temporäre Record-ID für Ordnerstruktur (wird später mit echter ID aktualisiert)
+                        temp_record_id = f"temp_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+                        permanent_image_paths_json = copy_images_to_permanent(
+                            valid_temp_paths,
+                            record_id=temp_record_id,
+                            artist=artist,
+                            title=title
+                        )
+                    except Exception as e:
+                        st.warning(f"⚠️ Fehler beim Kopieren der Bilder: {e}")
+                
+                # Verwende permanente Pfade für image_paths
+                serialized_image_paths = permanent_image_paths_json
+                
                 items_to_save = [{
                     "artist": artist,
                     "title": title,
@@ -3112,141 +3398,248 @@ def show_scan_session():
                     "year": int(year) if year else None,
                     "format": st.session_state.scan_format if st.session_state.scan_format else None,
                     "pricing": float(pricing) if pricing else None,
+                    "purchase_price": purchase_price_float,  # Einkaufspreis aus Scan-Session
                     "quantity": quantity_int,
                     "max_quantity": quantity_int,  # Beim ersten Hinzufügen: max_quantity = quantity
-                    "media_condition": media_condition,
-                    "sleeve_condition": sleeve_condition,
+                    "media_condition": media_condition_value,
+                    "sleeve_condition": sleeve_condition_value,
                     "general_condition": st.session_state.scan_general_condition if st.session_state.scan_general_condition else "VG",
                     "individual_condition_enabled": 1 if st.session_state.scan_individual_condition_enabled else 0,
                     "individual_condition_text": st.session_state.scan_individual_condition_text.strip() if st.session_state.scan_individual_condition_text else None,
                     "condition_grading": condition,
                     "status": "available",
-                    "image_paths": serialize_image_paths(st.session_state.get("scan_image_path")),
+                    "image_paths": serialized_image_paths,  # Enthält jetzt permanente Pfade
                     "tracklist": table_to_tracklist_string(st.session_state.scan_tracklist_table) if st.session_state.scan_tracklist_table else None
                 }]
             
-            # Speichere alle Items mit Dubletten-Prüfung
+            # Speichere alle Items mit Smart-Sync (Duplikat-Prüfung erfolgt in sync_to_inventory())
             if items_to_save:
                 try:
                     saved_count = 0
-                    items_with_duplicates = []  # Liste von Items mit Dubletten
+                    # Initialisiere aus Session State oder als leere Liste
+                    if "items_with_duplicates" not in st.session_state:
+                        st.session_state.items_with_duplicates = []
                     
-                    # Prüfe jedes Item auf Dubletten
+                    # Wenn ein neuer Scan gestartet wird, leere die Duplikat-Liste
+                    if not st.session_state.get("duplicate_found", False):
+                        st.session_state.items_with_duplicates = []
+                        st.session_state.duplicate_found = False
+                    
+                    # Rufe sync_to_inventory() für jedes Item auf - führt automatisch UPDATE oder INSERT durch
                     for item_data in items_to_save:
-                        cat_no = item_data.get("cat_no")
-                        # Nur prüfen wenn cat_no vorhanden, nicht None, nicht leer, nicht "None" (String) und nicht nur Leerzeichen
-                        if cat_no is not None:
-                            cat_no_str = str(cat_no).strip()
-                            # Prüfe auf gültige, nicht-leere Katalognummer (nicht "None", nicht leer)
-                            if cat_no_str and cat_no_str.lower() != "none" and len(cat_no_str) > 0:
-                                # Prüfe auf Dublette - zuerst mit Qualitätsprüfung
-                                media_condition = item_data.get("media_condition")
-                                sleeve_condition = item_data.get("sleeve_condition")
-                                
-                                # Prüfe ob exakte Übereinstimmung (cat_no + Qualität)
-                                duplicate_exact = st.session_state.db.get_duplicate_by_catalog_and_condition(
-                                    cat_no_str, media_condition, sleeve_condition
-                                )
-                                
-                                if duplicate_exact:
-                                    # Exakte Übereinstimmung (cat_no + Qualität) → Duplikat
-                                    items_with_duplicates.append({
-                                        "item": item_data,
-                                        "duplicate": duplicate_exact
-                                    })
-                                else:
-                                    # Prüfe ob nur cat_no übereinstimmt (ohne Qualität)
-                                    duplicate_cat_only = st.session_state.db.get_duplicate_by_catalog(cat_no_str)
-                                    if duplicate_cat_only:
-                                        # Nur cat_no übereinstimmend, aber Qualität unterschiedlich
-                                        # Füge zur Liste hinzu, damit Benutzer entscheiden kann
-                                        items_with_duplicates.append({
-                                            "item": item_data,
-                                            "duplicate": duplicate_cat_only
-                                        })
-                    
-                    # Wenn Dubletten gefunden wurden, zeige Warnung
-                    if items_with_duplicates:
-                        for dup_info in items_with_duplicates:
-                            item_data = dup_info["item"]
-                            duplicate = dup_info["duplicate"]
+                        # Verwende Master-Quantity (scan_quantity) für sync
+                        master_qty = st.session_state.get("scan_quantity", item_data.get("quantity", 1))
+                        item_data["quantity"] = master_qty
+                        item_data["max_quantity"] = master_qty
+                        
+                        # Rufe sync_to_inventory() auf - diese Funktion prüft automatisch auf Duplikate und führt UPDATE/INSERT durch
+                        result = st.session_state.db.sync_to_inventory(item_data)
+                        
+                        if result.get("status") == "updated":
+                            # Bestand wurde aktualisiert (Duplikat gefunden)
+                            saved_count += 1
+                            old_quantity = result.get("old_quantity", 0)
+                            new_quantity = result.get("new_quantity", 0)
+                            added_quantity = new_quantity - old_quantity
                             
-                            # Prüfe Qualitätsunterschiede
-                            existing_media = duplicate.get('media_condition', 'N/A')
-                            existing_sleeve = duplicate.get('sleeve_condition', 'N/A')
-                            new_media = item_data.get('media_condition', 'N/A')
-                            new_sleeve = item_data.get('sleeve_condition', 'N/A')
+                            # Spezifische Erfolgsmeldung für Duplikat-Fall
+                            success_msg = f"Duplikat gefunden, Stückzahl erweitert um {added_quantity} (von {old_quantity} auf {new_quantity})"
+                            st.session_state.duplicate_success_message = success_msg
+                            st.session_state.inventory_success_message = success_msg
                             
-                            quality_different = (existing_media != new_media) or (existing_sleeve != new_sleeve)
-                            
-                            # Erweitere Warnung um Qualitätsinformationen
-                            warning_text = f"⚠️ **Dublette gefunden!**\n\n"
-                            warning_text += f"Die Katalognummer **{item_data.get('cat_no')}** existiert bereits:\n"
-                            warning_text += f"- **Bestehend:** {duplicate.get('artist', 'N/A')} - {duplicate.get('title', 'N/A')} "
-                            warning_text += f"(ID: {duplicate.get('id')}, Stückzahl: {duplicate.get('quantity', 1)})\n"
-                            if existing_media != 'N/A' or existing_sleeve != 'N/A':
-                                warning_text += f"  Qualität: Media={existing_media}, Sleeve={existing_sleeve}\n"
-                            warning_text += f"- **Neu:** {item_data.get('artist', 'N/A')} - {item_data.get('title', 'N/A')} "
-                            warning_text += f"(Stückzahl: {item_data.get('quantity', 1)})\n"
-                            if new_media != 'N/A' or new_sleeve != 'N/A':
-                                warning_text += f"  Qualität: Media={new_media}, Sleeve={new_sleeve}\n"
-                            
-                            if quality_different:
-                                warning_text += f"\n💡 **Hinweis:** Die Qualität unterscheidet sich. Sie können diese Platte als separates Item speichern."
-                            
-                            st.warning(warning_text)
-                            
-                            # Checkbox für "Andere Qualität" wenn Qualität unterschiedlich ist
-                            different_quality_key = f"different_quality_{duplicate.get('id')}_{item_data.get('cat_no', '')}"
-                            if quality_different:
-                                different_quality = st.checkbox(
-                                    "✅ Andere Qualität - Als separates Item speichern",
-                                    key=different_quality_key,
-                                    value=True,  # Standardmäßig aktiviert wenn Qualität unterschiedlich
-                                    help="Aktivieren Sie diese Option, wenn die Qualität (Media/Sleeve Condition) unterschiedlich ist. Die Platte wird dann als separates Item gespeichert."
-                                )
-                                # Wenn aktiviert, entferne aus Duplikaten-Liste (wird normal gespeichert)
-                                if different_quality:
-                                    # Entferne Item aus items_with_duplicates
-                                    items_with_duplicates = [i for i in items_with_duplicates if i != dup_info]
-                                    # Item bleibt in items_to_save und wird normal gespeichert
-                                    st.info("ℹ️ Diese Platte wird als separates Item gespeichert, da die Qualität unterschiedlich ist.")
-                                    continue  # Überspringe die Buttons für dieses Item
-                            
-                            # Buttons für Aktion
-                            col1, col2 = st.columns(2)
-                            with col1:
-                                increment_key = f"increment_{duplicate.get('id')}"
-                                if st.button(f"➕ Stückzahl erhöhen (ID: {duplicate.get('id')})", 
-                                           key=increment_key, use_container_width=True):
-                                    # Erhöhe Stückzahl des bestehenden Eintrags
-                                    increment_amount = item_data.get("quantity", 1)
-                                    success = st.session_state.db.increment_quantity(duplicate.get("id"), increment_amount)
-                                    if success:
-                                        # Setze Erfolgsmeldung für Anzeige unter Button
-                                        set_success_message(f"✅ Stückzahl um {increment_amount} erhöht! (Neue Stückzahl: {duplicate.get('quantity', 1) + increment_amount})", increment_key)
-                                        # Entferne Item aus items_to_save, da es nicht neu gespeichert werden soll
-                                        items_to_save = [i for i in items_to_save if i != item_data]
-                                        st.rerun()
+                            # Aktualisiere Dateinamen mit echter Record-ID falls nötig
+                            record_id = result.get("id")
+                            if item_data.get("image_paths"):
+                                try:
+                                    current_paths_json = item_data.get("image_paths")
+                                    if isinstance(current_paths_json, str):
+                                        current_paths = json.loads(current_paths_json)
                                     else:
-                                        st.error("❌ Fehler beim Erhöhen der Stückzahl.")
-                                # Erfolgsmeldung unter Button anzeigen
-                                show_success_message("", increment_key)
+                                        current_paths = current_paths_json
+                                    
+                                    updated_paths = []
+                                    for idx, path in enumerate(current_paths):
+                                        old_path = Path(path)
+                                        if old_path.exists():
+                                            new_filename = f"cover_{record_id}_{idx}{old_path.suffix}"
+                                            new_path = old_path.parent / new_filename
+                                            if new_path != old_path:
+                                                old_path.rename(new_path)
+                                            updated_paths.append(str(new_path))
+                                        else:
+                                            updated_paths.append(path)
+                                    
+                                    if updated_paths:
+                                        st.session_state.db.update_record("inventory", record_id, {
+                                            "image_paths": json.dumps(updated_paths)
+                                        })
+                                except Exception as e:
+                                    pass
                             
-                            with col2:
-                                save_anyway_key = f"save_anyway_{duplicate.get('id')}"
-                                if st.button(f"💾 Trotzdem als neues Item speichern", 
-                                           key=save_anyway_key, use_container_width=True):
-                                    # Kopiere Bilder in permanentes Verzeichnis BEVOR das Item gespeichert wird
-                                    image_paths_raw = item_data.get("image_paths")
-                                    if image_paths_raw:
-                                        try:
-                                            # Versuche als JSON zu parsen
-                                            if isinstance(image_paths_raw, str):
-                                                parsed_paths = json.loads(image_paths_raw)
+                        elif result.get("status") == "inserted":
+                            # Neuer Eintrag wurde erstellt
+                            record_id = result.get("id")
+                            saved_count += 1
+                            
+                            # Aktualisiere Dateinamen mit echter Record-ID
+                            if item_data.get("image_paths"):
+                                try:
+                                    current_paths_json = item_data.get("image_paths")
+                                    if isinstance(current_paths_json, str):
+                                        current_paths = json.loads(current_paths_json)
+                                    else:
+                                        current_paths = current_paths_json
+                                    
+                                    updated_paths = []
+                                    for idx, path in enumerate(current_paths):
+                                        old_path = Path(path)
+                                        if old_path.exists():
+                                            new_filename = f"cover_{record_id}_{idx}{old_path.suffix}"
+                                            new_path = old_path.parent / new_filename
+                                            if new_path != old_path:
+                                                old_path.rename(new_path)
+                                            updated_paths.append(str(new_path))
+                                        else:
+                                            updated_paths.append(path)
+                                    
+                                    if updated_paths:
+                                        st.session_state.db.update_record("inventory", record_id, {
+                                            "image_paths": json.dumps(updated_paths)
+                                        })
+                                except Exception as e:
+                                    pass
+                    
+                    # Erfolgsmeldung und Navigation
+                    if saved_count > 0:
+                        st.success(f"✅ {saved_count} {'Item' if saved_count == 1 else 'Items'} erfolgreich synchronisiert!")
+                        reset_metadata()
+                        st.session_state.inventory_refresh_needed = True
+                        st.session_state.navigate_to = "Lager-Verwaltung"
+                        st.rerun()
+                    
+                except Exception as e:
+                    import traceback
+                    st.error(f"❌ Fehler beim Synchronisieren: {e}")
+                    with st.expander("🔍 Fehlerdetails anzeigen"):
+                        st.code(traceback.format_exc())
+            
+            # Wenn Dubletten gefunden wurden, zeige immer eine Meldung mit Auswahlmöglichkeiten
+            # WICHTIG: Diese UI muss außerhalb von "if items_to_save:" sein, damit sie auch angezeigt wird,
+            # wenn der Nutzer nur scan_quantity ändert (ohne erneut auf "Alle speichern" zu klicken)
+            # Verwende aktuelle Session State Version für UI-Anzeige
+            
+            # Prüfe ob Navigation aktiv ist - wenn ja, überspringe Duplikat-UI
+            # #region agent log
+            try:
+                with open(log_path, "a", encoding="utf-8") as f_log:
+                    f_log.write(json_log.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"C","location":"app.py:3487","message":"Check navigation state before duplicate UI","data":{"navigate_to":st.session_state.get("navigate_to"),"items_with_duplicates_count":len(st.session_state.get("items_with_duplicates",[]))},"timestamp":int(time.time()*1000)}) + "\n")
+            except: pass
+            # #endregion
+            if st.session_state.get("navigate_to") == "Lager-Verwaltung":
+                # Navigation wird durch main() behandelt, überspringe Duplikat-UI
+                # #region agent log
+                try:
+                    with open(log_path, "a", encoding="utf-8") as f_log:
+                        f_log.write(json_log.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"C","location":"app.py:3488","message":"Skipping duplicate UI due to navigation","data":{},"timestamp":int(time.time()*1000)}) + "\n")
+                except: pass
+                # #endregion
+                pass
+            else:
+                current_duplicates_for_ui = st.session_state.get("items_with_duplicates", [])
+                # Zeige Duplikat-UI auch wenn Detailansicht angezeigt wird
+                if current_duplicates_for_ui:
+                    # Initialisiere saved_count für "Neue ID anlegen" Logik
+                    if "saved_count" not in locals():
+                        saved_count = 0
+                    for dup_info in current_duplicates_for_ui:
+                        item_data = dup_info["item"]
+                        duplicate = dup_info["duplicate"]
+                        
+                        # Zeige persistierte Erfolgsmeldung falls vorhanden (wird nicht automatisch gelöscht)
+                        if st.session_state.get("duplicate_success_message"):
+                            st.success(st.session_state.duplicate_success_message)
+                            # Meldung bleibt bestehen bis neue Aktion ausgeführt wird
+                        
+                        # Prüfe Qualitätsunterschiede für Anzeige
+                        existing_media = duplicate.get('media_condition', 'N/A')
+                        existing_sleeve = duplicate.get('sleeve_condition', 'N/A')
+                        new_media = item_data.get('media_condition', 'N/A')
+                        new_sleeve = item_data.get('sleeve_condition', 'N/A')
+                        
+                        # Erstelle Warnung mit Details
+                        warning_text = f"⚠️ **Dublette gefunden!**\n\n"
+                        warning_text += f"Die Platte existiert bereits im Inventar:\n\n"
+                        warning_text += f"**📋 Bestehend:**\n"
+                        warning_text += f"- **{duplicate.get('artist', 'N/A')} - {duplicate.get('title', 'N/A')}**\n"
+                        warning_text += f"- ID: {duplicate.get('id')}\n"
+                        warning_text += f"- Stückzahl: {duplicate.get('quantity', 1)}\n"
+                        if existing_media != 'N/A' or existing_sleeve != 'N/A':
+                            warning_text += f"- Qualität: Media={existing_media}, Sleeve={existing_sleeve}\n"
+                        
+                        warning_text += f"\n**🆕 Neu gescannt:**\n"
+                        warning_text += f"- **{item_data.get('artist', 'N/A')} - {item_data.get('title', 'N/A')}**\n"
+                        warning_text += f"- Stückzahl: {item_data.get('quantity', 1)}\n"
+                        if new_media != 'N/A' or new_sleeve != 'N/A':
+                            warning_text += f"- Qualität: Media={new_media}, Sleeve={new_sleeve}\n"
+                        
+                        # Warning außerhalb des Forms (für bessere Sichtbarkeit)
+                        st.warning(warning_text)
+                        
+                        # Live-Rechnung: Zeige Bestehend + Neu = Zielbestand
+                        existing_qty = duplicate.get('quantity', 0) or 0
+                        new_qty = st.session_state.get("scan_quantity", item_data.get("quantity", 1))
+                        target_qty = existing_qty + new_qty
+                        st.info(f"📊 **Live-Rechnung:** Bestehend ({existing_qty}) + Neu ({new_qty}) = Zielbestand ({target_qty})")
+                        
+                        # Bestätigungsfrage
+                        st.markdown("**❓ Soll die Stückzahl aktualisiert werden?**")
+                        
+                        # Zwei Buttons: Ja und Abbrechen
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            confirm_button_key = f"confirm_update_{duplicate.get('id')}_{item_data.get('cat_no', '')}"
+                            if st.button(
+                                "✅ Ja, Stückzahl erhöhen",
+                                key=confirm_button_key,
+                                use_container_width=True,
+                                type="primary",
+                                help="Erhöht die Stückzahl des bestehenden Eintrags um die gescannte Menge."
+                            ):
+                                # Bereite item_data vor
+                                master_qty = st.session_state.get("scan_quantity", item_data.get("quantity", 1))
+                                item_data["quantity"] = master_qty
+                                item_data["max_quantity"] = master_qty
+                                
+                                # Prüfe, ob Bilder bereits in permanente Pfade kopiert wurden
+                                image_paths_raw = item_data.get("image_paths")
+                                if image_paths_raw:
+                                    try:
+                                        # Versuche als JSON zu parsen
+                                        if isinstance(image_paths_raw, str):
+                                            parsed_paths = json.loads(image_paths_raw)
+                                        else:
+                                            parsed_paths = image_paths_raw
+                                        
+                                        # Prüfe, ob die Pfade bereits permanent sind
+                                        paths_are_permanent = False
+                                        if isinstance(parsed_paths, list) and len(parsed_paths) > 0:
+                                            first_path = str(parsed_paths[0])
+                                            # Prüfe ob Pfad bereits permanent ist (beginnt mit vinyl_images/)
+                                            if first_path.startswith("vinyl_images") or first_path.startswith("vinyl_images/"):
+                                                paths_are_permanent = True
+                                            # Prüfe auch auf temporäre Pfade (Windows Temp)
+                                            elif "AppData" in first_path and "Local" in first_path and "Temp" in first_path:
+                                                paths_are_permanent = False
+                                            # Prüfe auf Unix Temp-Pfade
+                                            elif first_path.startswith("/tmp/") or first_path.startswith("/var/tmp/"):
+                                                paths_are_permanent = False
                                             else:
-                                                parsed_paths = image_paths_raw
-                                            
+                                                # Wenn Pfad existiert und nicht temporär ist, ist er wahrscheinlich permanent
+                                                if os.path.exists(first_path):
+                                                    paths_are_permanent = True
+                                        
+                                        # Nur kopieren, wenn die Pfade noch nicht permanent sind
+                                        if not paths_are_permanent:
                                             # Erstelle temporäre Record-ID für Dateinamen
                                             temp_record_id = f"temp_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
                                             
@@ -3261,18 +3654,27 @@ def show_scan_session():
                                             # Aktualisiere image_paths im item_data
                                             if permanent_image_paths:
                                                 item_data["image_paths"] = permanent_image_paths
-                                        except Exception as e:
-                                            st.warning(f"⚠️ Fehler beim Kopieren der Bilder: {e}")
+                                    except Exception as e:
+                                        st.warning(f"⚠️ Fehler beim Kopieren der Bilder: {e}")
+                                
+                                # Rufe sync_to_inventory() auf - führt automatisch UPDATE durch wenn Duplikat gefunden
+                                try:
+                                    result = st.session_state.db.sync_to_inventory(item_data)
                                     
-                                    # Speichere als neues Item (einmalig mit angegebener quantity)
-                                    record_id = st.session_state.db.add_record("inventory", item_data)
-                                    if record_id:
-                                        saved_count += 1
+                                    if result.get("status") == "updated":
+                                        # Erfolgsmeldung mit Details (Duplikat gefunden)
+                                        old_quantity = result.get("old_quantity", 0)
+                                        new_quantity = result.get("new_quantity", 0)
+                                        added_quantity = new_quantity - old_quantity
+                                        success_msg = f"Duplikat gefunden, Stückzahl erweitert um {added_quantity} (von {old_quantity} auf {new_quantity})"
+                                        st.session_state.duplicate_success_message = success_msg
+                                        st.session_state.inventory_success_message = success_msg
                                         
-                                        # Aktualisiere Dateinamen mit echter Record-ID
+                                        # Aktualisiere Dateinamen mit echter Record-ID falls nötig
+                                        record_id = result.get("id")
                                         if item_data.get("image_paths"):
                                             try:
-                                                current_paths = json.loads(item_data["image_paths"])
+                                                current_paths = json.loads(item_data["image_paths"]) if isinstance(item_data["image_paths"], str) else item_data["image_paths"]
                                                 updated_paths = []
                                                 for idx, path in enumerate(current_paths):
                                                     old_path = Path(path)
@@ -3292,25 +3694,111 @@ def show_scan_session():
                                             except Exception as e:
                                                 pass
                                         
-                                        # Setze Erfolgsmeldung für Anzeige unter Button
-                                        set_success_message(f"✅ Als neues Item gespeichert (ID: {record_id}, Stückzahl: {item_data.get('quantity', 1)})", save_anyway_key)
-                                    # Entferne Item aus items_with_duplicates, damit es nicht erneut geprüft wird
-                                    items_with_duplicates = [i for i in items_with_duplicates if i["item"] != item_data]
+                                    elif result.get("status") == "inserted":
+                                        # Neuer Eintrag erstellt (sollte bei Duplikat nicht passieren, aber für Sicherheit)
+                                        record_id = result.get("id")
+                                        success_msg = f"✅ Neuer Eintrag erstellt (ID: {record_id})"
+                                        st.session_state.duplicate_success_message = success_msg
+                                        st.session_state.inventory_success_message = success_msg
+                                        
+                                        # Aktualisiere Dateinamen mit echter Record-ID
+                                        if item_data.get("image_paths"):
+                                            try:
+                                                current_paths = json.loads(item_data["image_paths"]) if isinstance(item_data["image_paths"], str) else item_data["image_paths"]
+                                                updated_paths = []
+                                                for idx, path in enumerate(current_paths):
+                                                    old_path = Path(path)
+                                                    if old_path.exists():
+                                                        new_filename = f"cover_{record_id}_{idx}{old_path.suffix}"
+                                                        new_path = old_path.parent / new_filename
+                                                        if new_path != old_path:
+                                                            old_path.rename(new_path)
+                                                        updated_paths.append(str(new_path))
+                                                    else:
+                                                        updated_paths.append(path)
+                                                
+                                                if updated_paths:
+                                                    st.session_state.db.update_record("inventory", record_id, {
+                                                        "image_paths": json.dumps(updated_paths)
+                                                    })
+                                            except Exception as e:
+                                                pass
+                                    
+                                    # Entferne verarbeitetes Item aus Session State
+                                    st.session_state.items_with_duplicates = [
+                                        i for i in st.session_state.items_with_duplicates 
+                                        if i != dup_info
+                                    ]
+                                    
+                                    # Wenn keine Duplikate mehr vorhanden, setze Flag zurück
+                                    if not st.session_state.items_with_duplicates:
+                                        st.session_state.duplicate_found = False
+                                    
+                                    # Reset Scan-State
+                                    reset_metadata()
+                                    st.session_state.last_uploaded_files = (None, None)
+                                    st.session_state.scan_image_path = None
+                                    
+                                    # Setze Flag für Inventar-Aktualisierung
+                                    st.session_state.inventory_refresh_needed = True
+                                    
+                                    # Navigiere automatisch zur Lager-Verwaltung
+                                    st.session_state.navigate_to = "Lager-Verwaltung"
+                                    
+                                    # Automatisches Neuladen der Seite
+                                    st.balloons()
+                                    st.info("🔄 Weiterleitung zur Lager-Verwaltung...")
                                     st.rerun()
-                                # Erfolgsmeldung unter Button anzeigen
-                                show_success_message("", save_anyway_key)
-                                # Erfolgsmeldung unter Button anzeigen
-                                show_success_message("", save_anyway_key)
+                                    
+                                except Exception as e:
+                                    st.error(f"❌ Fehler beim Aktualisieren der Stückzahl: {str(e)}")
+                        
+                        with col2:
+                            cancel_button_key = f"cancel_update_{duplicate.get('id')}_{item_data.get('cat_no', '')}"
+                            if st.button(
+                                "❌ Abbrechen",
+                                key=cancel_button_key,
+                                use_container_width=True,
+                                help="Bricht den Vorgang ab und kehrt zum Scan zurück."
+                            ):
+                                # Entferne verarbeitetes Item aus Session State
+                                st.session_state.items_with_duplicates = [
+                                    i for i in st.session_state.items_with_duplicates 
+                                    if i != dup_info
+                                ]
+                                
+                                # Wenn keine Duplikate mehr vorhanden, setze Flag zurück
+                                if not st.session_state.items_with_duplicates:
+                                    st.session_state.duplicate_found = False
+                                
+                                st.info("ℹ️ Vorgang abgebrochen. Sie können den Scan fortsetzen.")
+                                st.rerun()
                     
-                    # Speichere alle Items ohne Dubletten (oder solche, die trotzdem gespeichert werden sollen)
+                    st.markdown("---")
+                    
+                    st.markdown("---")
+            
+            # Speichere alle Items ohne Dubletten (oder solche, die trotzdem gespeichert werden sollen)
+            # Dies wird nur ausgeführt, wenn items_to_save existiert (d.h. wenn "Alle speichern" geklickt wurde)
+            if items_to_save:
+                try:
                     items_to_save_filtered = items_to_save
-                    for dup_info in items_with_duplicates:
+                    # Verwende Session State für items_with_duplicates
+                    current_items_with_duplicates = st.session_state.get("items_with_duplicates", [])
+                    for dup_info in current_items_with_duplicates:
                         # Entferne Items mit Dubletten, die noch nicht verarbeitet wurden
                         items_to_save_filtered = [i for i in items_to_save_filtered if i != dup_info["item"]]
                     
+                    # #region agent log
+                    try:
+                        with open(log_path, "a", encoding="utf-8") as f_log:
+                            f_log.write(json_log.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"C","location":"app.py:3375","message":"Before saving items","data":{"items_to_save_filtered_count":len(items_to_save_filtered),"items_with_duplicates_count":len(current_items_with_duplicates),"saved_count":saved_count},"timestamp":int(os_log.path.getmtime(log_path) if os_log.path.exists(log_path) else 0)}) + "\n")
+                    except: pass
+                    # #endregion
+                    
                     # Speichere verbleibende Items
                     for item_data in items_to_save_filtered:
-                        # Kopiere Bilder in permanentes Verzeichnis BEVOR das Item gespeichert wird
+                        # Prüfe, ob Bilder bereits in permanente Pfade kopiert wurden
                         # Parse image_paths aus item_data
                         image_paths_raw = item_data.get("image_paths")
                         if image_paths_raw:
@@ -3321,65 +3809,139 @@ def show_scan_session():
                                 else:
                                     parsed_paths = image_paths_raw
                                 
-                                # Erstelle temporäre Record-ID für Dateinamen (wird später aktualisiert)
-                                temp_record_id = f"temp_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+                                # Prüfe, ob die Pfade bereits permanent sind
+                                paths_are_permanent = False
+                                if isinstance(parsed_paths, list) and len(parsed_paths) > 0:
+                                    first_path = str(parsed_paths[0])
+                                    # Prüfe ob Pfad bereits permanent ist (beginnt mit vinyl_images/)
+                                    if first_path.startswith("vinyl_images") or first_path.startswith("vinyl_images/"):
+                                        paths_are_permanent = True
+                                    # Prüfe auch auf temporäre Pfade (Windows Temp)
+                                    elif "AppData" in first_path and "Local" in first_path and "Temp" in first_path:
+                                        paths_are_permanent = False
+                                    # Prüfe auf Unix Temp-Pfade
+                                    elif first_path.startswith("/tmp/") or first_path.startswith("/var/tmp/"):
+                                        paths_are_permanent = False
+                                    else:
+                                        # Wenn Pfad existiert und nicht temporär ist, ist er wahrscheinlich permanent
+                                        if os.path.exists(first_path):
+                                            paths_are_permanent = True
                                 
-                                # Kopiere Bilder in permanentes Verzeichnis
-                                permanent_image_paths = copy_images_to_permanent(
-                                    parsed_paths, 
-                                    record_id=temp_record_id,
-                                    artist=item_data.get("artist"),
-                                    title=item_data.get("title")
-                                )
-                                
-                                # Aktualisiere image_paths im item_data
-                                if permanent_image_paths:
-                                    item_data["image_paths"] = permanent_image_paths
+                                # Nur kopieren, wenn die Pfade noch nicht permanent sind
+                                if not paths_are_permanent:
+                                    # Erstelle temporäre Record-ID für Dateinamen (wird später aktualisiert)
+                                    temp_record_id = f"temp_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+                                    
+                                    # Kopiere Bilder in permanentes Verzeichnis
+                                    permanent_image_paths = copy_images_to_permanent(
+                                        parsed_paths, 
+                                        record_id=temp_record_id,
+                                        artist=item_data.get("artist"),
+                                        title=item_data.get("title")
+                                    )
+                                    
+                                    # Aktualisiere image_paths im item_data
+                                    if permanent_image_paths:
+                                        item_data["image_paths"] = permanent_image_paths
                             except Exception as e:
                                 st.warning(f"⚠️ Fehler beim Kopieren der Bilder: {e}")
                         
                         # Speichere als einzelnes Item mit angegebener quantity (nicht mehrere Datensätze)
-                        record_id = st.session_state.db.add_record("inventory", item_data)
-                        if record_id:
-                            saved_count += 1
+                        # Nutze sync_to_inventory() für zentrale Smart-Sync Logik
+                        try:
+                            result = st.session_state.db.sync_to_inventory(item_data)
                             
-                            # Aktualisiere Dateinamen mit echter Record-ID (optional, für bessere Organisation)
-                            if item_data.get("image_paths"):
-                                try:
-                                    # Parse image_paths
-                                    current_paths = json.loads(item_data["image_paths"])
-                                    updated_paths = []
-                                    for idx, path in enumerate(current_paths):
-                                        old_path = Path(path)
-                                        if old_path.exists():
-                                            # Erstelle neuen Dateinamen mit Record-ID
-                                            new_filename = f"cover_{record_id}_{idx}{old_path.suffix}"
-                                            new_path = old_path.parent / new_filename
-                                            if new_path != old_path:
-                                                old_path.rename(new_path)
-                                            updated_paths.append(str(new_path))
+                            if result.get("status") == "updated":
+                                record_id = result.get("id")
+                                saved_count += 1
+                                
+                                # Aktualisiere Dateinamen mit echter Record-ID
+                                if item_data.get("image_paths"):
+                                    try:
+                                        current_paths_json = item_data.get("image_paths")
+                                        if isinstance(current_paths_json, str):
+                                            current_paths = json.loads(current_paths_json)
                                         else:
-                                            updated_paths.append(path)
-                                    
-                                    # Aktualisiere in Datenbank
-                                    if updated_paths:
-                                        st.session_state.db.update_record("inventory", record_id, {
-                                            "image_paths": json.dumps(updated_paths)
-                                        })
-                                except Exception as e:
-                                    # Fehler beim Umbenennen ist nicht kritisch
-                                    pass
+                                            current_paths = current_paths_json
+                                        
+                                        updated_paths = []
+                                        for idx, path in enumerate(current_paths):
+                                            old_path = Path(path)
+                                            if old_path.exists():
+                                                new_filename = f"cover_{record_id}_{idx}{old_path.suffix}"
+                                                new_path = old_path.parent / new_filename
+                                                if new_path != old_path:
+                                                    old_path.rename(new_path)
+                                                updated_paths.append(str(new_path))
+                                            else:
+                                                updated_paths.append(path)
+                                        
+                                        if updated_paths:
+                                            st.session_state.db.update_record("inventory", record_id, {
+                                                "image_paths": json.dumps(updated_paths)
+                                            })
+                                    except Exception as e:
+                                        pass
+                                
+                                st.success(f"✅ Bestand aktualisiert: {result['old_quantity']} → {result['new_quantity']}")
+                                
+                            elif result.get("status") == "inserted":
+                                record_id = result.get("id")
+                                saved_count += 1
+                                
+                                # Aktualisiere Dateinamen mit echter Record-ID
+                                if item_data.get("image_paths"):
+                                    try:
+                                        current_paths_json = item_data.get("image_paths")
+                                        if isinstance(current_paths_json, str):
+                                            current_paths = json.loads(current_paths_json)
+                                        else:
+                                            current_paths = current_paths_json
+                                        
+                                        updated_paths = []
+                                        for idx, path in enumerate(current_paths):
+                                            old_path = Path(path)
+                                            if old_path.exists():
+                                                new_filename = f"cover_{record_id}_{idx}{old_path.suffix}"
+                                                new_path = old_path.parent / new_filename
+                                                if new_path != old_path:
+                                                    old_path.rename(new_path)
+                                                updated_paths.append(str(new_path))
+                                            else:
+                                                updated_paths.append(path)
+                                        
+                                        if updated_paths:
+                                            st.session_state.db.update_record("inventory", record_id, {
+                                                "image_paths": json.dumps(updated_paths)
+                                            })
+                                    except Exception as e:
+                                        pass
+                                
+                                st.success(f"✅ Neuer Eintrag erstellt (ID: {record_id})")
+                                
+                        except Exception as e:
+                            st.error(f"❌ Fehler beim Synchronisieren: {str(e)}")
+                            raise
                     
                     # Erfolgsmeldung und Reset
+                    # #region agent log
+                    try:
+                        with open(log_path, "a", encoding="utf-8") as f_log:
+                            f_log.write(json_log.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"D","location":"app.py:3285","message":"Before success/error message","data":{"saved_count":saved_count,"items_with_duplicates_count":len(items_with_duplicates),"items_with_duplicates_empty":not items_with_duplicates},"timestamp":int(os_log.path.getmtime(log_path) if os_log.path.exists(log_path) else 0)}) + "\n")
+                    except: pass
+                    # #endregion
+                    # Verwende Session State für items_with_duplicates
+                    current_items_with_duplicates = st.session_state.get("items_with_duplicates", [])
                     if saved_count > 0:
-                        if not items_with_duplicates:
-                            # Setze Erfolgsmeldung für Anzeige unter Button
-                            set_success_message(f"✅ {saved_count} Platte(n) erfolgreich gespeichert!", "save_inventory")
+                        if not current_items_with_duplicates:
+                            # Erfolgsmeldung wurde bereits für jedes Item einzeln angezeigt
+                            # Setze zusätzliche Zusammenfassung für Button-Anzeige
+                            set_success_message(f"✅ {saved_count} neue Platte(n) mit neuen ID-Nummern gespeichert!", "save_inventory")
                         else:
-                            st.info(f"ℹ️ {saved_count} Platte(n) gespeichert. {len(items_with_duplicates)} Dublette(n) gefunden - bitte Aktion wählen.")
+                            st.info(f"ℹ️ {saved_count} Platte(n) gespeichert. {len(current_items_with_duplicates)} Dublette(n) gefunden - bitte Aktion wählen.")
                         
                         # Nur resetten wenn keine offenen Dubletten mehr vorhanden sind
-                        if not items_with_duplicates:
+                        if not current_items_with_duplicates:
                             # Reset Session State
                             reset_metadata()
                             st.session_state.last_uploaded_files = (None, None)
@@ -3392,11 +3954,23 @@ def show_scan_session():
                             st.balloons()
                             st.info("🔄 Weiterleitung zur Lager-Verwaltung...")
                             st.rerun()
-                    elif not items_with_duplicates:
-                        # Nur Fehler anzeigen wenn keine Dubletten vorhanden (dann wurde nichts gespeichert)
+                    elif not current_items_with_duplicates:
+                        # Nur Fehler anzeigen wenn wirklich nichts passiert ist
+                        # #region agent log
+                        try:
+                            with open(log_path, "a", encoding="utf-8") as f_log:
+                                f_log.write(json_log.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"D","location":"app.py:3467","message":"Showing error message","data":{"saved_count":saved_count,"items_with_duplicates_count":len(current_items_with_duplicates)},"timestamp":int(os_log.path.getmtime(log_path) if os_log.path.exists(log_path) else 0)}) + "\n")
+                        except: pass
+                        # #endregion
                         st.error("❌ Fehler beim Speichern in die Datenbank.")
                 except Exception as e:
                     import traceback
+                    # #region agent log
+                    try:
+                        with open(log_path, "a", encoding="utf-8") as f_log:
+                            f_log.write(json_log.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"A","location":"app.py:3468","message":"Exception caught in save block","data":{"error":str(e),"error_type":type(e).__name__,"traceback":traceback.format_exc()},"timestamp":int(os_log.path.getmtime(log_path) if os_log.path.exists(log_path) else 0)}) + "\n")
+                    except: pass
+                    # #endregion
                     st.error(f"❌ Fehler beim Speichern: {e}")
                     with st.expander("🔍 Fehlerdetails anzeigen"):
                         st.code(traceback.format_exc())
@@ -3409,6 +3983,11 @@ def show_inventory():
     st.header("📦 Inventar")
     
     db = st.session_state.db
+    
+    # Prüfe ob Inventar-Liste aktualisiert werden muss (z.B. nach Stückzahl-Erhöhung)
+    inventory_refresh_needed = st.session_state.get("inventory_refresh_needed", False)
+    # Hole Erfolgsmeldung aus Session State falls vorhanden (immer prüfen, nicht nur bei refresh_needed)
+    success_message = st.session_state.get("inventory_success_message", None)
     
     # Sidebar mit Filtern
     with st.sidebar:
@@ -3456,7 +4035,8 @@ def show_inventory():
         st.subheader("💰 Preisbereich")
         
         # Hole Min/Max Preise aus Datenbank
-        all_items = db.get_all_records("inventory")
+        # Wenn Refresh benötigt wird, führe WAL Checkpoint durch für aktuelle Daten
+        all_items = db.get_all_records("inventory", force_wal_checkpoint=inventory_refresh_needed)
         prices = [float(item.get("pricing", 0) or 0) for item in all_items if item.get("pricing")]
         min_price_db = min(prices) if prices else 0
         max_price_db = max(prices) if prices else 1000
@@ -3594,12 +4174,53 @@ def show_inventory():
         st.session_state.inventory_sort = "Nr. (absteigend)"
     order_by_clause = sort_options_map.get(sort_selection, "created_at DESC")
     
+    # WAL Checkpoint VOR Hauptdatenabfrage wenn Refresh benötigt wird
+    # Dies stellt sicher, dass alle Änderungen sichtbar sind bevor Daten geladen werden
+    if inventory_refresh_needed:
+        try:
+            conn = db._get_connection()
+            # Verwende RESTART für aggressiveren Checkpoint
+            conn.execute("PRAGMA wal_checkpoint(RESTART)")
+            # Versuche zusätzlich TRUNCATE für vollständige Synchronisation
+            try:
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except Exception:
+                # TRUNCATE kann fehlschlagen wenn keine WAL-Datei vorhanden - das ist OK
+                pass
+            # Verifikationsabfrage: Stelle sicher, dass Connection aktualisiert ist
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM inventory")
+            cursor.fetchone()
+            # Setze Verbindung zurück, damit die nächste Abfrage die neuesten Daten sieht
+            conn.close()
+            # Setze thread-lokale Verbindung zurück
+            if hasattr(db, '_local') and hasattr(db._local, 'conn'):
+                db._local.conn = None
+        except Exception:
+            # Falls Checkpoint fehlschlägt, versuche Verbindung trotzdem zurückzusetzen
+            try:
+                if hasattr(db, '_local') and hasattr(db._local, 'conn') and db._local.conn:
+                    db._local.conn.close()
+                    db._local.conn = None
+            except Exception:
+                pass
+    
     # Suche in Datenbank
     inventory = db.search_inventory(
         query=search_query if search_query else None, 
         filters=filters if filters else None,
         order_by=order_by_clause
     )
+    
+    # Zeige persistierte Erfolgsmeldung falls vorhanden (bleibt bestehen bis neue Aktion)
+    if success_message:
+        st.success(success_message)
+        # Meldung bleibt bestehen bis neue Aktion ausgeführt wird
+        # Wird nur gelöscht durch reset_metadata() oder explizite Löschung bei neuer Aktion
+    
+    # Lösche inventory_refresh_needed Flag nach Verwendung (aber nicht die Erfolgsmeldung)
+    if inventory_refresh_needed and "inventory_refresh_needed" in st.session_state:
+        del st.session_state.inventory_refresh_needed
     
     # Statistik
     col1, col2, col3, col4 = st.columns(4)
@@ -3633,8 +4254,12 @@ def show_inventory():
         if "pricing" in df.columns:
             df["pricing"] = df["pricing"].apply(lambda x: f"{float(x or 0):.2f} EUR" if x else "0.00 EUR")
         
-        if "purchase_price" in df.columns:
-            df["purchase_price"] = df["purchase_price"].apply(lambda x: f"{float(x or 0):.2f} EUR" if x else "0.00 EUR")
+        # Stelle sicher, dass purchase_price IMMER vorhanden ist (auch wenn nicht in Daten)
+        if "purchase_price" not in df.columns:
+            df["purchase_price"] = None
+        
+        # Formatiere purchase_price (auch wenn None-Werte vorhanden sind)
+        df["purchase_price"] = df["purchase_price"].apply(lambda x: f"{float(x or 0):.2f} EUR" if x else "0.00 EUR")
         
         # Berechne verkaufte Einheiten aus Rechnungen (MUSS VOR Formatierung von quantity erfolgen)
         if "id" in df.columns:
@@ -3873,57 +4498,108 @@ def show_inventory():
         show_vinyl_detail_view(st.session_state.selected_vinyl_id, db)
 
 
-def show_vinyl_detail_view(item_id: int, db: Database):
+def show_vinyl_detail_view(item_id: int, db: Database, inline: bool = False):
     """
     Zeigt Detailansicht und Bearbeitungsformular für eine ausgewählte Platte.
     
     Args:
         item_id: ID des Inventar-Eintrags
         db: Database-Instanz
+        inline: Wenn True, wird die Detailansicht inline angezeigt (z.B. in Duplikat-Warnung)
     """
     # Lade Datensatz aus Datenbank
     item = db.get_record("inventory", item_id)
     
     if not item:
         st.error(f"❌ Platte mit ID {item_id} nicht gefunden.")
-        st.session_state.selected_vinyl_id = None
+        if not inline:
+            st.session_state.selected_vinyl_id = None
         return
     
     st.header(f"✏️ Bearbeiten: {item.get('artist', 'N/A')} - {item.get('title', 'N/A')}")
     
-    # Button zum Schließen der Detailansicht
-    if st.button("❌ Detailansicht schließen", key=f"close_detail_view_{item_id}", use_container_width=True):
-        # Setze selected_vinyl_id auf None
-        st.session_state.selected_vinyl_id = None
-        # Lösche auch die Selectbox-Auswahl
-        if "vinyl_selection_dropdown" in st.session_state:
-            # Setze Selectbox zurück, indem wir den Index auf 0 setzen
-            # Das wird durch das Löschen des Keys erreicht
-            del st.session_state.vinyl_selection_dropdown
-        st.session_state.edit_vinyl_data = {}
-        st.session_state.edit_tracklist_table = {}
-        st.rerun()
+    # Button zum Schließen der Detailansicht (nur wenn nicht inline)
+    if not inline:
+        if st.button("❌ Detailansicht schließen", key=f"close_detail_view_{item_id}", use_container_width=True):
+            # Setze selected_vinyl_id auf None
+            st.session_state.selected_vinyl_id = None
+            # Lösche auch die Selectbox-Auswahl
+            if "vinyl_selection_dropdown" in st.session_state:
+                # Setze Selectbox zurück, indem wir den Index auf 0 setzen
+                # Das wird durch das Löschen des Keys erreicht
+                del st.session_state.vinyl_selection_dropdown
+            st.session_state.edit_vinyl_data = {}
+            st.session_state.edit_tracklist_table = {}
+            st.rerun()
     
     st.markdown("---")
     
     # Bilder anzeigen
     image_paths = item.get("image_paths")
+    # #region agent log
+    try:
+        import time
+        log_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cursor", "debug.log")
+        with open(log_file_path, "a", encoding="utf-8") as f_log:
+            f_log.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H4","location":"app.py:4155","message":"Retrieved image_paths from item","data":{"type":str(type(image_paths)),"is_none":image_paths is None,"value_preview":str(image_paths)[:150] if image_paths else None,"is_str":isinstance(image_paths, str),"is_list":isinstance(image_paths, list)},"timestamp":int(time.time()*1000)}) + "\n")
+    except: pass
+    # #endregion
     if image_paths:
         st.subheader("🖼️ Cover-Bilder")
         
         # Parse image_paths (kann String, JSON-String oder Liste sein)
         image_list = []
         if isinstance(image_paths, str):
+            # Prüfe auf doppelte Serialisierung (JSON-String in JSON-String)
             # Versuche zuerst als JSON zu parsen
             try:
                 parsed = json.loads(image_paths)
-                if isinstance(parsed, list):
-                    image_list = parsed
-                elif isinstance(parsed, str):
-                    image_list = [parsed]
+                # #region agent log
+                try:
+                    import time
+                    log_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cursor", "debug.log")
+                    with open(log_file_path, "a", encoding="utf-8") as f_log:
+                        f_log.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H4","location":"app.py:4168","message":"JSON parse success","data":{"parsed_type":str(type(parsed)),"parsed_is_list":isinstance(parsed, list),"parsed_len":len(parsed) if isinstance(parsed, list) else None},"timestamp":int(time.time()*1000)}) + "\n")
+                except: pass
+                # #endregion
+                
+                # Prüfe auf doppelte Serialisierung
+                if isinstance(parsed, str):
+                    # Parsed ist ein String - könnte doppelt serialisiert sein
+                    try:
+                        # Versuche erneut zu parsen
+                        double_parsed = json.loads(parsed)
+                        if isinstance(double_parsed, list):
+                            image_list = double_parsed
+                        elif isinstance(double_parsed, str):
+                            image_list = [double_parsed]
+                        else:
+                            image_list = [parsed]
+                    except (json.JSONDecodeError, TypeError):
+                        # Keine doppelte Serialisierung, verwende parsed als String
+                        image_list = [parsed]
+                elif isinstance(parsed, list):
+                    # Normalisiere Pfade nach dem Parsen
+                    normalized_list = []
+                    for path in parsed:
+                        if isinstance(path, str):
+                            # Normalisiere Pfad-Separatoren
+                            normalized_path = str(Path(path))
+                            normalized_list.append(normalized_path)
+                        else:
+                            normalized_list.append(str(path))
+                    image_list = normalized_list
                 else:
                     image_list = [image_paths]
-            except (json.JSONDecodeError, TypeError):
+            except (json.JSONDecodeError, TypeError) as e:
+                # #region agent log
+                try:
+                    import time
+                    log_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cursor", "debug.log")
+                    with open(log_file_path, "a", encoding="utf-8") as f_log:
+                        f_log.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H3","location":"app.py:4195","message":"JSON parse failed","data":{"error":str(e),"value_preview":image_paths[:150]},"timestamp":int(time.time()*1000)}) + "\n")
+                except: pass
+                # #endregion
                 # Falls kein JSON, prüfe ob es eine String-Repräsentation einer Liste ist
                 # (z.B. wenn SQLite eine Liste als String gespeichert hat)
                 if image_paths.strip().startswith('[') and image_paths.strip().endswith(']'):
@@ -3931,18 +4607,68 @@ def show_vinyl_detail_view(item_id: int, db: Database):
                         # Versuche mit ast.literal_eval (sicherer als eval)
                         import ast
                         parsed = ast.literal_eval(image_paths)
+                        # #region agent log
+                        try:
+                            import time
+                            log_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cursor", "debug.log")
+                            with open(log_file_path, "a", encoding="utf-8") as f_log:
+                                f_log.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H3","location":"app.py:4208","message":"ast.literal_eval success","data":{"parsed_type":str(type(parsed)),"parsed_is_list":isinstance(parsed, list)},"timestamp":int(time.time()*1000)}) + "\n")
+                        except: pass
+                        # #endregion
                         if isinstance(parsed, list):
-                            image_list = parsed
+                            # Normalisiere Pfade nach dem Parsen
+                            normalized_list = []
+                            for path in parsed:
+                                if isinstance(path, str):
+                                    # Normalisiere Pfad-Separatoren
+                                    normalized_path = str(Path(path))
+                                    normalized_list.append(normalized_path)
+                                else:
+                                    normalized_list.append(str(path))
+                            image_list = normalized_list
                         else:
                             image_list = [image_paths]
-                    except:
+                    except Exception as e2:
+                        # #region agent log
+                        try:
+                            import time
+                            log_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cursor", "debug.log")
+                            with open(log_file_path, "a", encoding="utf-8") as f_log:
+                                f_log.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H3","location":"app.py:4219","message":"ast.literal_eval failed","data":{"error":str(e2)},"timestamp":int(time.time()*1000)}) + "\n")
+                        except: pass
+                        # #endregion
                         image_list = [image_paths]
                 else:
                     # Einzelner Pfad
                     if image_paths.strip():
                         image_list = [image_paths]
         elif isinstance(image_paths, list):
-            image_list = image_paths
+            # Normalisiere Pfade in der Liste
+            normalized_list = []
+            for path in image_paths:
+                if isinstance(path, str):
+                    # Normalisiere Pfad-Separatoren
+                    normalized_path = str(Path(path))
+                    normalized_list.append(normalized_path)
+                else:
+                    normalized_list.append(str(path))
+            image_list = normalized_list
+            # #region agent log
+            try:
+                import time
+                log_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cursor", "debug.log")
+                with open(log_file_path, "a", encoding="utf-8") as f_log:
+                    f_log.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H4","location":"app.py:4231","message":"image_paths already a list","data":{"list_len":len(image_list)},"timestamp":int(time.time()*1000)}) + "\n")
+            except: pass
+            # #endregion
+        # #region agent log
+        try:
+            import time
+            log_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cursor", "debug.log")
+            with open(log_file_path, "a", encoding="utf-8") as f_log:
+                f_log.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H4","location":"app.py:4239","message":"Final image_list","data":{"image_list_len":len(image_list),"image_list_preview":str(image_list)[:200]},"timestamp":int(time.time()*1000)}) + "\n")
+        except: pass
+        # #endregion
         
         # Zeige Bilder in Spalten
         if image_list:
@@ -3955,20 +4681,52 @@ def show_vinyl_detail_view(item_id: int, db: Database):
                 cols = st.columns(min(3, num_images))
             
             images_found = False
+            # Basis-Verzeichnis für relative Pfade (Verzeichnis der app.py)
+            base_dir = Path(__file__).parent.resolve()
+            
             for idx, img_path in enumerate(image_list):
                 if img_path:
                     img_path_str = str(img_path).strip()
+                    original_path = img_path_str  # Für Debug-Zwecke speichern
+                    
                     # Entferne Anführungszeichen falls vorhanden
                     if img_path_str.startswith('"') and img_path_str.endswith('"'):
                         img_path_str = img_path_str[1:-1]
                     if img_path_str.startswith("'") and img_path_str.endswith("'"):
                         img_path_str = img_path_str[1:-1]
                     
-                    # Normalisiere Pfad (Windows/Unix)
-                    img_path_str = os.path.normpath(img_path_str)
+                    # Prüfe ob Pfad ein temporärer Pfad ist
+                    is_temp_path = False
+                    if img_path_str:
+                        # Prüfe auf Windows Temp-Pfad
+                        if "AppData" in img_path_str and "Local" in img_path_str and "Temp" in img_path_str:
+                            is_temp_path = True
+                        # Prüfe auf Unix Temp-Pfad
+                        elif img_path_str.startswith("/tmp/") or img_path_str.startswith("/var/tmp/"):
+                            is_temp_path = True
+                    
+                    # Konvertiere zu Path-Objekt für konsistente Behandlung
+                    try:
+                        # Normalisiere Pfad-Separatoren (Forward Slashes zu Backslashes auf Windows)
+                        # Path() normalisiert automatisch die Separatoren
+                        img_path_obj = Path(img_path_str)
+                        
+                        # Konvertiere relativen Pfad zu absolutem Pfad falls nötig
+                        if not img_path_obj.is_absolute():
+                            # Relativer Pfad - verwende Basis-Verzeichnis (app.py Verzeichnis)
+                            img_path_obj = base_dir / img_path_obj
+                        
+                        # Resolve für absolute Pfade (löst Symlinks auf und normalisiert)
+                        img_path_obj = img_path_obj.resolve()
+                        img_path_str = str(img_path_obj)
+                    except Exception as e:
+                        # Fallback: Verwende alte Methode bei Fehler
+                        if img_path_str and not os.path.isabs(img_path_str):
+                            img_path_str = os.path.join(os.getcwd(), img_path_str)
+                        img_path_str = os.path.normpath(img_path_str)
                     
                     # Prüfe ob Datei existiert
-                    if img_path_str and os.path.exists(img_path_str):
+                    if img_path_str and Path(img_path_str).exists():
                         try:
                             images_found = True
                             with cols[idx % len(cols)]:
@@ -3987,19 +4745,80 @@ def show_vinyl_detail_view(item_id: int, db: Database):
                             with cols[idx % len(cols)]:
                                 st.error(f"⚠️ Fehler beim Laden des Bildes:\n`{img_path_str}`\n{str(e)}")
                     elif img_path_str:
-                        # Pfad existiert nicht - zeige Warnung
+                        # Pfad existiert nicht - zeige detaillierte Warnung
                         with cols[idx % len(cols)]:
-                            st.warning(f"⚠️ Bild nicht gefunden:\n`{img_path_str}`")
-                            st.caption(f"Arbeitsverzeichnis: {os.getcwd()}")
+                            if is_temp_path:
+                                st.error(f"⚠️ **Temporäre Bilddatei nicht mehr verfügbar:**\n`{img_path_str}`\n\n💡 **Hinweis:** Temporäre Dateien werden nach dem Speichern gelöscht. Die Bilder sollten in permanente Pfade kopiert worden sein.")
+                            else:
+                                st.warning(f"⚠️ **Bild nicht gefunden:**\n`{img_path_str}`")
+                            
+                            # Zeige zusätzliche Debug-Informationen
+                            debug_info = []
+                            debug_info.append(f"**Ursprünglicher Pfad:** {original_path}")
+                            debug_info.append(f"**Aufgelöster Pfad:** {img_path_str}")
+                            debug_info.append(f"**Pfad-Typ:** {'Temporärer Pfad' if is_temp_path else 'Permanenter Pfad'}")
+                            
+                            # Prüfe verschiedene Pfad-Varianten
+                            path_variants = []
+                            path_variants.append(("Original", original_path))
+                            path_variants.append(("Aufgelöst", img_path_str))
+                            
+                            # Prüfe auch mit Basis-Verzeichnis
+                            if not Path(original_path).is_absolute():
+                                variant_path = base_dir / original_path
+                                path_variants.append(("Mit Basis-Verzeichnis", str(variant_path)))
+                            
+                            # Prüfe auch mit Arbeitsverzeichnis
+                            if not Path(original_path).is_absolute():
+                                variant_path = Path(os.getcwd()) / original_path
+                                path_variants.append(("Mit Arbeitsverzeichnis", str(variant_path)))
+                            
+                            debug_info.append(f"**Datei existiert:** {Path(img_path_str).exists() if img_path_str else 'N/A'}")
+                            debug_info.append(f"**Absoluter Pfad:** {Path(img_path_str).is_absolute() if img_path_str else 'N/A'}")
+                            debug_info.append(f"**Basis-Verzeichnis (app.py):** {base_dir}")
+                            debug_info.append(f"**Arbeitsverzeichnis:** {os.getcwd()}")
+                            
+                            with st.expander("🔍 Debug-Informationen"):
+                                for info in debug_info:
+                                    st.text(info)
+                                
+                                st.markdown("**Pfad-Varianten:**")
+                                for variant_name, variant_path in path_variants:
+                                    exists = Path(variant_path).exists() if variant_path else False
+                                    st.text(f"  {variant_name}: {variant_path} {'✅' if exists else '❌'}")
             
             if not images_found:
-                st.warning("⚠️ Keine Bilder gefunden. Die Bildpfade existieren möglicherweise nicht mehr.")
+                # Prüfe, ob alle Pfade temporäre Pfade sind
+                all_temp_paths = all(
+                    ("AppData" in str(path) and "Local" in str(path) and "Temp" in str(path)) or 
+                    str(path).startswith("/tmp/") or str(path).startswith("/var/tmp/")
+                    for path in image_list if path
+                )
+                
+                if all_temp_paths:
+                    st.error("⚠️ **Alle Bildpfade sind temporäre Pfade, die nicht mehr verfügbar sind.**\n\n💡 **Hinweis:** Die Bilder wurden möglicherweise nicht korrekt in permanente Pfade kopiert. Bitte scannen Sie die Platte erneut ein.")
+                else:
+                    st.warning("⚠️ Keine Bilder gefunden. Die Bildpfade existieren möglicherweise nicht mehr.")
+                
                 # Debug: Zeige was gespeichert wurde
                 with st.expander("🔍 Debug-Informationen"):
                     st.code(f"image_paths Typ: {type(image_paths)}")
                     st.code(f"image_paths Wert: {repr(image_paths)}")
                     st.code(f"image_list: {image_list}")
                     st.code(f"Aktuelles Arbeitsverzeichnis: {os.getcwd()}")
+                    
+                    # Zeige Details für jeden Pfad
+                    st.markdown("**Pfad-Details:**")
+                    for idx, path in enumerate(image_list):
+                        if path:
+                            path_str = str(path)
+                            is_temp = ("AppData" in path_str and "Local" in path_str and "Temp" in path_str) or path_str.startswith("/tmp/") or path_str.startswith("/var/tmp/")
+                            exists = os.path.exists(path_str)
+                            st.text(f"Pfad {idx + 1}: {path_str}")
+                            st.text(f"  - Temporärer Pfad: {is_temp}")
+                            st.text(f"  - Existiert: {exists}")
+                            st.text(f"  - Absolut: {os.path.isabs(path_str)}")
+                            st.text("")
         else:
             st.info("ℹ️ Keine Bilder für diese Platte vorhanden.")
         
@@ -4007,6 +4826,60 @@ def show_vinyl_detail_view(item_id: int, db: Database):
     else:
         st.info("ℹ️ Keine Bilder für diese Platte vorhanden.")
         st.markdown("---")
+    
+    # Bild-Upload-Sektion für neue Bilder
+    st.subheader("📤 Neue Bilder hochladen")
+    st.markdown("Laden Sie neue Cover-Bilder hoch, um die vorhandenen zu ersetzen oder zu ergänzen.")
+    
+    col_upload1, col_upload2 = st.columns(2)
+    with col_upload1:
+        edit_front_img = st.file_uploader(
+            "📸 Cover Frontseite",
+            type=["jpg", "jpeg", "png"],
+            help="Frontseite des Vinyl-Covers (JPG, JPEG oder PNG)",
+            key=f"edit_upload_front_{item_id}"
+        )
+    
+    with col_upload2:
+        edit_back_img = st.file_uploader(
+            "📄 Cover Rückseite (optional)",
+            type=["jpg", "jpeg", "png"],
+            help="Rückseite des Vinyl-Covers für bessere Erkennung von Label und Cat-No",
+            key=f"edit_upload_back_{item_id}"
+        )
+    
+    # Verarbeite hochgeladene Bilder
+    if edit_front_img is not None or edit_back_img is not None:
+        try:
+            # Stelle sicher, dass edit_vinyl_data initialisiert ist
+            if "edit_vinyl_data" not in st.session_state:
+                st.session_state.edit_vinyl_data = {}
+            
+            temp_paths = []
+            
+            # Frontseite
+            if edit_front_img is not None:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp_front:
+                    tmp_front.write(edit_front_img.getvalue())
+                    temp_paths.append(tmp_front.name)
+            
+            # Rückseite (falls vorhanden)
+            if edit_back_img is not None:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp_back:
+                    tmp_back.write(edit_back_img.getvalue())
+                    temp_paths.append(tmp_back.name)
+            
+            # Speichere temporäre Pfade in edit_vinyl_data
+            if temp_paths:
+                # Speichere als Liste in edit_vinyl_data
+                st.session_state.edit_vinyl_data["uploaded_image_paths"] = temp_paths
+                st.success(f"✅ {len(temp_paths)} Bild(er) erfolgreich hochgeladen. Klicken Sie auf 'Änderungen speichern', um sie zu speichern.")
+        except Exception as e:
+            st.error(f"❌ Fehler beim Hochladen der Bilder: {e}")
+    
+    st.markdown("---")
+    
+    st.markdown("---")
     
     # Initialisiere edit_vinyl_data wenn leer oder andere ID
     if not st.session_state.edit_vinyl_data or st.session_state.edit_vinyl_data.get("_id") != item_id:
@@ -4043,7 +4916,8 @@ def show_vinyl_detail_view(item_id: int, db: Database):
             "individual_condition_enabled": item.get("individual_condition_enabled", 0) == 1,
             "individual_condition_text": item.get("individual_condition_text", ""),
             "status": item.get("status", "available"),
-            "tracklist": item.get("tracklist", "")
+            "tracklist": item.get("tracklist", ""),
+            "image_paths": item.get("image_paths")  # Initialisiere image_paths aus Datenbank
         }
     
     edit_data = st.session_state.edit_vinyl_data
@@ -4144,7 +5018,7 @@ def show_vinyl_detail_view(item_id: int, db: Database):
             step=0.01,
             key="edit_purchase_price"
         )
-        edit_data["purchase_price"] = purchase_price if purchase_price > 0 else None
+        edit_data["purchase_price"] = purchase_price
         
         pricing = st.number_input(
             "💵 Verkaufspreis (EUR)",
@@ -4433,17 +5307,14 @@ def show_vinyl_detail_view(item_id: int, db: Database):
             # Die Eingabe ist max_quantity (maximale Anzahl)
             new_max_quantity = int(edit_data.get("max_quantity", old_max_quantity if old_max_quantity is not None else 0))
             
-            # Spezialfall: Wenn beide Werte 0 sind (alle verkauft) und max_quantity erhöht wird
-            # Dann sind alle neuen Platten verfügbar
-            if old_max_quantity == 0 and old_quantity == 0 and new_max_quantity > 0:
+            # NEUE LOGIK: Wenn max_quantity geändert wird, setze quantity auf den neuen max_quantity-Wert
+            # Dies stellt sicher, dass die neue Stückzahl auch als maximale verfügbare Stückzahl gilt
+            if new_max_quantity != old_max_quantity:
+                # Neue Stückzahl wird eingegeben - setze quantity auf max_quantity
                 new_quantity = new_max_quantity
             else:
-                # Wenn max_quantity geändert wurde, passe quantity proportional an
-                # Berechne die alte Differenz (verkaufte Einheiten)
-                old_difference = max(0, old_max_quantity - old_quantity)  # Stelle sicher, dass Differenz nicht negativ ist
-                
-                # Wende die Differenz auf die neue max_quantity an
-                new_quantity = new_max_quantity - old_difference
+                # max_quantity wurde nicht geändert - behalte alte quantity
+                new_quantity = old_quantity
             
             # Stelle sicher, dass neue_quantity nicht negativ ist und nicht größer als max_quantity
             new_quantity = max(0, min(new_quantity, new_max_quantity))
@@ -4452,12 +5323,146 @@ def show_vinyl_detail_view(item_id: int, db: Database):
             # Der Status wird vom Benutzer manuell ausgewählt und sollte respektiert werden
             manual_status = edit_data.get("status", "available")
             
+            # Wenn max_quantity geändert wurde (neue Stückzahl angegeben), setze Status auf "available"
+            if new_max_quantity != old_max_quantity:
+                # Neue Stückzahl wurde angegeben - setze Status automatisch auf "verfügbar"
+                manual_status = "available"
+            # Ansonsten bleibt der manuell ausgewählte Status erhalten
+            
             # Fallback: Wenn kein manueller Status vorhanden, setze automatisch basierend auf quantity
             if not manual_status or manual_status not in ["available", "sold", "reserved"]:
                 if new_quantity > 0:
                     manual_status = "available"
                 else:
                     manual_status = "sold"
+            
+            # Verwende Werte aus edit_data für media_condition und sleeve_condition
+            # (werden entweder aus Selectboxen oder als Default-Werte gesetzt)
+            media_condition_value = edit_data.get("media_condition", default_condition)
+            sleeve_condition_value = edit_data.get("sleeve_condition", default_condition)
+            # #region agent log
+            try:
+                log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cursor", "debug.log")
+                with open(log_path, "a", encoding="utf-8") as f_log:
+                    import json as json_log
+                    f_log.write(json_log.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H4","location":"app.py:4480","message":"Using edit_data values for conditions","data":{"media_condition_value":media_condition_value,"sleeve_condition_value":sleeve_condition_value,"has_media_in_edit_data":"media_condition" in edit_data,"has_sleeve_in_edit_data":"sleeve_condition" in edit_data},"timestamp":int(datetime.now().timestamp()*1000)}) + "\n")
+            except: pass
+            # #endregion
+            
+            # Funktion zum Kopieren von Bildern in permanente Pfade (ähnlich wie in show_scan_session)
+            def copy_images_to_permanent_detail(image_paths, record_id=None, artist=None, title=None):
+                """
+                Kopiert temporäre Bilder in einen Ordner pro Platte.
+                
+                Args:
+                    image_paths: Liste von Bildpfaden oder einzelner Pfad
+                    record_id: Optional Record-ID für Fallback oder Duplikatbehandlung
+                    artist: Artist-Name für Ordnernamen
+                    title: Titel für Ordnernamen
+                
+                Returns:
+                    JSON-String mit relativen Pfaden zu den kopierten Bildern
+                """
+                if not image_paths:
+                    return None
+                
+                # Erstelle Basisverzeichnis für Vinyl-Bilder
+                base_dir = Path("vinyl_images")
+                base_dir.mkdir(exist_ok=True)
+                
+                permanent_paths = []
+                
+                # Konvertiere zu Liste falls einzelner Pfad
+                if isinstance(image_paths, str):
+                    image_paths = [image_paths]
+                
+                # Bestimme Ordnernamen
+                folder_name = None
+                if artist and title:
+                    # Erstelle Ordnername aus Artist - Title
+                    folder_name_raw = f"{artist} - {title}"
+                    folder_name = _sanitize_folder_name(folder_name_raw)
+                elif record_id:
+                    # Fallback: Verwende Record-ID
+                    folder_name = f"Record_{record_id}"
+                else:
+                    # Letzter Fallback: Timestamp
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                    folder_name = f"Unknown_{timestamp}"
+                
+                # Prüfe ob Ordner bereits existiert (Duplikatbehandlung)
+                target_folder = base_dir / folder_name
+                if target_folder.exists():
+                    # Ordner existiert bereits - füge Record-ID oder Timestamp hinzu für Eindeutigkeit
+                    if record_id:
+                        folder_name = f"{folder_name} ({record_id})"
+                    else:
+                        # Verwende Timestamp als Fallback
+                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                        folder_name = f"{folder_name} ({timestamp})"
+                    target_folder = base_dir / folder_name
+                
+                # Erstelle Ordner
+                target_folder.mkdir(exist_ok=True)
+                
+                # Kopiere Bilder in den Ordner
+                import shutil
+                for idx, temp_path in enumerate(image_paths):
+                    if not temp_path:
+                        continue
+                    
+                    # Prüfe, ob temporäre Datei noch existiert
+                    temp_path_str = str(temp_path).strip()
+                    if not os.path.exists(temp_path_str):
+                        st.warning(f"⚠️ Temporäre Bilddatei nicht gefunden: {temp_path_str}. Überspringe dieses Bild.")
+                        continue
+                    
+                    try:
+                        # Einfacher Dateiname, da bereits im eigenen Ordner
+                        ext = Path(temp_path_str).suffix or ".jpg"
+                        filename = f"cover_{idx}{ext}"
+                        
+                        permanent_path = target_folder / filename
+                        
+                        # Kopiere Datei
+                        shutil.copy2(temp_path_str, permanent_path)
+                        # Speichere relativen Pfad
+                        relative_path = permanent_path.relative_to(Path.cwd())
+                        permanent_paths.append(str(relative_path))
+                    except Exception as e:
+                        st.warning(f"⚠️ Fehler beim Kopieren des Bildes {temp_path_str}: {e}")
+                
+                if permanent_paths:
+                    return json.dumps(permanent_paths)
+                return None
+            
+            # Prüfe, ob neue Bilder hochgeladen wurden
+            uploaded_image_paths = edit_data.get("uploaded_image_paths")
+            final_image_paths = None
+            
+            if uploaded_image_paths:
+                # Neue Bilder wurden hochgeladen - kopiere sie in permanente Pfade
+                try:
+                    permanent_image_paths_json = copy_images_to_permanent_detail(
+                        uploaded_image_paths,
+                        record_id=item_id,
+                        artist=artist,
+                        title=title
+                    )
+                    if permanent_image_paths_json:
+                        final_image_paths = permanent_image_paths_json
+                        st.info("✅ Neue Bilder wurden in permanente Pfade kopiert.")
+                    else:
+                        st.warning("⚠️ Fehler beim Kopieren der neuen Bilder. Bestehende Bilder werden beibehalten.")
+                        # Behalte bestehende image_paths
+                        final_image_paths = item.get("image_paths")
+                except Exception as e:
+                    st.error(f"❌ Fehler beim Kopieren der Bilder: {e}")
+                    # Behalte bestehende image_paths
+                    final_image_paths = item.get("image_paths")
+            else:
+                # Keine neuen Bilder hochgeladen - behalte bestehende image_paths
+                final_image_paths = item.get("image_paths")
             
             update_data = {
                 "artist": artist,
@@ -4467,16 +5472,17 @@ def show_vinyl_detail_view(item_id: int, db: Database):
                 "year": year if year and year > 0 else None,
                 "format": edit_data.get("format") if edit_data.get("format") else None,
                 "pricing": float(pricing) if pricing else None,
-                "purchase_price": float(purchase_price) if purchase_price else None,
+                "purchase_price": float(purchase_price) if purchase_price is not None else None,
                 "quantity": new_quantity,
                 "max_quantity": new_max_quantity,
-                "media_condition": media_condition,
-                "sleeve_condition": sleeve_condition,
+                "media_condition": media_condition_value,
+                "sleeve_condition": sleeve_condition_value,
                 "general_condition": edit_data.get("general_condition", "VG"),
                 "individual_condition_enabled": 1 if edit_data.get("individual_condition_enabled", False) else 0,
                 "individual_condition_text": edit_data.get("individual_condition_text", "").strip() if edit_data.get("individual_condition_text") else None,
                 "status": manual_status,  # WICHTIG: Verwende den manuell ausgewählten Status
                 "tracklist": table_to_tracklist_string(updated_tracks) if updated_tracks else None,
+                "image_paths": final_image_paths,  # Füge image_paths hinzu (entweder neue oder bestehende)
                 "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             }
             
@@ -4493,6 +5499,9 @@ def show_vinyl_detail_view(item_id: int, db: Database):
                 st.session_state.edit_tracklist_table = {}
                 # Schließe Detailansicht nach erfolgreichem Speichern
                 st.session_state.selected_vinyl_id = None
+                # Lösche auch die Selectbox-Auswahl (wie beim manuellen Schließen)
+                if "vinyl_selection_dropdown" in st.session_state:
+                    del st.session_state.vinyl_selection_dropdown
                 st.rerun()
             else:
                 st.error("❌ Fehler beim Speichern.")
@@ -4716,20 +5725,25 @@ def download_database_zip() -> Optional[bytes]:
         zip_path = zip_buffer.name
         zip_buffer.close()
         
+        # Aktuell genutzte Datenbank (z. B. vinyl_localhost.db) oder Fallback vinyl.db
+        db_file_name = "vinyl.db"
+        if "db" in st.session_state and hasattr(st.session_state.db, "db_path"):
+            db_file_name = st.session_state.db.db_path
+        
         with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
             # Füge Datenbank hinzu
-            db_path = Path("vinyl.db")
+            db_path = Path(db_file_name)
             if db_path.exists():
-                zipf.write(db_path, "vinyl.db")
+                zipf.write(db_path, db_file_name)
             
             # Füge WAL-Dateien hinzu
-            for wal_file in ["vinyl.db-shm", "vinyl.db-wal"]:
+            for wal_file in [f"{db_file_name}-shm", f"{db_file_name}-wal"]:
                 wal_path = Path(wal_file)
                 if wal_path.exists():
                     zipf.write(wal_path, wal_file)
             
             # Füge Bilder hinzu
-            images_dir = Path("vinyl_images")
+            images_dir = Path("vinyl_images").resolve()
             # #region agent log
             try:
                 images_dir_str = str(images_dir)
@@ -4762,14 +5776,14 @@ def download_database_zip() -> Optional[bytes]:
                             pass
                         # #endregion
                         arcname = img_file.relative_to(Path.cwd())
-                        zipf.write(img_file, str(arcname))
+                        zipf.write(img_file, str(arcname).replace("\\", "/"))
             
             # Füge Rechnungen hinzu
-            invoices_dir = Path("invoices")
+            invoices_dir = Path("invoices").resolve()
             if invoices_dir.exists() and invoices_dir.is_dir():
                 for pdf_file in invoices_dir.glob("*.pdf"):
                     arcname = pdf_file.relative_to(Path.cwd())
-                    zipf.write(pdf_file, str(arcname))
+                    zipf.write(pdf_file, str(arcname).replace("\\", "/"))
         
         # Lese ZIP-Datei
         with open(zip_path, 'rb') as f:
@@ -4814,26 +5828,40 @@ def upload_database_zip(uploaded_file) -> Dict[str, Any]:
             with open(backup_zip, 'wb') as f:
                 f.write(current_backup)
         
-        # Extrahiere hochgeladene ZIP
-        with tempfile.TemporaryDirectory() as temp_dir:
-            zip_path = Path(temp_dir) / uploaded_file.name
-            with open(zip_path, 'wb') as f:
-                f.write(uploaded_file.getvalue())
-            
-            # Prüfe ZIP-Struktur
+        # Unter Windows bleiben DB-Dateien oft gemappt (WinError 1224).
+        # ZIP in persistenten Ordner pending_restore extrahieren, DB schließen,
+        # Flag setzen; im nächsten Run (bevor DB geöffnet wird) nach cwd kopieren.
+        restore_dir = Path.cwd() / "pending_restore"
+        if restore_dir.exists():
+            shutil.rmtree(restore_dir)
+        restore_dir.mkdir()
+        
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".zip") as tmp:
+            tmp.write(uploaded_file.getvalue())
+            zip_path = tmp.name
+        try:
             with zipfile.ZipFile(zip_path, 'r') as zipf:
                 file_list = zipf.namelist()
-                
-                # Prüfe ob wichtige Dateien vorhanden sind
-                has_db = any('vinyl.db' in f for f in file_list)
+                has_db = any('vinyl' in f and f.endswith('.db') for f in file_list)
                 has_images = any('vinyl_images' in f for f in file_list)
                 has_invoices = any('invoices' in f for f in file_list)
-                
                 if not has_db and not has_images and not has_invoices:
-                    return {"success": False, "message": "ZIP-Datei enthält keine gültigen Daten (vinyl.db, vinyl_images/ oder invoices/)."}
-                
-                # Extrahiere Dateien
-                zipf.extractall(Path.cwd())
+                    os.unlink(zip_path)
+                    return {"success": False, "message": "ZIP-Datei enthält keine gültigen Daten (vinyl.db/vinyl_*.db, vinyl_images/ oder invoices/)."}
+                zipf.extractall(restore_dir)
+        finally:
+            try:
+                os.unlink(zip_path)
+            except Exception:
+                pass
+        
+        if "db" in st.session_state:
+            try:
+                st.session_state.db.close()
+            except Exception:
+                pass
+            del st.session_state["db"]
+        st.session_state["pending_restore"] = True
         
         return {
             "success": True,
@@ -4851,7 +5879,7 @@ def show_settings():
     st.header("⚙️ Einstellungen")
     
     # Rechtlicher Hinweis
-    st.info("ℹ️ **Rechtlicher Hinweis:** VinylLocal AI arbeitet lokal. Externe Datenabfragen erfolgen nur auf ausdrücklichen Wunsch des Nutzers.")
+    st.info("ℹ️ **Rechtlicher Hinweis:** VinylLocal AI speichert alle Daten benutzerspezifisch. Externe Datenabfragen erfolgen nur auf ausdrücklichen Wunsch des Nutzers.")
     
     st.markdown("---")
     
@@ -5111,6 +6139,36 @@ def show_settings():
     
     st.markdown("---")
     
+    # Bankverbindung
+    with st.expander("🏦 Bankverbindung", expanded=False):
+        bank_name = st.text_input(
+            "Bankname",
+            value=company_settings.get("bank_name", "") if company_settings else "",
+            key="bank_name_input"
+        )
+        
+        bank_account_holder = st.text_input(
+            "Kontoinhaber",
+            value=company_settings.get("bank_account_holder", "") if company_settings else "",
+            key="bank_account_holder_input"
+        )
+        
+        bank_iban = st.text_input(
+            "IBAN",
+            value=company_settings.get("bank_iban", "") if company_settings else "",
+            key="bank_iban_input",
+            help="Internationale Bankkontonummer (z.B. DE89 3704 0044 0532 0130 00)"
+        )
+        
+        bank_bic = st.text_input(
+            "BIC",
+            value=company_settings.get("bank_bic", "") if company_settings else "",
+            key="bank_bic_input",
+            help="Bank Identifier Code (z.B. COBADEFFXXX)"
+        )
+    
+    st.markdown("---")
+    
     # Versandeinstellungen
     with st.expander("🚚 Versandeinstellungen", expanded=False):
         # Lade bestehende Versandoptionen
@@ -5266,6 +6324,22 @@ def show_settings():
                     st.rerun()
                 else:
                     st.error(f"❌ {result['message']}")
+        
+        # Localhost-Daten zurücksetzen (nur im Localhost-Modus sichtbar)
+        if st.session_state.get("current_user", {}).get("username") == "localhost":
+            st.markdown("---")
+            st.markdown("#### 🗑️ Daten zurücksetzen")
+            st.markdown("Löscht alle Localhost-Daten (Bestand, Rechnungen, Kunden, Einstellungen). Die Datenbank wird neu angelegt und ist danach leer. Bilder und PDF-Dateien auf der Festplatte werden nicht gelöscht.")
+            confirm_reset = st.checkbox("Ja, Localhost-Daten löschen", key="confirm_reset_localhost")
+            if st.button("🗑️ Localhost-Daten löschen", type="secondary", use_container_width=True, key="reset_localhost_data", disabled=not confirm_reset):
+                db = st.session_state.get("db")
+                if db:
+                    db.close()
+                if "db" in st.session_state:
+                    del st.session_state.db
+                st.session_state["pending_delete_localhost"] = True
+                st.success("✅ Localhost-Daten werden beim Neuladen gelöscht. Die App wird neu geladen.")
+                st.rerun()
     
     st.markdown("---")
     
@@ -5432,7 +6506,12 @@ def show_settings():
                 "VG": condition_text_vg.strip() if condition_text_vg else "",
                 "G": condition_text_g.strip() if condition_text_g else "",
                 "P": condition_text_p.strip() if condition_text_p else ""
-            })
+            }),
+            # Bankverbindung
+            "bank_name": bank_name.strip() if bank_name and bank_name.strip() else None,
+            "bank_account_holder": bank_account_holder.strip() if bank_account_holder and bank_account_holder.strip() else None,
+            "bank_iban": bank_iban.strip() if bank_iban and bank_iban.strip() else None,
+            "bank_bic": bank_bic.strip() if bank_bic and bank_bic.strip() else None
         }
         # #region agent log
         try:
@@ -5679,10 +6758,8 @@ def _show_new_invoice_form(db, company_settings, tax_status):
     
     for selected_item in selected_items:
         item_id = selected_item['id']
-        purchase_price = float(selected_item.get("purchase_price", 0) or 0)
-        if not purchase_price:
-            # Fallback: Nutze pricing als purchase_price falls purchase_price nicht gesetzt
-            purchase_price = float(selected_item.get("pricing", 0) or 0)
+        # Lade purchase_price direkt aus der Datenbank (wie in Detailansicht)
+        purchase_price = float(selected_item.get("purchase_price", 0.0) or 0.0)
         
         purchase_prices_dict[item_id] = purchase_price
         
@@ -5745,14 +6822,32 @@ def _show_new_invoice_form(db, company_settings, tax_status):
             final_selling_price = selling_price * (1 - discount_factor)  # Preis nach Rabatt
         
         with col_info:
+            # Stelle sicher, dass purchase_price als float behandelt wird (0 wenn None)
+            purchase_price = float(purchase_price or 0)
+            
+            # Berechne Gesamteinkaufspreis (pro Einheit * Stückzahl)
+            purchase_price_total = purchase_price * item_quantity
+            
+            # Zeige Gesamteinkaufspreis (Hauptanzeige)
+            st.metric("Einkaufspreis (gesamt)", f"{purchase_price_total:.2f} EUR")
+            
+            # Zeige Preis pro Einheit als Caption für Übersicht (nur wenn > 0)
             if purchase_price > 0:
-                # Gesamtmarge berechnen (für gesamte Menge)
-                margin_per_unit = final_selling_price - purchase_price
-                margin_total = margin_per_unit * item_quantity  # Gesamtmarge
-                margin_pct = (margin_per_unit / purchase_price * 100) if purchase_price > 0 else 0
+                st.caption(f"({purchase_price:.2f} EUR pro Stück × {item_quantity})")
+            else:
+                st.caption("(0.00 EUR pro Stück)")
+            
+            # Gesamtmarge berechnen (für gesamte Menge)
+            selling_price_total = final_selling_price * item_quantity
+            margin_total = selling_price_total - purchase_price_total  # Gesamtmarge
+            margin_per_unit = final_selling_price - purchase_price
+            
+            # Marge-Prozent berechnen (nur wenn purchase_price > 0, sonst "N/A")
+            if purchase_price > 0:
+                margin_pct = (margin_per_unit / purchase_price * 100)
                 st.metric("Marge (gesamt)", f"{margin_total:.2f} EUR", f"{margin_pct:.1f}%")
             else:
-                st.info("ℹ️ Kein Einkaufspreis")
+                st.metric("Marge (gesamt)", f"{margin_total:.2f} EUR", "N/A")
         
         invoice_items.append({
             "item_id": item_id,
@@ -5776,6 +6871,37 @@ def _show_new_invoice_form(db, company_settings, tax_status):
     customer_dict = {"-- Kein Kunde --": None, "➕ Neuer Kunde": "new"}
     for c in all_customers:
         customer_dict[f"{c['name']} (ID: {c['id']})"] = c['id']
+    
+    # Prüfe ob eine ausstehende Auswahl vorhanden ist (nach Anlegen eines neuen Kunden)
+    # #region agent log
+    try:
+        with open(log_path, "a", encoding="utf-8") as f_log:
+            f_log.write(json_log.dumps({"sessionId":"debug-session","runId":"checkout","hypothesisId":"A","location":"app.py:5811","message":"Checking for pending customer selection","data":{"has_pending":"_checkout_customer_select_pending" in st.session_state},"timestamp":int(os_log.path.getmtime(log_path) if os_log.path.exists(log_path) else 0)}) + "\n")
+    except: pass
+    # #endregion
+    if "_checkout_customer_select_pending" in st.session_state:
+        pending_selection = st.session_state._checkout_customer_select_pending
+        # #region agent log
+        try:
+            with open(log_path, "a", encoding="utf-8") as f_log:
+                f_log.write(json_log.dumps({"sessionId":"debug-session","runId":"checkout","hypothesisId":"A","location":"app.py:5815","message":"Processing pending selection","data":{"pending_selection":pending_selection,"in_options":pending_selection in customer_options},"timestamp":int(os_log.path.getmtime(log_path) if os_log.path.exists(log_path) else 0)}) + "\n")
+        except: pass
+        # #endregion
+        # Setze die Auswahl, bevor das Widget erstellt wird
+        if pending_selection in customer_options:
+            # Lösche den Widget-Key, damit er neu erstellt werden kann
+            if "checkout_customer_select" in st.session_state:
+                del st.session_state.checkout_customer_select
+            # Setze den neuen Wert
+            st.session_state.checkout_customer_select = pending_selection
+            # #region agent log
+            try:
+                with open(log_path, "a", encoding="utf-8") as f_log:
+                    f_log.write(json_log.dumps({"sessionId":"debug-session","runId":"checkout","hypothesisId":"A","location":"app.py:5823","message":"Set customer selection before widget creation","data":{"selection":pending_selection},"timestamp":int(os_log.path.getmtime(log_path) if os_log.path.exists(log_path) else 0)}) + "\n")
+            except: pass
+            # #endregion
+        # Lösche den temporären Key
+        del st.session_state._checkout_customer_select_pending
     
     selected_customer_option = st.selectbox(
         "Kunde auswählen",
@@ -5838,8 +6964,15 @@ def _show_new_invoice_form(db, company_settings, tax_status):
                     if new_customer_id:
                         # Setze Erfolgsmeldung für Anzeige unter Button
                         set_success_message(f"✅ Kunde angelegt! (ID: {new_customer_id})", save_customer_key)
-                        # Setze Auswahl auf neuen Kunden
-                        st.session_state.checkout_customer_select = f"{quick_name.strip()} (ID: {new_customer_id})"
+                        # Speichere gewünschte Auswahl in temporärem Key (wird beim nächsten Rendern verarbeitet)
+                        pending_value = f"{quick_name.strip()} (ID: {new_customer_id})"
+                        st.session_state._checkout_customer_select_pending = pending_value
+                        # #region agent log
+                        try:
+                            with open(log_path, "a", encoding="utf-8") as f_log:
+                                f_log.write(json_log.dumps({"sessionId":"debug-session","runId":"checkout","hypothesisId":"A","location":"app.py:5879","message":"New customer created, setting pending selection","data":{"new_customer_id":new_customer_id,"pending_value":pending_value},"timestamp":int(os_log.path.getmtime(log_path) if os_log.path.exists(log_path) else 0)}) + "\n")
+                        except: pass
+                        # #endregion
                         st.rerun()
                 else:
                     st.error("❌ Name ist ein Pflichtfeld.")
@@ -6460,19 +7593,28 @@ def _show_invoice_overview(db):
                     display_columns.append("selling_price")
                     column_mapping["selling_price"] = "Preis (EUR)"
                 
-                # Purchase price optional hinzufügen
-                if "purchase_price" in available_columns:
+                # Purchase price IMMER hinzufügen (auch wenn nicht vorhanden oder None)
+                purchase_price_exists = "purchase_price" in available_columns
+                if purchase_price_exists:
                     display_columns.append("purchase_price")
-                    column_mapping["purchase_price"] = "Einkaufspreis (EUR)"
+                # Mapping für purchase_price immer setzen (wird später verwendet)
+                column_mapping["purchase_price"] = "Einkaufspreis (EUR)"
                 
                 if display_columns:
-                    display_df = items_df[display_columns].copy()
+                    # Erstelle DataFrame nur mit vorhandenen Spalten
+                    display_df = items_df[[col for col in display_columns if col in items_df.columns]].copy()
+                    
+                    # Stelle sicher, dass purchase_price Spalte IMMER existiert (füge mit 0.00 hinzu falls fehlend)
+                    if not purchase_price_exists:
+                        display_df["purchase_price"] = 0.00
+                    
                     # Benenne Spalten um
-                    display_df.columns = [column_mapping.get(col, col) for col in display_columns]
-                    # Runde Preis-Spalten falls vorhanden
+                    display_df.columns = [column_mapping.get(col, col) for col in display_df.columns]
+                    
+                    # Runde Preis-Spalten falls vorhanden und formatiere None-Werte
                     for price_col in ["Preis (EUR)", "Einkaufspreis (EUR)"]:
                         if price_col in display_df.columns:
-                            display_df[price_col] = pd.to_numeric(display_df[price_col], errors='coerce').round(2)
+                            display_df[price_col] = pd.to_numeric(display_df[price_col], errors='coerce').fillna(0.00).round(2)
                     # #region agent log - Before dataframe call in invoice overview
                     try:
                         with open(log_path, "a", encoding="utf-8") as f_log:
@@ -6601,73 +7743,22 @@ def show_customer_management():
             
             df_customers = pd.DataFrame(customer_data)
             
-            # Erstelle Layout mit Tabelle und Button-Spalte (ähnlich wie Inventar)
-            col_table, col_buttons = st.columns([11, 1])
-            
-            with col_table:
-                # Zeige Tabelle
-                st.dataframe(
-                    df_customers,
-                    use_container_width=True,
-                    hide_index=True,
-                    column_config={
-                        "ID": st.column_config.NumberColumn("ID", width="small"),
-                        "Name": st.column_config.TextColumn("Name", width="medium"),
-                        "Adresse": st.column_config.TextColumn("Adresse", width="large"),
-                        "E-Mail": st.column_config.TextColumn("E-Mail", width="medium"),
-                        "Telefon": st.column_config.TextColumn("Telefon", width="small"),
-                        "Käufe": st.column_config.NumberColumn("Käufe", width="small"),
-                        "Gesamtbetrag": st.column_config.TextColumn("Gesamtbetrag", width="small"),
-                        "Letzter Kauf": st.column_config.TextColumn("Letzter Kauf", width="small")
-                    }
-                )
-            
-            with col_buttons:
-                # Header-Platzhalter für Ausrichtung
-                st.markdown("<div style='height: 40px;'></div>", unsafe_allow_html=True)
-                
-                # Lösch-Buttons parallel zur Tabelle
-                for customer in customers:
-                    customer_id = customer['id']
-                    customer_name = customer.get('name', 'N/A')
-                    
-                    # Bestätigungsdialog mit Session State
-                    delete_key = f"delete_confirm_{customer_id}"
-                    if delete_key not in st.session_state:
-                        st.session_state[delete_key] = False
-                    
-                    if st.session_state[delete_key]:
-                        # Bestätigungsmodus
-                        st.warning(f"⚠️ Löschen?")
-                        col_yes, col_no = st.columns(2)
-                        with col_yes:
-                            if st.button("✓", key=f"confirm_delete_{customer_id}", help="Löschen bestätigen"):
-                                success = db.delete_customer(customer_id)
-                                if success:
-                                    st.success("✅ Gelöscht!")
-                                    st.session_state[delete_key] = False
-                                    st.rerun()
-                                else:
-                                    st.warning("⚠️ Kunde kann nicht gelöscht werden, da bereits Rechnungen vorhanden sind.")
-                                    st.session_state[delete_key] = False
-                                    st.rerun()
-                        with col_no:
-                            if st.button("✗", key=f"cancel_delete_{customer_id}", help="Abbrechen"):
-                                st.session_state[delete_key] = False
-                                st.rerun()
-                    else:
-                        # Normaler Lösch-Button
-                        if st.button(
-                            "🗑️",
-                            key=f"delete_btn_{customer_id}",
-                            help=f"Kunde löschen: {customer_name}",
-                            use_container_width=True
-                        ):
-                            st.session_state[delete_key] = True
-                            st.rerun()
-                    
-                    # Kleiner Abstand zwischen Buttons
-                    st.markdown("<div style='height: 2px;'></div>", unsafe_allow_html=True)
+            # Zeige Tabelle
+            st.dataframe(
+                df_customers,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "ID": st.column_config.NumberColumn("ID", width="small"),
+                    "Name": st.column_config.TextColumn("Name", width="medium"),
+                    "Adresse": st.column_config.TextColumn("Adresse", width="large"),
+                    "E-Mail": st.column_config.TextColumn("E-Mail", width="medium"),
+                    "Telefon": st.column_config.TextColumn("Telefon", width="small"),
+                    "Käufe": st.column_config.NumberColumn("Käufe", width="small"),
+                    "Gesamtbetrag": st.column_config.TextColumn("Gesamtbetrag", width="small"),
+                    "Letzter Kauf": st.column_config.TextColumn("Letzter Kauf", width="small")
+                }
+            )
             
             # Bearbeiten/Löschen Buttons
             st.markdown("---")
@@ -6982,24 +8073,90 @@ def main():
     # Navigation mit Session State für programmatische Navigation
     nav_options = ["Dashboard", "Scan-Session", "Lager-Verwaltung", "Kasse/Rechnung", "Kunden", "⚙️ Einstellungen"]
     
+    # Speichere vorherige Seite für Vergleich
+    previous_page = st.session_state.get("previous_page", None)
+    
+    # Berechne default_index mit verbesserter Logik und Validierung
+    default_index = 0  # Fallback-Wert
+    
     # Prüfe ob Navigation programmatisch geändert werden soll
+    # #region agent log
+    try:
+        with open(log_path, "a", encoding="utf-8") as f_log:
+            f_log.write(json_log.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"D","location":"app.py:7994","message":"Navigation check","data":{"navigate_to":st.session_state.get("navigate_to"),"previous_page":previous_page,"nav_options":nav_options},"timestamp":int(time.time()*1000)}) + "\n")
+    except: pass
+    # #endregion
+    
     if "navigate_to" in st.session_state and st.session_state.navigate_to:
         target_page = st.session_state.navigate_to
+        # #region agent log
+        try:
+            with open(log_path, "a", encoding="utf-8") as f_log:
+                f_log.write(json_log.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"D","location":"app.py:8007","message":"Navigation target found","data":{"target_page":target_page,"target_in_options":target_page in nav_options},"timestamp":int(time.time()*1000)}) + "\n")
+        except: pass
+        # #endregion
         if target_page in nav_options:
-            # Setze den Index basierend auf der Zielseite
-            default_index = nav_options.index(target_page)
-            # Lösche den Navigations-Key nach Verwendung
-            del st.session_state.navigate_to
-        else:
-            default_index = 0
-    else:
+            calculated_index = nav_options.index(target_page)
+            # Validiere Index
+            if 0 <= calculated_index < len(nav_options):
+                default_index = calculated_index
+        # navigate_to wird NACH dem Radio-Button gelöscht (siehe unten)
+    elif previous_page is not None and previous_page in nav_options:
+        calculated_index = nav_options.index(previous_page)
+        # Validiere Index
+        if 0 <= calculated_index < len(nav_options):
+            default_index = calculated_index
+    
+    # Validiere finalen Index
+    if default_index < 0 or default_index >= len(nav_options):
         default_index = 0
     
+    # #region agent log
+    try:
+        with open(log_path, "a", encoding="utf-8") as f_log:
+            f_log.write(json_log.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"D","location":"app.py:8035","message":"Navigation index calculated","data":{"default_index":default_index,"navigate_to":st.session_state.get("navigate_to"),"previous_page":previous_page},"timestamp":int(time.time()*1000)}) + "\n")
+    except: pass
+    # #endregion
+    
+    # Radio-Button mit explizitem Key für konsistenten State
     page = st.sidebar.radio(
         "Navigation",
         nav_options,
-        index=default_index
+        index=default_index,
+        key="main_navigation_radio"
     )
+    
+    # Lösche navigate_to NACH dem Rendern des Radio-Buttons
+    if "navigate_to" in st.session_state and st.session_state.navigate_to:
+        # Prüfe ob Navigation erfolgreich war
+        if page == st.session_state.navigate_to:
+            # #region agent log
+            try:
+                with open(log_path, "a", encoding="utf-8") as f_log:
+                    f_log.write(json_log.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"D","location":"app.py:8050","message":"Navigation successful, deleting navigate_to","data":{"page":page,"navigate_to":st.session_state.navigate_to},"timestamp":int(time.time()*1000)}) + "\n")
+            except: pass
+            # #endregion
+            del st.session_state.navigate_to
+    
+    # Prüfe ob Seite geändert wurde - wenn ja, schließe Detailansicht
+    if previous_page is not None and page != previous_page:
+        # Seite wurde geändert - schließe Detailansicht
+        if "selected_vinyl_id" in st.session_state:
+            st.session_state.selected_vinyl_id = None
+    
+    # Aktualisiere previous_page für nächsten Durchlauf
+    # Validiere dass page eine gültige Option ist
+    if page in nav_options:
+        st.session_state.previous_page = page
+    else:
+        # Fallback falls page nicht in nav_options ist
+        st.session_state.previous_page = "Dashboard"
+        # #region agent log
+        try:
+            with open(log_path, "a", encoding="utf-8") as f_log:
+                f_log.write(json_log.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"D","location":"app.py:8048","message":"Invalid page value, resetting to Dashboard","data":{"page":page,"nav_options":nav_options},"timestamp":int(time.time()*1000)}) + "\n")
+        except: pass
+        # #endregion
     
     # Seiteninhalt anzeigen (nur wenn eingeloggt)
     if not check_authentication():

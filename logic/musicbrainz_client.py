@@ -79,6 +79,7 @@ class MusicBrainzClient:
         
         Returns:
             Liste von Release-Dictionaries oder None bei Fehler
+            Jedes Dictionary enthält Metadaten und Trackliste (für erstes Ergebnis)
         """
         if not artist or not title:
             return None
@@ -104,7 +105,7 @@ class MusicBrainzClient:
         
         if result and "releases" in result:
             releases = []
-            for release in result["releases"]:
+            for idx, release in enumerate(result["releases"]):
                 release_data = {
                     "id": release.get("id"),
                     "title": release.get("title", ""),
@@ -114,8 +115,20 @@ class MusicBrainzClient:
                     "label": self._extract_label(release),
                     "cat_no": self._extract_cat_no(release),
                     "barcode": release.get("barcode"),
-                    "format": self._extract_format(release)
+                    "format": self._extract_format(release),
+                    "tracklist": []  # Standard: leere Trackliste
                 }
+                
+                # Für das erste Ergebnis (bestes Match): Hole detaillierte Info inkl. Trackliste
+                if idx == 0 and release_data.get("id"):
+                    try:
+                        detailed_release = self.get_release_by_id(release_data["id"])
+                        if detailed_release and detailed_release.get("tracklist"):
+                            release_data["tracklist"] = detailed_release["tracklist"]
+                    except Exception:
+                        # Fehler beim Abrufen der Trackliste ist nicht kritisch
+                        pass
+                
                 releases.append(release_data)
             return releases
         
@@ -206,10 +219,46 @@ class MusicBrainzClient:
             for medium in release["media"]:
                 if "tracks" in medium:
                     for track in medium["tracks"]:
+                        # Konvertiere Laufzeit von Millisekunden zu mm:ss Format
+                        length_str = ""
+                        if track.get("length"):
+                            length_ms = track.get("length", 0)
+                            length_seconds = length_ms // 1000
+                            minutes = length_seconds // 60
+                            seconds = length_seconds % 60
+                            length_str = f"{minutes}:{seconds:02d}"
+                        
                         track_data = {
                             "position": str(track.get("position", "")),
                             "title": track.get("title", ""),
-                            "length": str(track.get("length", 0) // 1000) if track.get("length") else ""
+                            "length": length_str
                         }
                         tracks.append(track_data)
         return tracks
+    
+    def format_tracklist_as_string(self, tracklist: List[Dict[str, str]]) -> str:
+        """
+        Konvertiert MusicBrainz Trackliste (Liste von Dicts) zu String-Format für die App.
+        
+        Args:
+            tracklist: Liste von Dictionaries mit "position", "title", "length"
+        
+        Returns:
+            String im Format "Position. Titel (Laufzeit)" pro Zeile
+        """
+        if not tracklist:
+            return ""
+        
+        lines = []
+        for track in tracklist:
+            position = track.get("position", "")
+            title = track.get("title", "")
+            length = track.get("length", "")
+            
+            if title:
+                line = f"{position}. {title}" if position else title
+                if length:
+                    line += f" ({length})"
+                lines.append(line)
+        
+        return "\n".join(lines)

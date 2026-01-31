@@ -177,6 +177,50 @@ class Database:
             cursor.execute("ALTER TABLE inventory ADD COLUMN format TEXT")
             conn.commit()
         
+        # UNIQUE Constraint auf cat_no hinzufügen (Datenbank-Härtung für Duplikat-Schutz)
+        # Prüfe ob UNIQUE Index bereits existiert
+        try:
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_inventory_cat_no_unique'")
+            index_exists = cursor.fetchone() is not None
+            
+            if not index_exists:
+                # Prüfe auf Duplikate vor dem Hinzufügen des Constraints
+                cursor.execute("""
+                    SELECT cat_no, COUNT(*) as count 
+                    FROM inventory 
+                    WHERE cat_no IS NOT NULL AND cat_no != '' 
+                    GROUP BY cat_no 
+                    HAVING COUNT(*) > 1
+                """)
+                duplicates = cursor.fetchall()
+                
+                if duplicates:
+                    # Duplikate vorhanden - Constraint nicht hinzufügen, Warnung loggen
+                    _debug_log("database.py:_initialize_database", "UNIQUE constraint skipped", {
+                        "reason": "duplicates_found",
+                        "duplicate_count": len(duplicates)
+                    }, "MIGRATION")
+                else:
+                    # Keine Duplikate - füge UNIQUE Index hinzu
+                    try:
+                        cursor.execute("""
+                            CREATE UNIQUE INDEX idx_inventory_cat_no_unique 
+                            ON inventory(cat_no) 
+                            WHERE cat_no IS NOT NULL AND cat_no != ''
+                        """)
+                        conn.commit()
+                        _debug_log("database.py:_initialize_database", "UNIQUE constraint added", {}, "MIGRATION")
+                    except sqlite3.OperationalError as e:
+                        # Index existiert bereits oder anderer Fehler
+                        _debug_log("database.py:_initialize_database", "UNIQUE constraint creation failed", {
+                            "error": str(e)
+                        }, "MIGRATION")
+        except Exception as e:
+            # Fehler beim Prüfen - ignoriere, Constraint wird beim nächsten Versuch hinzugefügt
+            _debug_log("database.py:_initialize_database", "UNIQUE constraint check failed", {
+                "error": str(e)
+            }, "MIGRATION")
+        
         # Tabelle: invoices (Rechnungen für Differenzbesteuerung §25a UStG)
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS invoices (
@@ -360,6 +404,26 @@ class Database:
                     # Ignoriere Fehler falls Spalte bereits existiert
                     pass
         
+        # Prüfe ob Bankverbindungs-Spalten existieren, falls nicht hinzufügen
+        bank_columns = [
+            ("bank_name", "TEXT"),
+            ("bank_account_holder", "TEXT"),
+            ("bank_iban", "TEXT"),
+            ("bank_bic", "TEXT")
+        ]
+        
+        for column_name, column_type in bank_columns:
+            try:
+                cursor.execute(f"SELECT {column_name} FROM company_settings LIMIT 1")
+            except sqlite3.OperationalError:
+                try:
+                    cursor.execute(f"ALTER TABLE company_settings ADD COLUMN {column_name} {column_type}")
+                    conn.commit()
+                except Exception as migration_err:
+                    conn.rollback()
+                    # Ignoriere Fehler falls Spalte bereits existiert
+                    pass
+        
         # Tabelle: customers (Kundenverwaltung)
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS customers (
@@ -477,6 +541,7 @@ class Database:
     def add_record(self, table: str, data: Dict[str, Any]) -> int:
         """
         Fügt einen neuen Datensatz in die angegebene Tabelle ein.
+        Prüft bei 'inventory' auf Duplikate basierend auf cat_no oder Artist+Title.
         
         Args:
             table: Tabellenname ('inventory' oder 'invoices')
@@ -484,12 +549,43 @@ class Database:
             
         Returns:
             ID des eingefügten Datensatzes
+            
+        Raises:
+            ValueError: Wenn ein Duplikat gefunden wird
         """
         # #region agent log
         _debug_log("database.py:add_record", "Function entry", {"table": table, "columns": list(data.keys())}, "D")
         # #endregion
         conn = self._get_connection()
         cursor = conn.cursor()
+        
+        # Spezielle Prüfung für inventory-Tabelle
+        if table == "inventory":
+            cat_no = data.get("cat_no")
+            artist = data.get("artist")
+            title = data.get("title")
+            
+            # Prüfe auf Duplikat basierend auf cat_no (wenn vorhanden)
+            if cat_no:
+                cursor.execute(
+                    "SELECT id FROM inventory WHERE cat_no = ? AND cat_no IS NOT NULL AND cat_no != ''",
+                    (cat_no,)
+                )
+                existing = cursor.fetchone()
+                if existing:
+                    existing_id = dict(existing)["id"] if isinstance(existing, sqlite3.Row) else existing[0]
+                    raise ValueError(f"Abgebrochen: Artikel mit Katalognummer '{cat_no}' existiert bereits (ID: {existing_id}). Bitte 'Stückzahl erhöhen' nutzen.")
+            
+            # Fallback: Prüfe auch auf Artist + Title (wenn cat_no nicht vorhanden)
+            elif artist and title:
+                cursor.execute(
+                    "SELECT id FROM inventory WHERE artist = ? AND title = ?",
+                    (artist, title)
+                )
+                existing = cursor.fetchone()
+                if existing:
+                    existing_id = dict(existing)["id"] if isinstance(existing, sqlite3.Row) else existing[0]
+                    raise ValueError(f"Abgebrochen: Artikel '{artist} - {title}' existiert bereits (ID: {existing_id}). Bitte 'Stückzahl erhöhen' nutzen.")
         
         columns = ', '.join(data.keys())
         placeholders = ', '.join(['?' for _ in data])
@@ -509,6 +605,98 @@ class Database:
         except sqlite3.OperationalError as e:
             # #region agent log
             _debug_log("database.py:add_record", "Insert failed", {"error": str(e), "query": query}, "D")
+            # #endregion
+            raise
+    
+    def add_to_inventory(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Fügt einen neuen Inventar-Eintrag hinzu oder gibt Duplikat-Info zurück.
+        Nutzt Datenbank-IntegrityError als Sicherheitsschleuse.
+        
+        DEPRECATED: Verwende stattdessen sync_to_inventory() für zentrale Smart-Sync Logik.
+        Diese Funktion wird nur noch für Rückwärtskompatibilität bereitgestellt.
+        
+        Args:
+            data: Dictionary mit Inventar-Daten (alle Felder für inventory-Tabelle)
+        
+        Returns:
+            {"status": "success", "id": record_id} bei Erfolg
+            {"status": "duplicate", "existing_id": existing_id} bei Duplikat (cat_no bereits vorhanden)
+            
+        Raises:
+            sqlite3.OperationalError: Bei anderen Datenbank-Fehlern
+        """
+        # #region agent log
+        _debug_log("database.py:add_to_inventory", "Function entry", {"columns": list(data.keys()), "has_cat_no": "cat_no" in data}, "D")
+        # #endregion
+        
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        
+        # Versuche INSERT
+        columns = ', '.join(data.keys())
+        placeholders = ', '.join(['?' for _ in data])
+        values = list(data.values())
+        
+        query = f"INSERT INTO inventory ({columns}) VALUES ({placeholders})"
+        
+        try:
+            cursor.execute(query, values)
+            conn.commit()
+            record_id = cursor.lastrowid
+            # #region agent log
+            _debug_log("database.py:add_to_inventory", "Insert successful", {"id": record_id}, "D")
+            # #endregion
+            return {"status": "success", "id": record_id}
+        
+        except sqlite3.IntegrityError as e:
+            # IntegrityError bedeutet UNIQUE Constraint Verletzung
+            error_msg = str(e)
+            # #region agent log
+            _debug_log("database.py:add_to_inventory", "IntegrityError caught", {"error": error_msg}, "D")
+            # #endregion
+            
+            # Prüfe ob es wegen cat_no UNIQUE Constraint ist
+            cat_no = data.get("cat_no")
+            if cat_no and ("cat_no" in error_msg or "UNIQUE constraint" in error_msg or "idx_inventory_cat_no_unique" in error_msg):
+                # Hole existing_id aus Datenbank
+                cursor.execute(
+                    "SELECT id FROM inventory WHERE cat_no = ? AND cat_no IS NOT NULL AND cat_no != ''",
+                    (cat_no,)
+                )
+                existing = cursor.fetchone()
+                if existing:
+                    existing_id = dict(existing)["id"] if isinstance(existing, sqlite3.Row) else existing[0]
+                    # #region agent log
+                    _debug_log("database.py:add_to_inventory", "Duplicate found", {"existing_id": existing_id, "cat_no": cat_no}, "D")
+                    # #endregion
+                    return {"status": "duplicate", "existing_id": existing_id, "duplicate_type": "cat_no"}
+            
+            # Falls nicht cat_no, könnte es Artist+Title sein (Fallback-Prüfung)
+            artist = data.get("artist")
+            title = data.get("title")
+            if artist and title:
+                cursor.execute(
+                    "SELECT id FROM inventory WHERE artist = ? AND title = ?",
+                    (artist, title)
+                )
+                existing = cursor.fetchone()
+                if existing:
+                    existing_id = dict(existing)["id"] if isinstance(existing, sqlite3.Row) else existing[0]
+                    # #region agent log
+                    _debug_log("database.py:add_to_inventory", "Duplicate found (artist+title)", {"existing_id": existing_id}, "D")
+                    # #endregion
+                    return {"status": "duplicate", "existing_id": existing_id, "duplicate_type": "artist_title"}
+            
+            # Unbekannter IntegrityError - re-raise
+            # #region agent log
+            _debug_log("database.py:add_to_inventory", "Unknown IntegrityError", {"error": error_msg}, "D")
+            # #endregion
+            raise
+        
+        except sqlite3.OperationalError as e:
+            # #region agent log
+            _debug_log("database.py:add_to_inventory", "OperationalError", {"error": str(e)}, "D")
             # #endregion
             raise
     
@@ -534,7 +722,7 @@ class Database:
         return None
     
     def get_all_records(self, table: str, where_clause: Optional[str] = None, 
-                       params: Optional[tuple] = None) -> List[Dict[str, Any]]:
+                       params: Optional[tuple] = None, force_wal_checkpoint: bool = False) -> List[Dict[str, Any]]:
         """
         Ruft alle Datensätze aus einer Tabelle ab.
         
@@ -542,11 +730,32 @@ class Database:
             table: Tabellenname
             where_clause: Optional WHERE-Klausel (ohne 'WHERE')
             params: Parameter für WHERE-Klausel
+            force_wal_checkpoint: Wenn True, wird ein WAL Checkpoint vor dem SELECT durchgeführt
             
         Returns:
             Liste von Dictionaries mit Datensätzen
         """
         conn = self._get_connection()
+        
+        # Wenn force_wal_checkpoint gesetzt ist, führe Checkpoint durch und reset Connection
+        if force_wal_checkpoint:
+            try:
+                # Aggressiver Checkpoint für sofortige Synchronisation
+                conn.execute("PRAGMA wal_checkpoint(RESTART)")
+                try:
+                    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                except Exception:
+                    pass
+            except Exception:
+                try:
+                    conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                except Exception:
+                    pass
+            # Reset Connection nach Checkpoint, damit neue Verbindung die neuesten Daten sieht
+            conn.close()
+            self._local.conn = None
+            conn = self._get_connection()
+        
         cursor = conn.cursor()
         
         query = f"SELECT * FROM {table}"
@@ -981,9 +1190,115 @@ class Database:
             return dict(row)
         return None
     
-    def increment_quantity(self, record_id: int, increment: int = 1, increment_max_quantity: bool = True) -> bool:
+    def get_duplicate_by_metadata(self, 
+                                   artist: Optional[str] = None,
+                                   title: Optional[str] = None,
+                                   label: Optional[str] = None,
+                                   cat_no: Optional[str] = None,
+                                   year: Optional[int] = None,
+                                   format: Optional[str] = None,
+                                   media_condition: Optional[str] = None,
+                                   sleeve_condition: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """
-        Erhöht die Stückzahl eines Inventar-Eintrags.
+        Prüft ob ein Item mit ähnlichen Metadaten bereits im Inventar existiert.
+        Vergleicht Artist, Title, Label, Catalog Number, Year und Format.
+        
+        Args:
+            artist: Künstlername
+            title: Albumtitel
+            label: Label
+            cat_no: Katalognummer (optional)
+            year: Jahr (optional)
+            format: Format (optional, z.B. "12\" LP")
+            media_condition: Media Condition (optional)
+            sleeve_condition: Sleeve Condition (optional)
+        
+        Returns:
+            Dictionary mit existierendem Datensatz oder None
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        
+        conditions = []
+        params = []
+        
+        # Artist muss vorhanden sein (case-insensitive)
+        if artist:
+            artist_clean = str(artist).strip()
+            if artist_clean:
+                conditions.append("LOWER(TRIM(artist)) = LOWER(TRIM(?))")
+                params.append(artist_clean)
+        
+        # Title muss vorhanden sein (case-insensitive)
+        if title:
+            title_clean = str(title).strip()
+            if title_clean:
+                conditions.append("LOWER(TRIM(title)) = LOWER(TRIM(?))")
+                params.append(title_clean)
+        
+        # Label (optional, aber wenn vorhanden, sollte es übereinstimmen)
+        # Verbesserte Logik: Wenn label vorhanden ist, sollte es übereinstimmen oder beide NULL sein
+        if label:
+            label_clean = str(label).strip()
+            if label_clean:
+                # Wenn label vorhanden ist, sollte es übereinstimmen (aber erlaube auch, wenn DB-Feld NULL ist)
+                conditions.append("(label IS NULL OR LOWER(TRIM(label)) = LOWER(TRIM(?)))")
+                params.append(label_clean)
+        
+        # Catalog Number (wenn vorhanden, sollte es übereinstimmen)
+        if cat_no:
+            cat_no_clean = str(cat_no).strip()
+            if cat_no_clean and cat_no_clean.lower() != "none":
+                # Wenn cat_no vorhanden ist, sollte es übereinstimmen (aber erlaube auch, wenn DB-Feld NULL/leer ist)
+                conditions.append("(cat_no IS NULL OR cat_no = '' OR cat_no = 'None' OR LOWER(TRIM(cat_no)) = LOWER(TRIM(?)))")
+                params.append(cat_no_clean)
+        
+        # Year (optional, wenn vorhanden, sollte es übereinstimmen)
+        if year:
+            conditions.append("(year IS NULL OR year = ?)")
+            params.append(year)
+        
+        # Format (optional)
+        if format:
+            format_clean = str(format).strip()
+            if format_clean:
+                conditions.append("(format IS NULL OR LOWER(TRIM(format)) = LOWER(TRIM(?)))")
+                params.append(format_clean)
+        
+        # Qualität (optional, für genauere Erkennung - wird nicht für Duplikat-Erkennung verwendet)
+        # media_condition und sleeve_condition werden nicht in die Suche einbezogen,
+        # da sie sich zwischen verschiedenen Kopien unterscheiden können
+        
+        # Mindestens Artist und Title müssen vorhanden sein
+        if len(conditions) < 2:
+            _debug_log("database.py:get_duplicate_by_metadata", "Not enough conditions", 
+                      {"conditions_count": len(conditions), "artist": artist, "title": title}, "D")
+            return None
+        
+        sql = f"SELECT * FROM inventory WHERE {' AND '.join(conditions)} LIMIT 1"
+        
+        # Debug-Logging
+        _debug_log("database.py:get_duplicate_by_metadata", "Executing query", 
+                  {"sql": sql, "params_count": len(params), "artist": artist, "title": title, 
+                   "label": label, "cat_no": cat_no, "year": year, "format": format}, "D")
+        
+        cursor.execute(sql, tuple(params))
+        row = cursor.fetchone()
+        
+        if row:
+            result = dict(row)
+            _debug_log("database.py:get_duplicate_by_metadata", "Duplicate found", 
+                      {"duplicate_id": result.get("id"), "duplicate_artist": result.get("artist"), 
+                       "duplicate_title": result.get("title")}, "D")
+            return result
+        
+        _debug_log("database.py:get_duplicate_by_metadata", "No duplicate found", 
+                  {"artist": artist, "title": title}, "D")
+        return None
+    
+    def increment_quantity(self, record_id: int, increment: int = 1, increment_max_quantity: bool = True) -> Optional[int]:
+        """
+        Erhöht die Stückzahl eines Inventar-Eintrags atomar.
         
         Args:
             record_id: ID des Datensatzes
@@ -991,49 +1306,244 @@ class Database:
             increment_max_quantity: Ob max_quantity ebenfalls erhöht werden soll (Standard: True)
         
         Returns:
-            True bei Erfolg, False wenn Datensatz nicht gefunden
+            Neue quantity bei Erfolg, None wenn Datensatz nicht gefunden
         """
         conn = self._get_connection()
         cursor = conn.cursor()
         
-        # Hole aktuelle quantity und max_quantity
+        # Prüfe zuerst, ob der Datensatz existiert und hole aktuelle quantity
         cursor.execute("SELECT quantity, max_quantity FROM inventory WHERE id = ?", (record_id,))
         row = cursor.fetchone()
         
         if not row:
-            return False
+            return None
         
-        current_quantity = row[0] or 1
+        current_quantity = row[0] or 0  # Verwende 0 statt 1, um Bestand 0 korrekt zu behandeln
         current_max_quantity = row[1]
         
-        # Wenn max_quantity NULL ist, setze es auf current_quantity (Rückwärtskompatibilität)
-        if current_max_quantity is None:
-            current_max_quantity = current_quantity
-        
-        new_quantity = current_quantity + increment
-        
-        # Berechne neue max_quantity
-        if increment_max_quantity:
-            new_max_quantity = current_max_quantity + increment
-        else:
-            new_max_quantity = current_max_quantity
-        
-        # Wenn new_quantity > 0, setze Status auf "available" (damit verkaufte Platten wieder verfügbar werden)
-        if new_quantity > 0:
-            # Update quantity, max_quantity und status
+        # Spezielle Behandlung für Bestand 0 (Reaktivierung)
+        # Wenn aktueller Bestand 0 ist, setze quantity auf increment (nicht addieren)
+        if current_quantity == 0:
+            # Reaktivierung: Setze quantity auf increment
+            new_quantity = increment
+            # Setze max_quantity auf increment wenn increment_max_quantity True ist
+            if increment_max_quantity:
+                new_max_quantity = increment
+            else:
+                new_max_quantity = current_max_quantity if current_max_quantity is not None else increment
+            # Update quantity, max_quantity und status atomar
             cursor.execute(
                 "UPDATE inventory SET quantity = ?, max_quantity = ?, status = 'available', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
                 (new_quantity, new_max_quantity, record_id)
             )
         else:
-            # Update nur quantity und max_quantity (Status bleibt unverändert)
+            # Normale Erhöhung: Verwende atomare SQL-Query mit quantity = quantity + increment
+            # Berechne neue max_quantity
+            if increment_max_quantity:
+                # Hole neue quantity nach Update für max_quantity Berechnung
+                new_quantity = current_quantity + increment
+                new_max_quantity = new_quantity
+            else:
+                new_quantity = current_quantity + increment
+                new_max_quantity = current_max_quantity if current_max_quantity is not None else new_quantity
+            
+            # Update quantity atomar mit SQL quantity = quantity + increment
             cursor.execute(
-                "UPDATE inventory SET quantity = ?, max_quantity = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                (new_quantity, new_max_quantity, record_id)
+                "UPDATE inventory SET quantity = quantity + ?, max_quantity = ?, status = 'available', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (increment, new_max_quantity, record_id)
             )
+        
+        # Stelle sicher, dass die Transaktion committed wird
         conn.commit()
         
-        return cursor.rowcount > 0
+        # Stelle sicher, dass WAL-Änderungen für andere Verbindungen sichtbar sind
+        # Dies ist wichtig, damit die Inventarliste die aktualisierten Werte sofort anzeigt
+        try:
+            # Verwende RESTART für aggressiveren Checkpoint, damit Änderungen sofort sichtbar sind
+            conn.execute("PRAGMA wal_checkpoint(RESTART)")
+            # Versuche zusätzlich TRUNCATE für vollständige Synchronisation
+            try:
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except Exception:
+                # TRUNCATE kann fehlschlagen wenn keine WAL-Datei vorhanden - das ist OK
+                pass
+        except Exception:
+            # Falls Checkpoint fehlschlägt, versuche PASSIVE als Fallback
+            try:
+                conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+            except Exception:
+                pass
+        
+        # Verifikationsabfrage NACH allen Checkpoints: Stelle sicher, dass die Änderung committed und sichtbar ist
+        # Dies stellt sicher, dass die Änderung tatsächlich in der Datenbank persistiert ist
+        cursor.execute("SELECT quantity FROM inventory WHERE id = ?", (record_id,))
+        result_row = cursor.fetchone()
+        new_quantity_value = result_row[0] if result_row else None
+        
+        # Zusätzliche Verifikation: Prüfe ob die erwartete Menge korrekt ist
+        if new_quantity_value is not None:
+            expected_quantity = new_quantity if current_quantity == 0 else (current_quantity + increment)
+            if new_quantity_value != expected_quantity:
+                # Logge Warnung, aber gib trotzdem den Wert zurück (könnte durch Race Condition entstehen)
+                _debug_log("database.py:increment_quantity", "Quantity mismatch after update", {
+                    "record_id": record_id,
+                    "expected": expected_quantity,
+                    "actual": new_quantity_value
+                }, "WAL_SYNC")
+        
+        # Setze Verbindung zurück, damit die nächste Abfrage eine neue Verbindung öffnet
+        # die die neuesten Daten sieht (wichtig für thread-lokale Verbindungen)
+        conn.close()
+        self._local.conn = None
+        
+        # Gib die neue quantity zurück (oder None bei Fehler)
+        return new_quantity_value
+    
+    def increment_inventory_quantity(self, item_id: int, add_quantity: int) -> Optional[int]:
+        """
+        Erhöht die Stückzahl eines Inventar-Eintrags atomar mit SQL UPDATE.
+        Setzt Status automatisch auf 'available' wenn quantity > 0.
+        
+        DEPRECATED: Verwende stattdessen sync_to_inventory() für zentrale Smart-Sync Logik.
+        
+        Args:
+            item_id: ID des Datensatzes
+            add_quantity: Anzahl um die erhöht werden soll
+        
+        Returns:
+            Neue quantity bei Erfolg, None wenn Datensatz nicht gefunden
+        """
+        # increment_quantity() setzt bereits status = 'available' und gibt neue quantity zurück
+        return self.increment_quantity(item_id, add_quantity, increment_max_quantity=True)
+    
+    def _normalize_catalog_number(self, cat_no: Optional[str]) -> Optional[str]:
+        """
+        Normalisiert Katalognummer für Vergleich (Großbuchstaben, Leerzeichen entfernen).
+        
+        Args:
+            cat_no: Katalognummer (kann None oder leer sein)
+        
+        Returns:
+            Normalisierte Katalognummer oder None
+        """
+        if not cat_no or not str(cat_no).strip():
+            return None
+        return str(cat_no).upper().replace(" ", "").strip()
+    
+    def sync_to_inventory(self, record_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Zentrale Smart-Sync Funktion: Führt UPSERT-Operation durch.
+        
+        Normalisiert catalog_number (Großbuchstaben, Leerzeichen entfernen).
+        Prüft ob bereits vorhanden. Führt automatisch UPDATE oder INSERT durch.
+        
+        Args:
+            record_data: Dictionary mit Inventar-Daten (muss cat_no enthalten für Duplikat-Prüfung)
+        
+        Returns:
+            {"status": "updated", "id": record_id, "old_quantity": int, "new_quantity": int} wenn UPDATE
+            {"status": "inserted", "id": record_id} wenn INSERT
+        """
+        # #region agent log
+        _debug_log("database.py:sync_to_inventory", "Function entry", {"has_cat_no": "cat_no" in record_data}, "SYNC")
+        # #endregion
+        
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        
+        # Schritt 1: Normalisierung der Katalognummer
+        cat_no = record_data.get("cat_no")
+        cat_no_normalized = self._normalize_catalog_number(cat_no)
+        
+        # Schritt 2: Duplikat-Prüfung mit normalisierter Katalognummer
+        existing_record = None
+        if cat_no_normalized:
+            # Suche nach normalisierter Version in DB
+            # Verwende UPPER(REPLACE()) für Vergleich, da bestehende Einträge möglicherweise nicht normalisiert sind
+            cursor.execute("""
+                SELECT id, quantity, max_quantity 
+                FROM inventory 
+                WHERE UPPER(REPLACE(cat_no, ' ', '')) = ? 
+                AND cat_no IS NOT NULL 
+                AND cat_no != ''
+            """, (cat_no_normalized,))
+            existing_record = cursor.fetchone()
+        
+        # FALL A: Duplikat gefunden - führe automatisch UPDATE durch
+        if existing_record:
+            existing_id = dict(existing_record)["id"] if isinstance(existing_record, sqlite3.Row) else existing_record[0]
+            existing_quantity = dict(existing_record)["quantity"] if isinstance(existing_record, sqlite3.Row) else existing_record[1]
+            existing_max_quantity = dict(existing_record)["max_quantity"] if isinstance(existing_record, sqlite3.Row) else existing_record[2]
+            
+            # Berechne neue Werte
+            new_quantity_value = record_data.get("quantity", 1)
+            new_quantity = (existing_quantity or 0) + new_quantity_value
+            new_max_quantity = (existing_max_quantity or existing_quantity or 0) + new_quantity_value
+            
+            # UPDATE Statement
+            update_data = {
+                "quantity": new_quantity,
+                "max_quantity": new_max_quantity,
+                "status": "available",
+                "updated_at": "CURRENT_TIMESTAMP"
+            }
+            
+            # Füge purchase_price hinzu wenn vorhanden
+            if "purchase_price" in record_data and record_data["purchase_price"] is not None:
+                update_data["purchase_price"] = record_data["purchase_price"]
+            
+            # Baue UPDATE Query
+            set_clauses = []
+            values = []
+            for key, value in update_data.items():
+                if key == "updated_at":
+                    set_clauses.append(f"{key} = CURRENT_TIMESTAMP")
+                else:
+                    set_clauses.append(f"{key} = ?")
+                    values.append(value)
+            
+            values.append(existing_id)
+            query = f"UPDATE inventory SET {', '.join(set_clauses)} WHERE id = ?"
+            
+            cursor.execute(query, values)
+            conn.commit()
+            
+            # #region agent log
+            _debug_log("database.py:sync_to_inventory", "Update successful", {
+                "id": existing_id,
+                "old_quantity": existing_quantity,
+                "new_quantity": new_quantity
+            }, "SYNC")
+            # #endregion
+            
+            return {
+                "status": "updated",
+                "id": existing_id,
+                "old_quantity": existing_quantity or 0,
+                "new_quantity": new_quantity
+            }
+        
+        # FALL B: Kein Duplikat gefunden - führe INSERT durch
+        else:
+            # Normales INSERT mit allen Feldern aus record_data
+            columns = ', '.join(record_data.keys())
+            placeholders = ', '.join(['?' for _ in record_data])
+            values = list(record_data.values())
+            
+            query = f"INSERT INTO inventory ({columns}) VALUES ({placeholders})"
+            
+            cursor.execute(query, values)
+            conn.commit()
+            record_id = cursor.lastrowid
+            
+            # #region agent log
+            _debug_log("database.py:sync_to_inventory", "Insert successful", {"id": record_id}, "SYNC")
+            # #endregion
+            
+            return {
+                "status": "inserted",
+                "id": record_id
+            }
     
     def decrement_quantity(self, record_id: int, decrement: int = 1) -> bool:
         """
@@ -1060,8 +1570,8 @@ class Database:
         cursor = conn.cursor()
         
         try:
-            # Hole aktuelle quantity
-            cursor.execute("SELECT quantity FROM inventory WHERE id = ?", (record_id,))
+            # Hole aktuelle quantity und max_quantity
+            cursor.execute("SELECT quantity, max_quantity FROM inventory WHERE id = ?", (record_id,))
             row = cursor.fetchone()
             
             # #region agent log
@@ -1117,17 +1627,20 @@ class Database:
             
             new_quantity = current_quantity - decrement
             
+            # Setze max_quantity auf die neue quantity (verbleibende Menge)
+            new_max_quantity = new_quantity
+            
             # #region agent log
             try:
                 with open(log_path, "a", encoding="utf-8") as f_log:
-                    f_log.write(json_log.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"C","location":"database.py:decrement_quantity","message":"Before UPDATE","data":{"record_id":record_id,"current_quantity":current_quantity,"new_quantity":new_quantity},"timestamp":int(time_log.time()*1000)}) + "\n")
+                    f_log.write(json_log.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"C","location":"database.py:decrement_quantity","message":"Before UPDATE","data":{"record_id":record_id,"current_quantity":current_quantity,"new_quantity":new_quantity,"new_max_quantity":new_max_quantity},"timestamp":int(time_log.time()*1000)}) + "\n")
             except: pass
             # #endregion
             
-            # Update quantity - verwende atomare UPDATE-Anweisung für Thread-Sicherheit
+            # Update quantity und max_quantity atomar - verwende atomare UPDATE-Anweisung für Thread-Sicherheit
             cursor.execute(
-                "UPDATE inventory SET quantity = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                (new_quantity, record_id)
+                "UPDATE inventory SET quantity = ?, max_quantity = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (new_quantity, new_max_quantity, record_id)
             )
             
             # Speichere rowcount VOR dem Commit (wichtig: rowcount wird nach weiteren Queries zurückgesetzt)
@@ -1448,12 +1961,12 @@ class Database:
                 if not isinstance(items, list):
                     continue
                 
-                # Summiere purchase_price * quantity und quantity aus allen Rechnungen
+                # Summiere purchase_price (bereits Gesamt-Einkaufspreis pro Zeile) und quantity
                 for item in items:
                     if isinstance(item, dict):
                         purchase_price = float(item.get("purchase_price", 0) or 0)
                         quantity = int(item.get("quantity", 1) or 1)
-                        total_cost += purchase_price * quantity
+                        total_cost += purchase_price
                         total_sold_quantity += quantity
             
             except (json.JSONDecodeError, TypeError, ValueError):
@@ -1506,6 +2019,110 @@ class Database:
             stats['roi'] = (stats['total_profit'] / total_cost) * 100
         else:
             stats['roi'] = 0.0
+        
+        return stats
+    
+    def get_total_sold_quantity(self) -> int:
+        """
+        Berechnet die Gesamtzahl aller verkauften Einheiten aus allen Rechnungen.
+        
+        Returns:
+            Summe aller verkauften Einheiten aus allen Rechnungen
+        """
+        # #region agent log
+        try:
+            import time
+            log_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cursor", "debug.log")
+            with open(log_file_path, "a", encoding="utf-8") as f_log:
+                f_log.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"A","location":"database.py:get_total_sold_quantity","message":"Function entry","data":{},"timestamp":int(time.time()*1000)}) + "\n")
+        except: pass
+        # #endregion
+        
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        
+        # Hole alle Rechnungen
+        cursor.execute("SELECT items FROM invoices")
+        rows = cursor.fetchall()
+        
+        # #region agent log
+        try:
+            import time
+            log_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cursor", "debug.log")
+            with open(log_file_path, "a", encoding="utf-8") as f_log:
+                f_log.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"A","location":"database.py:get_total_sold_quantity","message":"After SELECT invoices","data":{"row_count":len(rows)},"timestamp":int(time.time()*1000)}) + "\n")
+        except: pass
+        # #endregion
+        
+        total_sold_quantity = 0
+        
+        for idx, row in enumerate(rows):
+            try:
+                items_json = row[0]
+                
+                # #region agent log
+                try:
+                    import time
+                    log_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cursor", "debug.log")
+                    with open(log_file_path, "a", encoding="utf-8") as f_log:
+                        f_log.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"B","location":"database.py:get_total_sold_quantity","message":"Processing invoice row","data":{"row_index":idx,"items_json_type":str(type(items_json)),"items_json_is_none":items_json is None,"items_json_preview":str(items_json)[:100] if items_json else None},"timestamp":int(time.time()*1000)}) + "\n")
+                except: pass
+                # #endregion
+                
+                if not items_json:
+                    continue
+                    
+                items = json.loads(items_json) if isinstance(items_json, str) else items_json
+                
+                # #region agent log
+                try:
+                    import time
+                    log_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cursor", "debug.log")
+                    with open(log_file_path, "a", encoding="utf-8") as f_log:
+                        f_log.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"C","location":"database.py:get_total_sold_quantity","message":"After JSON parse","data":{"items_type":str(type(items)),"items_is_list":isinstance(items, list),"items_len":len(items) if isinstance(items, list) else None},"timestamp":int(time.time()*1000)}) + "\n")
+                except: pass
+                # #endregion
+                
+                if not isinstance(items, list):
+                    continue
+                
+                # Summiere quantity aus allen Rechnungen
+                for item_idx, item in enumerate(items):
+                    if isinstance(item, dict):
+                        quantity = int(item.get("quantity", 1) or 1)
+                        
+                        # #region agent log
+                        try:
+                            import time
+                            log_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cursor", "debug.log")
+                            with open(log_file_path, "a", encoding="utf-8") as f_log:
+                                f_log.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"D","location":"database.py:get_total_sold_quantity","message":"Processing item","data":{"item_index":item_idx,"quantity":quantity,"item_keys":list(item.keys())},"timestamp":int(time.time()*1000)}) + "\n")
+                        except: pass
+                        # #endregion
+                        
+                        total_sold_quantity += quantity
+            
+            except (json.JSONDecodeError, TypeError, ValueError) as e:
+                # #region agent log
+                try:
+                    import time
+                    log_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cursor", "debug.log")
+                    with open(log_file_path, "a", encoding="utf-8") as f_log:
+                        f_log.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"E","location":"database.py:get_total_sold_quantity","message":"Exception caught","data":{"error":str(e),"error_type":type(e).__name__,"row_index":idx},"timestamp":int(time.time()*1000)}) + "\n")
+                except: pass
+                # #endregion
+                continue
+        
+        # #region agent log
+        try:
+            import time
+            log_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cursor", "debug.log")
+            with open(log_file_path, "a", encoding="utf-8") as f_log:
+                f_log.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"A","location":"database.py:get_total_sold_quantity","message":"Function exit","data":{"total_sold_quantity":total_sold_quantity},"timestamp":int(time.time()*1000)}) + "\n")
+        except: pass
+        # #endregion
+        
+        return total_sold_quantity
         
         return stats
     

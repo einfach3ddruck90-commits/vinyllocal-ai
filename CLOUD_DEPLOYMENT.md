@@ -54,6 +54,8 @@ Diese Anleitung erklärt, wie Sie VinylLocal AI auf Streamlit Cloud deployen kö
 
 Die App wird automatisch mit den Einstellungen aus `.streamlit/config.toml` konfiguriert.
 
+- **Upload-Limit:** In `config.toml` ist `server.maxUploadSize = 2000` (2000 MB) gesetzt, damit große Backup-ZIPs (z. B. bei 10.000+ Platten) hochgeladen werden können.
+
 ## Schritt 3: Daten-Synchronisation
 
 ### 3.1 Beim ersten Start
@@ -121,9 +123,10 @@ Wenn Sie die App zum ersten Mal auf Streamlit Cloud öffnen:
 
 ### "Upload fehlgeschlagen"
 
-- Prüfen Sie die Dateigröße (max. 200 MB)
-- Stellen Sie sicher, dass es eine gültige ZIP-Datei ist
+- Prüfen Sie die Dateigröße (Standard-Limit: 2000 MB, siehe `.streamlit/config.toml` – `maxUploadSize`)
+- Stellen Sie sicher, dass es eine gültige ZIP-Datei ist (enthält vinyl.db/vinyl_*.db, vinyl_images/ oder invoices/)
 - Prüfen Sie die Internetverbindung
+- Nach dem Hochladen wird die App neu geladen; bei großen Dateien kann die Wiederherstellung einen weiteren Ladevorgang benötigen
 
 ### "App startet nicht"
 

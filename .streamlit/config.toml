@@ -1,0 +1,4 @@
+# Streamlit-Konfiguration
+# Maximale Upload-Größe in MB (für Backup-ZIP und andere Datei-Uploads bei großen Inventaren)
+[server]
+maxUploadSize = 2000
