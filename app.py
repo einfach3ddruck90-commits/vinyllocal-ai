@@ -934,20 +934,7 @@ def show_email_verification():
 
 def check_authentication() -> bool:
     """Prüft ob Benutzer eingeloggt ist."""
-    # VORÜBERGEHEND: Login für localhost deaktiviert
-    # TODO: Wieder aktivieren für Produktion
-    # Setze Standard-Benutzer falls nicht vorhanden
-    if not st.session_state.get("current_user"):
-        st.session_state.current_user = {
-            "username": "localhost",
-            "email": "localhost@local",
-            "id": 1
-        }
-        st.session_state.is_authenticated = True
-    return True  # Login deaktiviert für localhost
-    
-    # Original-Code (auskommentiert):
-    # return st.session_state.get("is_authenticated", False) and st.session_state.get("current_user") is not None
+    return st.session_state.get("is_authenticated", False) and st.session_state.get("current_user") is not None
 
 
 def logout():
@@ -1011,16 +998,6 @@ def init_session_state():
         if username:
             if "db" not in st.session_state:
                 st.session_state.db = Database(username=username)
-    # VORÜBERGEHEND: Auch für localhost ohne Login initialisieren
-    elif not st.session_state.get("is_authenticated") and "db" not in st.session_state:
-        # Setze Standard-Benutzer und initialisiere DB
-        st.session_state.current_user = {
-            "username": "localhost",
-            "email": "localhost@local",
-            "id": 1
-        }
-        st.session_state.is_authenticated = True
-        st.session_state.db = Database(username="localhost")
     
     # Wenn nicht eingeloggt, keine Datenbank initialisieren
     if not st.session_state.is_authenticated:
