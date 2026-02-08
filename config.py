@@ -13,21 +13,34 @@ from typing import Optional
 # Versionsnummer (wird beim Update angezeigt; bitte mit VERSION.txt synchron halten)
 APP_VERSION = "1.1.0"
 
-# Standard: Desktop-Variante. Für Cloud-Deployment per Umgebungsvariable auf "CLOUD" setzen.
-APP_MODE = (os.getenv("APP_MODE") or "DESKTOP").strip().upper() or "DESKTOP"
+
+def _get_secret_or_env(key: str, default: str = "") -> str:
+    """Liefert Wert aus Umgebungsvariable oder aus st.secrets (für Streamlit Cloud ohne Env-Variablen)."""
+    v = (os.getenv(key) or "").strip()
+    if v:
+        return v
+    try:
+        import streamlit as st
+        x = st.secrets.get(key)
+        if x is None:
+            return default
+        if isinstance(x, bool):
+            return "true" if x else "false"
+        return str(x).strip() or default
+    except Exception:
+        return default
+
+
+# Standard: Desktop-Variante. Für Cloud: APP_MODE aus Umgebungsvariable oder aus Secrets (z. B. "CLOUD").
+APP_MODE = (_get_secret_or_env("APP_MODE", "DESKTOP").strip().upper() or "DESKTOP")
 
 # Cloud-Demo: Alle Nutzer teilen sich vinyl_demo.db und cloud_demo_assets/vinyl_images.
-CLOUD_DEMO_MODE = (
-    (os.getenv("CLOUD_DEMO_MODE") or "").strip().lower() in ("1", "true", "yes")
-    and APP_MODE == "CLOUD"
-)
+_cluster_demo_raw = _get_secret_or_env("CLOUD_DEMO_MODE", "").strip().lower()
+CLOUD_DEMO_MODE = _cluster_demo_raw in ("1", "true", "yes") and APP_MODE == "CLOUD"
 
 # Demo-Modus: Nur vorgegebene Bilder aus demo_images/ wählbar, kein file_uploader für Plattenbilder.
-# Nur wirksam wenn CLOUD_DEMO_MODE.
-DEMO_MODE = (
-    (os.getenv("DEMO_MODE") or "").strip().lower() in ("1", "true", "yes")
-    and CLOUD_DEMO_MODE
-)
+_demo_raw = _get_secret_or_env("DEMO_MODE", "").strip().lower()
+DEMO_MODE = _demo_raw in ("1", "true", "yes") and CLOUD_DEMO_MODE
 
 # Ordner für Cover-Fotos (relativ zum Projektroot). Wird von core/health.py und app.py genutzt.
 COVERS_DIR = "vinyl_images"

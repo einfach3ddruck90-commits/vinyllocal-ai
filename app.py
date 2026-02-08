@@ -1079,8 +1079,11 @@ def _init_session_state_heavy():
     
     discogs_enabled = api_settings.get("discogs_enabled", 0) == 1
     try:
-        from config import get_discogs_api_key
+        from config import get_discogs_api_key, APP_MODE
         discogs_api_key = (get_discogs_api_key() or api_settings.get("discogs_api_key", "") or "")
+        # Cloud: Wenn Key aus Secrets vorhanden, Discogs automatisch aktivieren (Demo-DB hat ggf. discogs_enabled=0)
+        if APP_MODE == "CLOUD" and get_discogs_api_key() and not discogs_enabled:
+            discogs_enabled = True
     except Exception:
         discogs_api_key = api_settings.get("discogs_api_key", "") or ""
     
@@ -1861,7 +1864,13 @@ def _ensure_discogs_client() -> None:
     db = st.session_state.db
     api_settings = db.get_company_settings() or {}
     discogs_enabled = api_settings.get("discogs_enabled", 0) == 1
-    discogs_api_key = (api_settings.get("discogs_api_key") or "").strip()
+    try:
+        from config import get_discogs_api_key, APP_MODE
+        discogs_api_key = (get_discogs_api_key() or api_settings.get("discogs_api_key") or "").strip()
+        if APP_MODE == "CLOUD" and get_discogs_api_key() and not discogs_enabled:
+            discogs_enabled = True
+    except Exception:
+        discogs_api_key = (api_settings.get("discogs_api_key") or "").strip()
     if not discogs_api_key:
         discogs_api_key = (st.session_state.get("settings_discogs_token") or "").strip()
         discogs_enabled = discogs_enabled or st.session_state.get("settings_discogs_enabled", False)
