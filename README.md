@@ -70,6 +70,7 @@ pip install -r requirements.txt
      - `OPENAI_API_KEY`: OpenAI API Key (Alternative zu Gemini)
      - `DISCOGS_TOKEN`: Discogs API Token (für Preisabfragen)
      - `MUSICBRAINZ_API_KEY`: MusicBrainz API Key (optional, nicht erforderlich)
+     - **Shopify OAuth:** `SHOPIFY_CLIENT_ID`, `SHOPIFY_CLIENT_SECRET` (aus Partner Dashboard); `APP_URL` (Basis-URL der App für Redirect, z. B. `http://localhost:8501` oder Produktiv-URL – muss im Partner Dashboard unter „Allowed redirection URL(s)“ eingetragen sein)
 
 ## Verwendung
 

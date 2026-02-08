@@ -43,6 +43,32 @@ def side_to_seite(side_str: str) -> str:
     return ""
 
 
+def html_to_tracklist_text(html: str) -> str:
+    """
+    Konvertiert HTML-Trackliste (z.B. <ul><li>1. Title (3:45)</li></ul>) in reinen Text
+    für parse_tracklist_to_table. Wenn der String kein HTML ist, wird er unverändert zurückgegeben.
+    """
+    if not html or not isinstance(html, str):
+        return ""
+    s = html.strip()
+    if not s or "<" not in s or ">" not in s:
+        return s
+    # <li>...</li> Inhalte extrahieren
+    li_pattern = re.compile(r"<li[^>]*>(.*?)</li>", re.DOTALL | re.IGNORECASE)
+    parts = li_pattern.findall(s)
+    if not parts:
+        # Fallback: alle Tags entfernen, Zeilen beibehalten
+        text = re.sub(r"<[^>]+>", "", s)
+        return text.strip()
+    lines = []
+    for part in parts:
+        # Innere Tags entfernen
+        line = re.sub(r"<[^>]+>", "", part).replace("&nbsp;", " ").strip()
+        if line:
+            lines.append(line)
+    return "\n".join(lines)
+
+
 def parse_tracklist_to_table(tracklist_text: str) -> List[Dict[str, str]]:
     """
     Konvertiert rohen Trackliste-Text (von KI oder Discogs) in Tabellenformat.

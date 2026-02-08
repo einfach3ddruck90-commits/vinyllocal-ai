@@ -7,12 +7,25 @@ Streamlit-basiertes Interface für Vinyl-Bestandsverwaltung.
 import json as json_log
 import os
 import os as os_log
-# Relativer Pfad für Log-Datei (funktioniert auf jedem Rechner)
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+from config import get_base_path, get_covers_dir, get_vinyl_db_path, APP_VERSION, PENDING_SCANS_DIR, CLOUD_DEMO_MODE
+# Basisverzeichnis (Projektroot oder EXE-Verzeichnis)
+BASE_DIR = get_base_path()
 LOG_DIR = os.path.join(BASE_DIR, ".cursor")
 REMEMBER_ME_PATH = os.path.join(BASE_DIR, ".streamlit", "remember_me.json")
+COVERS_ABS = get_covers_dir()
+INVOICES_ABS = os.path.join(BASE_DIR, "invoices")
+DISCOGS_FALLBACK_MAX_RELEASES = 20  # Max. get_release-Aufrufe in Fallback-Schleifen, damit Analyse nicht minutenlang blockiert
 os.makedirs(LOG_DIR, exist_ok=True)
 log_path = os.path.join(LOG_DIR, "debug.log")
+# Debug-Mode: dieselbe Datei wie log_path, damit Logs gefunden werden
+DEBUG_LOG_PATH = os.path.join(LOG_DIR, "debug.log")
+# #region agent log
+try:
+    with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as _dl0:
+        _dl0.write(json_log.dumps({"sessionId":"debug-session","runId":"module_load","hypothesisId":"A","location":"app.py:module","message":"module_loaded","data":{"debug_log_path":DEBUG_LOG_PATH},"timestamp":0}) + "\n")
+except Exception:
+    pass
+# #endregion
 try:
     with open(log_path, "a", encoding="utf-8") as f_log:
         f_log.write(json_log.dumps({"sessionId":"debug-session","runId":"startup","hypothesisId":"A","location":"app.py:6","message":"Starting imports","data":{},"timestamp":int(os_log.path.getmtime(log_path) if os_log.path.exists(log_path) else 0)}) + "\n")
@@ -28,7 +41,17 @@ try:
 except: pass
 # #endregion
 
+import contextlib
+import csv
+import io
 import pandas as pd
+try:
+    import plotly.express as px
+    import plotly.graph_objects as go
+except Exception:
+    # Plotly kann auf externen Rechnern (z. B. PyInstaller-Build) fehlen oder fehlschlagen
+    px = None
+    go = None
 import tempfile
 import re
 import json
@@ -38,7 +61,7 @@ import zipfile
 import shutil
 from pathlib import Path
 from typing import List, Dict, Any, Optional
-from datetime import datetime
+from datetime import datetime, date, timedelta
 
 # #region agent log - Fix sys.stderr logging issue
 try:
@@ -111,6 +134,20 @@ configure_logger_safe("streamlit.deprecation_util")
 configure_logger_safe("streamlit.runtime")
 configure_logger_safe("streamlit.elements")
 
+# Shopify-Kategorie-Debug: Logs in .cursor/shopify_category.log
+try:
+    _shopify_log = logging.getLogger("logic.shopify_client")
+    _shopify_log.setLevel(logging.INFO)
+    _shopify_log.propagate = False
+    _shopify_fh = logging.FileHandler(
+        os.path.join(LOG_DIR, "shopify_category.log"),
+        encoding="utf-8"
+    )
+    _shopify_fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    _shopify_log.addHandler(_shopify_fh)
+except Exception:
+    pass
+
 # #region agent log
 try:
     with open(log_path, "a", encoding="utf-8") as f_log:
@@ -120,7 +157,6 @@ except: pass
 
 from database import Database
 from logic.auth import UserDatabase, validate_email
-from logic.email_service import EmailService
 
 # #region agent log
 try:
@@ -130,13 +166,28 @@ except: pass
 # #endregion
 
 from core.vision_ocr import VisionOCR
-from core.tracklist import parse_tracklist_to_table, table_to_tracklist_string, table_to_readable_string
+from core.tracklist import parse_tracklist_to_table, table_to_tracklist_string, table_to_readable_string, html_to_tracklist_text
 from core.health import run_full_system_check
 from logic.discogs_client import DiscogsClient
+from logic.shopify_client import (
+    ShopifyClient,
+    validate_shopify_store_url,
+    normalize_shopify_store_url,
+    get_shopify_install_url,
+    exchange_code_for_token,
+    verify_shopify_hmac,
+)
 from logic.pricing import PricingWizard
 from logic.pdf_gen import InvoicePDFGenerator
 from logic.invoicing import calculate_invoice_totals, generate_invoice_number
-from datetime import datetime
+from logic.kleinanzeigen_listing_generator import (
+    generate_listing as generate_kleinanzeigen_listing,
+    _extract_tracklist_table,
+    DEFAULT_SHIPPING,
+    DEFAULT_LEGAL,
+    DEFAULT_PAYMENT,
+)
+from datetime import datetime, date, timedelta
 import time
 
 # #region agent log
@@ -145,6 +196,63 @@ try:
         f_log.write(json_log.dumps({"sessionId":"debug-session","runId":"startup","hypothesisId":"C","location":"app.py:42","message":"All imports completed","data":{},"timestamp":int(os_log.path.getmtime(log_path) if os_log.path.exists(log_path) else 0)}) + "\n")
 except: pass
 # #endregion
+
+
+def _boot_debug(msg: str) -> None:
+    """Schreibt eine Zeile in .cursor/boot_debug.txt mit Flush/fsync, damit bei Hang die letzte Phase erkennbar ist. Schluckt alle Exceptions."""
+    try:
+        if "boot_phases_this_run" in st.session_state:
+            st.session_state.boot_phases_this_run.append(msg)
+    except Exception:
+        pass
+    try:
+        path = os.path.join(LOG_DIR, "boot_debug.txt")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"{datetime.now().isoformat()} {msg}\n")
+            f.flush()
+            if hasattr(f, "fileno"):
+                try:
+                    os.fsync(f.fileno())
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+def _diagnostic_log(message: str, data: dict = None, hypothesis_id: str = "X") -> None:
+    """Schreibt eine Zeile in boot_debug.txt mit Präfix 'D ' und JSON (gleiche Datei wie _boot_debug)."""
+    try:
+        path = os.path.join(LOG_DIR, "boot_debug.txt")
+        payload = {"ts": time.time(), "msg": message, "h": hypothesis_id, **(data or {})}
+        with open(path, "a", encoding="utf-8") as f:
+            f.write("D " + json_log.dumps(payload) + "\n")
+            f.flush()
+    except Exception:
+        pass
+
+
+def _boot_checkpoint(label: str) -> None:
+    """Für Blink-Diagnose: Checkpoint mit Laufzeit (ms ab Run-Start) in Session State + boot_debug.txt.
+    Zeigt, an welchen Stellen gerendert wird und wie viel Zeit dazwischen liegt."""
+    try:
+        start_ts = st.session_state.get("boot_run_start_ts")
+        elapsed_ms = int((time.time() - start_ts) * 1000) if isinstance(start_ts, (int, float)) else 0
+        if "boot_checkpoints_this_run" in st.session_state:
+            st.session_state.boot_checkpoints_this_run.append((label, elapsed_ms))
+    except Exception:
+        pass
+    try:
+        path = os.path.join(LOG_DIR, "boot_debug.txt")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"  [CHECKPOINT +{elapsed_ms} ms] {label}\n")
+            f.flush()
+            if hasattr(f, "fileno"):
+                try:
+                    os.fsync(f.fileno())
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
 
 def show_success_message(message: str, button_key: str, duration: int = 5):
@@ -323,12 +431,44 @@ def format_company_address(company_settings: Dict[str, Any]) -> str:
     return company_settings.get('company_address', '')
 
 
-# Streamlit Konfiguration
+# Streamlit Konfiguration (Diagnose: debug.log + boot_debug – bei Hang zeigt letzter Eintrag die Stelle)
+_boot_debug("set_page_config_start")
+try:
+    with open(log_path, "a", encoding="utf-8") as f_log:
+        f_log.write(json_log.dumps({"sessionId": "debug-session", "runId": "startup", "hypothesisId": "B", "location": "app.py:set_page_config", "message": "Before set_page_config", "data": {}, "timestamp": int(time.time() * 1000)}) + "\n")
+        f_log.flush()
+        if hasattr(f_log, "fileno"):
+            try:
+                os.fsync(f_log.fileno())
+            except Exception:
+                pass
+except Exception:
+    pass
 st.set_page_config(
     page_title="VinylLocal AI",
     page_icon="🎵",
     layout="wide",
     initial_sidebar_state="expanded"
+)
+try:
+    with open(log_path, "a", encoding="utf-8") as f_log:
+        f_log.write(json_log.dumps({"sessionId": "debug-session", "runId": "startup", "hypothesisId": "B", "location": "app.py:set_page_config", "message": "After set_page_config", "data": {}, "timestamp": int(time.time() * 1000)}) + "\n")
+        f_log.flush()
+        if hasattr(f_log, "fileno"):
+            try:
+                os.fsync(f_log.fileno())
+            except Exception:
+                pass
+except Exception:
+    pass
+_boot_debug("set_page_config_done")
+
+# Blink-Reduktion: App-Container anfangs ausgeblendet, nach kurzer Verzögerung weich einblenden (ein Übergang statt mehrfacher Frames)
+_HIDE_APP_CSS = (
+    '<style id="vinyl-hide-until-ready">'
+    '@keyframes vinylFadeIn { to { opacity: 1; } }'
+    '[data-testid="stAppViewContainer"] { opacity: 0; animation: vinylFadeIn 0.3s ease-out 0.15s forwards; }'
+    '</style>'
 )
 
 
@@ -399,7 +539,8 @@ def show_login():
                         st.session_state.is_authenticated = True
                         st.session_state.current_user = user_data
                         # Initialisiere benutzerspezifische Datenbank
-                        st.session_state.db = Database(username=username)
+                        safe_username = re.sub(r"[^a-zA-Z0-9_]", "_", username)
+                        st.session_state.db = Database(db_path=get_vinyl_db_path(username))
                         _save_remember_me(username)
                         
                         # Prüfe ob E-Mail vorhanden ist
@@ -421,14 +562,18 @@ def show_login():
             st.rerun()
 
 
-def get_email_service() -> Optional[EmailService]:
+def get_email_service():
     """
     Erstellt EmailService aus Umgebungsvariablen.
-    
+    Lazy-Import, damit die App auch startet wenn email.mime in der EXE fehlt.
     Returns:
-        EmailService Instanz oder None wenn Einstellungen fehlen
+        EmailService Instanz oder None wenn Einstellungen fehlen / Modul nicht ladbar
     """
-    return EmailService.from_env()
+    try:
+        from logic.email_service import EmailService
+        return EmailService.from_env()
+    except (ImportError, Exception):
+        return None
 
 
 def show_register():
@@ -471,7 +616,8 @@ def show_register():
                                 st.session_state.is_authenticated = True
                                 st.session_state.current_user = user_data
                                 # Initialisiere benutzerspezifische Datenbank
-                                st.session_state.db = Database(username=username)
+                                safe_username = re.sub(r"[^a-zA-Z0-9_]", "_", username)
+                                st.session_state.db = Database(db_path=get_vinyl_db_path(username))
                                 _save_remember_me(username)
                                 st.success("✅ Registrierung erfolgreich! Willkommen bei VinylLocal AI!")
                                 st.rerun()
@@ -580,6 +726,8 @@ def show_email_update():
     
     st.info("ℹ️ **Wichtig:** Eine E-Mail-Adresse ist jetzt erforderlich. Bitte tragen Sie Ihre E-Mail-Adresse ein.")
     
+    show_success_message("", "save_email")
+    
     col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
         with st.form("email_update_form"):
@@ -603,7 +751,7 @@ def show_email_update():
                         success, message = user_db.update_user_email(username, email.strip())
                         
                         if success:
-                            st.success("E-Mail-Adresse erfolgreich gespeichert!")
+                            set_success_message("✅ E-Mail-Adresse erfolgreich gespeichert!", "save_email")
                             # Aktualisiere current_user in Session State
                             current_user['email'] = email.strip()
                             st.session_state.current_user = current_user
@@ -691,18 +839,27 @@ def logout():
     st.session_state.current_user = None
     if "db" in st.session_state:
         del st.session_state.db
+    if "_init_heavy_done" in st.session_state:
+        del st.session_state["_init_heavy_done"]
+    if "boot_ui_ready" in st.session_state:
+        del st.session_state["boot_ui_ready"]
     st.rerun()
 
 
 def init_session_state():
-    """Initialisiert Session State Variablen."""
-    # Authentifizierungs-Variablen
+    """Initialisiert Session State Variablen. Keine DB/Datei hier – erst bei Bedarf (verhindert Skeleton-Hang)."""
+    # #region agent log
+    try:
+        with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as _dl:
+            _dl.write(json_log.dumps({"sessionId":"debug-session","runId":f"run{st.session_state.get('boot_run_count',0)}","hypothesisId":"H2","location":"app.py:init_session_state","message":"init_session_state_enter","data":{},"timestamp":int(time.time()*1000)}) + "\n")
+    except Exception:
+        pass
+    # #endregion
+    # Authentifizierungs-Variablen (nur In-Memory, kein UserDatabase() – wird vor Login/Restore erstellt)
     if "is_authenticated" not in st.session_state:
         st.session_state.is_authenticated = False
     if "current_user" not in st.session_state:
         st.session_state.current_user = None
-    if "user_db" not in st.session_state:
-        st.session_state.user_db = UserDatabase()
     if "show_register" not in st.session_state:
         st.session_state.show_register = False
     if "show_resend_verification" not in st.session_state:
@@ -711,27 +868,10 @@ def init_session_state():
         st.session_state.show_resend_button = False
     if "resend_username" not in st.session_state:
         st.session_state.resend_username = ""
-    
-    # Login aus Session-Datei wiederherstellen (z. B. nach Browser-Refresh)
-    if not st.session_state.is_authenticated or not st.session_state.current_user:
-        try:
-            if os.path.exists(REMEMBER_ME_PATH):
-                with open(REMEMBER_ME_PATH, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                username = data.get("username")
-                if username:
-                    user_db = st.session_state.user_db
-                    user_data = user_db.get_user(username)
-                    if user_data:
-                        st.session_state.is_authenticated = True
-                        st.session_state.current_user = user_data
-                        st.session_state.db = Database(username=username)
-        except Exception:
-            pass
-    
+
     # Datenbank initialisieren wenn eingeloggt (oder localhost-Modus)
     if st.session_state.get("pending_delete_localhost"):
-        base = Path.cwd()
+        base = Path(BASE_DIR)
         for name in ["vinyl_localhost.db", "vinyl_localhost.db-shm", "vinyl_localhost.db-wal"]:
             p = base / name
             if p.exists():
@@ -762,27 +902,88 @@ def init_session_state():
         username = st.session_state.current_user.get("username")
         if username:
             if "db" not in st.session_state:
-                st.session_state.db = Database(username=username)
+                st.session_state.db = Database(db_path=get_vinyl_db_path(username))
     
     # Wenn nicht eingeloggt, keine Datenbank initialisieren
     if not st.session_state.is_authenticated:
         if "db" in st.session_state:
             # Lösche DB-Verbindung wenn nicht mehr eingeloggt
             del st.session_state.db
+        # #region agent log
+        try:
+            with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as _dl:
+                _dl.write(json_log.dumps({"sessionId":"debug-session","runId":f"run{st.session_state.get('boot_run_count',0)}","hypothesisId":"H2","location":"app.py:init_session_state","message":"init_session_state_exit","data":{"path":"not_authenticated"},"timestamp":int(time.time()*1000)}) + "\n")
+        except Exception:
+            pass
+        # #endregion
         return
-    
-    # Ab hier: Nur wenn eingeloggt
+
+    # Ab hier: Nur wenn eingeloggt – schwere Init (API-Clients, Einstellungen) erst in _main_content(),
+    # damit die Login-Seite schnell erscheint und kein Skeleton-Hang entsteht
+    if "db" not in st.session_state:
+        # #region agent log
+        try:
+            with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as _dl:
+                _dl.write(json_log.dumps({"sessionId":"debug-session","runId":f"run{st.session_state.get('boot_run_count',0)}","hypothesisId":"H2","location":"app.py:init_session_state","message":"init_session_state_exit","data":{"path":"no_db"},"timestamp":int(time.time()*1000)}) + "\n")
+        except Exception:
+            pass
+        # #endregion
+        return
+
+    # Einmal-Migration: Rechnungs-PDFs von vinyl_images/invoices/ nach invoices/ verschieben
+    if not st.session_state.get("_invoices_migration_done"):
+        _migrate_invoices_out_of_vinyl_images(st.session_state.db)
+        st.session_state["_invoices_migration_done"] = True
+
+    # #region agent log
+    try:
+        with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as _dl:
+            _dl.write(json_log.dumps({"sessionId":"debug-session","runId":f"run{st.session_state.get('boot_run_count',0)}","hypothesisId":"H2","location":"app.py:init_session_state","message":"init_session_state_exit","data":{"path":"ok"},"timestamp":int(time.time()*1000)}) + "\n")
+    except Exception:
+        pass
+    # #endregion
+
+
+def _migrate_invoices_out_of_vinyl_images(db) -> None:
+    """Verschiebt bestehende Rechnungs-PDFs von vinyl_images/invoices/ nach invoices/ und aktualisiert DB-Pfade."""
+    old_dir = Path(COVERS_ABS) / "invoices"
+    new_dir = Path(INVOICES_ABS)
+    if not old_dir.exists() or not old_dir.is_dir():
+        return
+    new_dir.mkdir(parents=True, exist_ok=True)
+    for pdf_file in old_dir.glob("*.pdf"):
+        dest = new_dir / pdf_file.name
+        if not dest.exists():
+            try:
+                shutil.copy2(pdf_file, dest)
+            except Exception:
+                pass
+    prefix = "vinyl_images/invoices/"
+    for inv in db.get_all_records("invoices", where_clause=None) or []:
+        pdf_path = inv.get("pdf_path") or ""
+        if pdf_path.startswith(prefix):
+            new_path = "invoices/" + os.path.basename(pdf_path)
+            try:
+                db.update_record("invoices", inv["id"], {"pdf_path": new_path})
+            except Exception:
+                pass
+
+
+def _init_session_state_heavy():
+    """Lädt API-Einstellungen und Clients (VisionOCR, Shopify, etc.). Nur einmal nach Login."""
+    if st.session_state.get("_init_heavy_done"):
+        return
     if "db" not in st.session_state:
         return
-    
-    # Lade API-Einstellungen aus Datenbank
+    _boot_debug("heavy_enter")
     db = st.session_state.db
     api_settings = db.get_company_settings() or {}
-    
+    _boot_debug("heavy_get_settings_done")
+
     # Gemini/VisionOCR - Initialisiere nur wenn aktiviert und Key vorhanden
     if "vision_ocr" not in st.session_state:
         st.session_state.vision_ocr = None
-    
+
     gemini_enabled = api_settings.get("gemini_enabled", 0) == 1
     # Cloud: Key aus config/st.secrets; Desktop: aus Einstellungen/DB (BYOK)
     try:
@@ -811,13 +1012,18 @@ def init_session_state():
         except Exception as e:
             st.session_state.vision_ocr = None
             pass
-    
+    _boot_debug("heavy_vision_done")
+
     # OpenAI/VisionOCR - Initialisiere nur wenn aktiviert und Key vorhanden
     if "openai_vision_ocr" not in st.session_state:
         st.session_state.openai_vision_ocr = None
     
     openai_enabled = api_settings.get("openai_enabled", 0) == 1
-    openai_api_key = api_settings.get("openai_api_key", "")
+    try:
+        from config import get_openai_api_key
+        openai_api_key = (get_openai_api_key() or api_settings.get("openai_api_key", "") or "")
+    except Exception:
+        openai_api_key = api_settings.get("openai_api_key", "") or ""
     
     if openai_enabled and openai_api_key:
         try:
@@ -828,13 +1034,18 @@ def init_session_state():
             # print(f"OpenAIVisionOCR konnte nicht initialisiert werden: {e}")  # Deaktiviert wegen Streamlit stdout
     else:
         st.session_state.openai_vision_ocr = None
-    
+    _boot_debug("heavy_openai_done")
+
     # MusicBrainz Client - nur initialisieren wenn aktiviert
     if "musicbrainz_client" not in st.session_state:
         st.session_state.musicbrainz_client = None
     
     musicbrainz_enabled = api_settings.get("musicbrainz_enabled", 0) == 1
-    musicbrainz_api_key = api_settings.get("musicbrainz_api_key", "")
+    try:
+        from config import get_musicbrainz_api_key
+        musicbrainz_api_key = (get_musicbrainz_api_key() or api_settings.get("musicbrainz_api_key", "") or "")
+    except Exception:
+        musicbrainz_api_key = api_settings.get("musicbrainz_api_key", "") or ""
     
     if musicbrainz_enabled:
         try:
@@ -845,13 +1056,18 @@ def init_session_state():
         except Exception as e:
             st.session_state.musicbrainz_client = None
             # print(f"MusicBrainz Client konnte nicht initialisiert werden: {e}")  # Deaktiviert wegen Streamlit stdout
-    
+    _boot_debug("heavy_musicbrainz_done")
+
     # Discogs Client - nur initialisieren wenn aktiviert und Token vorhanden
     if "discogs_client" not in st.session_state:
         st.session_state.discogs_client = None
     
     discogs_enabled = api_settings.get("discogs_enabled", 0) == 1
-    discogs_api_key = api_settings.get("discogs_api_key", "")
+    try:
+        from config import get_discogs_api_key
+        discogs_api_key = (get_discogs_api_key() or api_settings.get("discogs_api_key", "") or "")
+    except Exception:
+        discogs_api_key = api_settings.get("discogs_api_key", "") or ""
     
     # Fallback auf Session State für Rückwärtskompatibilität
     if not discogs_api_key:
@@ -864,6 +1080,30 @@ def init_session_state():
         except Exception as e:
             st.session_state.discogs_client = None
             # print(f"Discogs Client konnte nicht initialisiert werden: {e}")  # Deaktiviert wegen Streamlit stdout
+    _boot_debug("heavy_discogs_done")
+
+    # Shopify Client
+    if "shopify_client" not in st.session_state:
+        st.session_state.shopify_client = None
+    shopify_enabled = api_settings.get("shopify_enabled", 0) == 1
+    shopify_store_url = (api_settings.get("shopify_store_url") or "").strip()
+    shopify_access_token = (api_settings.get("shopify_access_token") or "").strip()
+    if shopify_enabled and shopify_store_url and shopify_access_token:
+        valid_url, _ = validate_shopify_store_url(shopify_store_url)
+        if valid_url:
+            try:
+                st.session_state.shopify_client = ShopifyClient(
+                    store_url=shopify_store_url,
+                    access_token=shopify_access_token,
+                )
+            except Exception:
+                st.session_state.shopify_client = None
+        else:
+            st.session_state.shopify_client = None
+    else:
+        st.session_state.shopify_client = None
+    _boot_debug("heavy_shopify_done")
+
     if "pricing_wizard" not in st.session_state:
         st.session_state.pricing_wizard = PricingWizard()
     if "pdf_generator" not in st.session_state:
@@ -881,7 +1121,10 @@ def init_session_state():
     if "scan_year" not in st.session_state:
         st.session_state.scan_year = None
     if "scan_format" not in st.session_state:
-        st.session_state.scan_format = ""
+        _df = (st.session_state.get("db").get_company_settings() or {}).get("default_format") or "" if st.session_state.get("db") else ""
+        st.session_state.scan_format = _df if isinstance(_df, str) else ""
+    if "scan_genre" not in st.session_state:
+        st.session_state.scan_genre = ""
     if "scan_individual_condition_enabled" not in st.session_state:
         st.session_state.scan_individual_condition_enabled = False
     if "scan_individual_condition_text" not in st.session_state:
@@ -920,6 +1163,10 @@ def init_session_state():
     if "auto_search_performed" not in st.session_state:
         st.session_state.auto_search_performed = False
     
+    # Flag: Discogs erneut suchen nach manueller Cat-No-Änderung (Enter)
+    if "trigger_discogs_after_cat_no_edit" not in st.session_state:
+        st.session_state.trigger_discogs_after_cat_no_edit = False
+    
     # Track zuletzt verarbeitete Release-ID (verhindert Endlos-Loop bei Radio-Button)
     if "last_processed_release_id" not in st.session_state:
         st.session_state.last_processed_release_id = None
@@ -936,7 +1183,8 @@ def init_session_state():
             "label": False,
             "cat_no": False,
             "year": False,
-            "tracklist": False
+            "tracklist": False,
+            "genre": False
         }
     
     # Trackliste als Tabelle (Liste von Dictionaries) - Initialisierung falls nicht vorhanden
@@ -997,6 +1245,9 @@ def init_session_state():
     if "scan_success_message_shown_at" not in st.session_state:
         st.session_state.scan_success_message_shown_at = 0
 
+    _boot_debug("heavy_done")
+    st.session_state._init_heavy_done = True
+
 
 def reset_metadata():
     """
@@ -1011,6 +1262,7 @@ def reset_metadata():
     st.session_state.scan_cat_no = ""
     st.session_state.scan_year = None
     st.session_state.scan_format = ""
+    st.session_state.scan_genre = ""
     st.session_state.scan_tracklist_table = []
     st.session_state.scan_discogs_results = None
     st.session_state.scan_selected_release = None
@@ -1039,7 +1291,8 @@ def reset_metadata():
         "label": False,
         "cat_no": False,
         "year": False,
-        "tracklist": False
+        "tracklist": False,
+        "genre": False
     }
     
     # Lösche temporäre Bildpfade wenn vorhanden
@@ -1055,6 +1308,10 @@ def reset_metadata():
     # Erhöhe Form-Counter um UI-Widgets zu aktualisieren
     st.session_state.form_reset_counter += 1
     
+    # Reset späten Jahr-Fallback (bei neuem Scan erneut versuchen)
+    if "year_late_fallback_done" in st.session_state:
+        del st.session_state["year_late_fallback_done"]
+    
     # Reset Dubletten-Zustand beim neuen Scan
     st.session_state.duplicate_found = False
     st.session_state.items_with_duplicates = []
@@ -1063,6 +1320,50 @@ def reset_metadata():
     st.session_state.scan_success_message_shown_at = 0
     
     # print("Metadaten zurueckgesetzt - bereit fuer neue Analyse")  # Deaktiviert wegen Streamlit stdout
+
+
+def clear_scan_session_for_new_session():
+    """
+    Setzt die komplette Scan-Session zurück (Metadaten + Bilder/Upload-Zustand).
+    Wird aufgerufen, wenn der Nutzer von einer anderen Seite zur Scan-Session wechselt,
+    damit keine alten Daten der letzten Session angezeigt werden.
+    """
+    reset_metadata()
+    # Standard-Plattenformat aus Einstellungen übernehmen
+    _db = st.session_state.get("db")
+    if _db:
+        _fmt = (_db.get_company_settings() or {}).get("default_format") or ""
+        st.session_state.scan_format = _fmt if isinstance(_fmt, str) else ""
+    # Cover-Bilder und Upload-Zustand leeren
+    st.session_state.cover_front_bytes = None
+    st.session_state.cover_back_bytes = None
+    st.session_state.cover_front_name = None
+    st.session_state.cover_back_name = None
+    st.session_state.cover_last_front_uploader_name = None
+    st.session_state.cover_last_back_uploader_name = None
+    st.session_state.both_covers_upload_done = False
+    st.session_state.upload_reset_counter = st.session_state.get("upload_reset_counter", 0) + 1
+    if "scan_image_path" in st.session_state:
+        st.session_state.scan_image_path = None
+    if "last_uploaded_files" in st.session_state:
+        st.session_state.last_uploaded_files = (None, None)
+    # Pending-Zuordnung (2 Cover): Temporäre Dateien löschen, dann verwerfen
+    pending_paths = st.session_state.get("pending_two_covers_paths") or []
+    for p in pending_paths:
+        if isinstance(p, str) and os.path.exists(p):
+            try:
+                os.unlink(p)
+            except Exception:
+                pass
+    st.session_state.pending_two_covers_paths = []
+    st.session_state.pending_two_covers_names = []
+    # Kein Queue-Kontext beim Wechsel aus anderer Seite
+    if "analyze_from_queue" in st.session_state:
+        st.session_state.analyze_from_queue = False
+    if "do_assign_and_analyze_from_queue" in st.session_state:
+        st.session_state.do_assign_and_analyze_from_queue = False
+    if "run_analysis_from_queue" in st.session_state:
+        st.session_state.run_analysis_from_queue = False
 
 
 def show_dashboard():
@@ -1105,6 +1406,59 @@ def show_dashboard():
     )
     
     period_type = period_options[selected_period]
+    today = date.today()
+    date_from = None
+    date_to = None
+    period_map = {
+        "Letzte 7 Tage": (today - timedelta(days=7), today, "day"),
+        "Letzte 30 Tage": (today - timedelta(days=30), today, "day"),
+        "Letzte 3 Monate": (today - timedelta(days=90), today, "month"),
+        "Letzte 6 Monate": (today - timedelta(days=180), today, "month"),
+        "Letztes Jahr": (today - timedelta(days=365), today, "month"),
+        "Gesamt": (None, None, "month"),
+    }
+    range_tuple = period_map.get(selected_period, (None, None, "month"))
+    if range_tuple[0] is not None:
+        date_from = range_tuple[0].strftime("%Y-%m-%d")
+        date_to = range_tuple[1].strftime("%Y-%m-%d")
+    period_chart = range_tuple[2]
+    
+    # Dashboard-Farbschema (hellgrau)
+    DASHBOARD_BG = "#e0e0e0"
+    DASHBOARD_PAPER = "#f5f5f5"
+    DASHBOARD_TEXT = "#2c2c2c"
+    ACCENT_POSITIVE = "#2e7d32"
+    ACCENT_NEUTRAL = "#5c6bc0"
+    
+    st.markdown(f"""
+    <style>
+    div[data-testid="stMetric"] {{
+        background: {DASHBOARD_BG};
+        padding: 1rem 1.25rem;
+        border-radius: 10px;
+        box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+        border: 1px solid rgba(0,0,0,0.12);
+    }}
+    div[data-testid="stMetric"] label {{ color: {DASHBOARD_TEXT} !important; }}
+    div[data-testid="stMetric"] [data-testid="stMetricValue"] {{ color: {ACCENT_NEUTRAL} !important; }}
+    </style>
+    """, unsafe_allow_html=True)
+    
+    # Shopify-Verkäufe (on-the-fly, optional 60s Cache)
+    shopify_quantity = 0
+    shopify_revenue = 0.0
+    shopify_err = None
+    shopify_client = st.session_state.get("shopify_client")
+    if shopify_client:
+        import time as _time
+        cache = st.session_state.get("shopify_sales_totals")
+        ts = st.session_state.get("shopify_sales_totals_ts", 0)
+        if cache is not None and (_time.time() - ts) < 60:
+            shopify_quantity, shopify_revenue, shopify_err = cache
+        else:
+            shopify_quantity, shopify_revenue, shopify_err = shopify_client.get_orders_sales_totals()
+            st.session_state.shopify_sales_totals = (shopify_quantity, shopify_revenue, shopify_err)
+            st.session_state.shopify_sales_totals_ts = _time.time()
     
     # Tabs für verschiedene Statistik-Views
     tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Übersicht", "💰 Finanzen", "📈 Verkäufe", "👥 Kunden", "🎵 Produkte"])
@@ -1117,24 +1471,8 @@ def show_dashboard():
             for item in valid_inventory 
             if item.get("status") == "available" or (item.get("quantity", 0) or 0) > 0
         )
-        # Zähle verkaufte Einheiten aus Rechnungen (präziser als nur Status "sold")
-        # #region agent log
-        try:
-            import time
-            log_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cursor", "debug.log")
-            with open(log_file_path, "a", encoding="utf-8") as f_log:
-                f_log.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"A","location":"app.py:show_dashboard","message":"Before get_total_sold_quantity","data":{},"timestamp":int(time.time()*1000)}) + "\n")
-        except: pass
-        # #endregion
-        sold_items = db.get_total_sold_quantity()
-        # #region agent log
-        try:
-            import time
-            log_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cursor", "debug.log")
-            with open(log_file_path, "a", encoding="utf-8") as f_log:
-                f_log.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"A","location":"app.py:show_dashboard","message":"After get_total_sold_quantity","data":{"sold_items":sold_items},"timestamp":int(time.time()*1000)}) + "\n")
-        except: pass
-        # #endregion
+        # Zähle verkaufte Einheiten: App-Rechnungen + Shopify-Orders
+        sold_items = db.get_total_sold_quantity() + shopify_quantity
         
         total_value = sum(float(item.get("pricing", 0) or 0) * float(item.get("quantity", 1) or 1) for item in valid_inventory if item.get("status") == "available")
         
@@ -1149,13 +1487,84 @@ def show_dashboard():
         
         with col3:
             st.metric("💰 Verkauft", sold_items)
+            if shopify_quantity > 0:
+                st.caption("inkl. " + str(shopify_quantity) + " aus Shopify")
+            if shopify_err:
+                st.caption("Shopify-Verkäufe derzeit nicht abrufbar")
         
         with col4:
             st.metric("💵 Gesamtwert", f"{total_value:.2f} EUR")
+        
+        # Charts: Umsatz über Zeit + Einkaufswert vs. Gesamt Lagerwert
+        chart_col1, chart_col2 = st.columns(2)
+        with chart_col1:
+            st.markdown("**Umsatz über Zeit**")
+            sales_over_time = db.get_sales_over_time(period_chart, date_from, date_to)
+            if sales_over_time and px is not None:
+                df_time = pd.DataFrame(sales_over_time)
+                fig_bar = px.bar(
+                    df_time, x="period", y="revenue",
+                    labels={"period": "Zeitraum", "revenue": "Umsatz (EUR)"}
+                )
+                fig_bar.update_layout(
+                    paper_bgcolor=DASHBOARD_PAPER, plot_bgcolor=DASHBOARD_BG,
+                    font_color=DASHBOARD_TEXT, margin=dict(t=30, b=30, l=40, r=20),
+                    xaxis=dict(gridcolor="rgba(0,0,0,0.15)"),
+                    yaxis=dict(gridcolor="rgba(0,0,0,0.15)")
+                )
+                fig_bar.update_traces(marker_color=ACCENT_POSITIVE)
+                st.plotly_chart(fig_bar, use_container_width=True)
+            elif sales_over_time and px is None:
+                df_time = pd.DataFrame(sales_over_time)
+                # Fallback: Streamlit-Balkendiagramm wenn Plotly nicht verfügbar (z. B. externer Rechner/PyInstaller)
+                st.bar_chart(df_time.set_index("period")[["revenue"]].rename(columns={"revenue": "Umsatz (EUR)"}))
+            else:
+                st.info("Keine Umsatzdaten im gewählten Zeitraum.")
+        with chart_col2:
+            st.markdown("**Einkaufswert vs. Gesamt Lagerwert**")
+            sales_stats = db.get_sales_statistics(date_from=date_from, date_to=date_to)
+            purchase_value = float(sales_stats.get("total_purchase_value", 0) or 0)
+            df_vals = pd.DataFrame({
+                "Art": ["Einkaufswert", "Gesamt Lagerwert"],
+                "Wert (EUR)": [round(purchase_value, 2), round(total_value, 2)]
+            })
+            if px is not None:
+                fig_vals = px.bar(
+                    df_vals, x="Art", y="Wert (EUR)",
+                    labels={"Art": "", "Wert (EUR)": "EUR"}
+                )
+                fig_vals.update_layout(
+                    paper_bgcolor=DASHBOARD_PAPER, plot_bgcolor=DASHBOARD_BG,
+                    font_color=DASHBOARD_TEXT, margin=dict(t=30, b=30, l=40, r=20),
+                    xaxis=dict(gridcolor="rgba(0,0,0,0.15)"),
+                    yaxis=dict(gridcolor="rgba(0,0,0,0.15)")
+                )
+                fig_vals.update_traces(marker_color=[ACCENT_NEUTRAL, ACCENT_POSITIVE])
+                st.plotly_chart(fig_vals, use_container_width=True)
+            else:
+                # Fallback: Streamlit-Balkendiagramm wenn Plotly nicht verfügbar (z. B. externer Rechner/PyInstaller)
+                st.bar_chart(df_vals.set_index("Art")[["Wert (EUR)"]])
+        
+        # Top 5 Seller (zeitgefiltert)
+        st.markdown("**Top 5 Seller (nach Umsatz)**")
+        top5 = db.get_top_sellers(limit=5, sort_by="revenue", date_from=date_from, date_to=date_to)
+        if top5:
+            df_top5 = pd.DataFrame(top5)
+            df_top5["revenue"] = df_top5["revenue"].round(2)
+            st.dataframe(
+                df_top5[["artist", "title", "quantity_sold", "revenue"]].rename(columns={
+                    "artist": "Künstler", "title": "Titel", "quantity_sold": "Verkauft", "revenue": "Umsatz (EUR)"
+                }),
+                use_container_width=True,
+                hide_index=True
+            )
+        else:
+            st.info("Keine Verkäufe im gewählten Zeitraum.")
     
     with tab2:
-        # Finanzielle Übersicht - nur das Nötigste
-        sales_stats = db.get_sales_statistics()  # WICHTIG: Lädt aktuelle Daten aus DB
+        # Finanzielle Übersicht - nur das Nötigste (Umsatz = App + Shopify; Gewinn nur App)
+        sales_stats = db.get_sales_statistics(date_from=date_from, date_to=date_to)  # WICHTIG: Lädt aktuelle Daten aus DB
+        total_revenue_display = sales_stats.get('total_revenue', 0) + shopify_revenue
         
         st.subheader("💰 Finanzielle Übersicht")
         
@@ -1163,10 +1572,13 @@ def show_dashboard():
         col1, col2, col3, col4 = st.columns(4)
         
         with col1:
-            st.metric("💵 Gesamtumsatz", f"{sales_stats.get('total_revenue', 0):.2f} EUR")
+            st.metric("💵 Gesamtumsatz", f"{total_revenue_display:.2f} EUR")
+            if shopify_revenue > 0:
+                st.caption("davon Shopify: " + f"{shopify_revenue:.2f}" + " EUR")
         
         with col2:
             st.metric("💸 Gesamtgewinn", f"{sales_stats.get('total_profit', 0):.2f} EUR")
+            st.caption("nur aus App-Rechnungen")
         
         with col3:
             st.metric("💶 Ø Verkaufspreis", f"{sales_stats.get('avg_sale_price', 0):.2f} EUR")
@@ -1178,7 +1590,8 @@ def show_dashboard():
         # Verkaufsstatistik - nur das Nötigste
         st.subheader("📈 Verkäufe")
         
-        sales_stats = db.get_sales_statistics()
+        sales_stats = db.get_sales_statistics(date_from=date_from, date_to=date_to)
+        total_revenue_display = sales_stats.get('total_revenue', 0) + shopify_revenue
         
         # Nur die wichtigsten Metriken anzeigen
         col1, col2 = st.columns(2)
@@ -1187,7 +1600,9 @@ def show_dashboard():
             st.metric("🧾 Anzahl Rechnungen", sales_stats.get('total_invoices', 0))
         
         with col2:
-            st.metric("💵 Gesamtumsatz", f"{sales_stats.get('total_revenue', 0):.2f} EUR")
+            st.metric("💵 Gesamtumsatz", f"{total_revenue_display:.2f} EUR")
+            if shopify_revenue > 0:
+                st.caption("davon Shopify: " + f"{shopify_revenue:.2f}" + " EUR")
     
     with tab4:
         # Top-Kunden
@@ -1197,7 +1612,7 @@ def show_dashboard():
         
         with col_cust1:
             st.markdown("**Top 10 nach Umsatz**")
-            top_customers_revenue = db.get_top_customers(limit=10, sort_by='revenue')
+            top_customers_revenue = db.get_top_customers(limit=10, sort_by='revenue', date_from=date_from, date_to=date_to)
             
             if top_customers_revenue:
                 df_customers = pd.DataFrame(top_customers_revenue)
@@ -1228,7 +1643,7 @@ def show_dashboard():
         
         with col_cust2:
             st.markdown("**Top 10 nach Anzahl**")
-            top_customers_count = db.get_top_customers(limit=10, sort_by='count')
+            top_customers_count = db.get_top_customers(limit=10, sort_by='count', date_from=date_from, date_to=date_to)
             
             if top_customers_count:
                 df_customers = pd.DataFrame(top_customers_count)
@@ -1244,11 +1659,12 @@ def show_dashboard():
             else:
                 st.info("Noch keine Kundendaten vorhanden.")
         
-        # Durchschnittlicher Kundenwert
-        sales_stats = db.get_sales_statistics()
-        total_customers = len(db.get_top_customers(limit=1000, sort_by='revenue'))
-        if total_customers > 0 and sales_stats.get('total_revenue', 0) > 0:
-            avg_customer_value = sales_stats.get('total_revenue', 0) / total_customers
+        # Durchschnittlicher Kundenwert (Umsatz = App + Shopify)
+        sales_stats = db.get_sales_statistics(date_from=date_from, date_to=date_to)
+        total_revenue_combined = sales_stats.get('total_revenue', 0) + shopify_revenue
+        total_customers = len(db.get_top_customers(limit=1000, sort_by='revenue', date_from=date_from, date_to=date_to))
+        if total_customers > 0 and total_revenue_combined > 0:
+            avg_customer_value = total_revenue_combined / total_customers
             st.metric("💎 Durchschnittlicher Kundenwert", f"{avg_customer_value:.2f} EUR")
     
     with tab5:
@@ -1259,7 +1675,7 @@ def show_dashboard():
         
         with col_prod1:
             st.markdown("**Top 10 Platten (nach Anzahl)**")
-            top_sellers_qty = db.get_top_sellers(limit=10, sort_by='quantity')
+            top_sellers_qty = db.get_top_sellers(limit=10, sort_by='quantity', date_from=date_from, date_to=date_to)
             
             if top_sellers_qty:
                 df_sellers = pd.DataFrame(top_sellers_qty)
@@ -1279,7 +1695,7 @@ def show_dashboard():
         
         with col_prod2:
             st.markdown("**Top 10 Platten (nach Umsatz)**")
-            top_sellers_rev = db.get_top_sellers(limit=10, sort_by='revenue')
+            top_sellers_rev = db.get_top_sellers(limit=10, sort_by='revenue', date_from=date_from, date_to=date_to)
             
             if top_sellers_rev:
                 df_sellers = pd.DataFrame(top_sellers_rev)
@@ -1369,9 +1785,82 @@ def show_dashboard():
             st.info("Noch keine Zustands-Daten vorhanden.")
 
 
+def _normalize_cat_no(s: Optional[str]) -> str:
+    """Entfernt Anführungszeichen (am Rand und in der Mitte) und Leerzeichen am Anfang/Ende der Katalognummer (z. B. OCR liefert \"BI 1544 STEREO\")."""
+    if s is None:
+        return ""
+    t = str(s).strip()
+    # Umfassende Menge an Anführungszeichen (ASCII + Unicode), damit keine in der Suche landen
+    quotes = '"\'`"\u201c\u201d\u2018\u2019\u201a\u201b\u201e\u201f\u2039\u203a\uff02\u00ab\u00bb'
+    while t and t[0] in quotes:
+        t = t[1:].strip()
+    while t and t[-1] in quotes:
+        t = t[:-1].strip()
+    t = "".join(c for c in t if c not in quotes)
+    t = t.strip()
+    # KI/OCR liefert oft "none" als Platzhalter – als leer behandeln, damit nicht danach bei Discogs gesucht wird
+    if t.lower() == "none":
+        return ""
+    return t
+
+
+def _normalize_cat_no_for_match(s: Optional[str]) -> str:
+    """Normalisiert Katalognummer für Vergleich: wie _normalize_cat_no, plus Leerzeichen/Bindestriche/Unterstriche/Schrägstriche und Unicode-Varianten zu einem Leerzeichen."""
+    t = _normalize_cat_no(s)
+    if not t:
+        return ""
+    # Auch Unicode Bindestrich (en-dash, em-dash, minus) und Schrägstrich-Varianten
+    t = re.sub(r"[\s\-_/\u2013\u2014\u2212]+", " ", t).strip()
+    return t.upper()
+
+
+def _cat_no_search_variants(cat_no: str) -> List[str]:
+    """
+    Liefert zusätzliche Suchvarianten für die Cat-No, damit die API Treffer liefert (z. B. BI 1544 statt BI 1544 STEREO).
+    Es werden nur bekannte Suffixe am Ende abgetrennt; die Cat-No wird nicht beliebig verkürzt (z. B. 1C 066 14 7197 1 bleibt unverändert).
+    """
+    if not cat_no or not cat_no.strip():
+        return []
+    t = cat_no.strip()
+    # Bekannte Suffixe, die am Ende der Cat-No stehen können (nach Leerzeichen)
+    suffix_words = {"STEREO", "MONO", "LP", "CD", "EP", "12", "7", "10", "MC"}
+    parts = t.upper().split()
+    if len(parts) < 2:
+        return []
+    if parts[-1] in suffix_words:
+        core = " ".join(parts[:-1]).strip()
+        if core and core != t.upper():
+            return [core]
+    return []
+
+
+def _ensure_discogs_client() -> None:
+    """
+    Lädt den Discogs-Client aus der DB nach, falls er in der Session noch None ist.
+    So funktioniert die Katalognummer-Suche auch ohne vorherigen Einstellungen-Test oder Reload.
+    """
+    if st.session_state.get("discogs_client") is not None:
+        return
+    if "db" not in st.session_state:
+        return
+    db = st.session_state.db
+    api_settings = db.get_company_settings() or {}
+    discogs_enabled = api_settings.get("discogs_enabled", 0) == 1
+    discogs_api_key = (api_settings.get("discogs_api_key") or "").strip()
+    if not discogs_api_key:
+        discogs_api_key = (st.session_state.get("settings_discogs_token") or "").strip()
+        discogs_enabled = discogs_enabled or st.session_state.get("settings_discogs_enabled", False)
+    if discogs_enabled and discogs_api_key:
+        try:
+            st.session_state.discogs_client = DiscogsClient(token=discogs_api_key)
+        except Exception:
+            st.session_state.discogs_client = None
+
+
 def _auto_search_discogs(artist: str, title: str, cat_no: str, label: str) -> Optional[Dict[str, Any]]:
     """
     Führt automatisch eine Discogs-Suche nach KI-Analyse durch.
+    Mehrere Suchläufe: Cat-No (+ Label) -> Artist - Title -> nur Artist / nur Title.
     
     Args:
         artist: Erkannte Artist von KI
@@ -1382,45 +1871,484 @@ def _auto_search_discogs(artist: str, title: str, cat_no: str, label: str) -> Op
     Returns:
         Dictionary mit Suchergebnissen oder None
     """
+    _ensure_discogs_client()
     if not st.session_state.discogs_client:
         return None
     
-    # Bevorzuge Suche mit Cat-No für genauere Treffer
-    search_query = None
+    cat_no = _normalize_cat_no(cat_no)
+    label = (label or "").strip()
     
-    if cat_no and cat_no.strip():
-        # Suche primär nach Katalognummer
-        search_query = cat_no.strip()
-        if label:
-            search_query = f"{label} {cat_no}".strip()
-    elif artist or title:
-        # Fallback: Suche nach Artist - Title
-        search_query = f"{artist} - {title}".strip()
-        if search_query.startswith("- "):
-            search_query = search_query[2:]
-        if search_query.endswith(" -"):
-            search_query = search_query[:-2]
-    
-    if not search_query:
+    def do_search(query: str, catno_param: Optional[str] = None, per_page: int = 25):
+        if not query or not query.strip():
+            return None
+        try:
+            res = st.session_state.discogs_client.search(
+                query.strip(),
+                catno=catno_param.strip() if catno_param and catno_param.strip() else None,
+                per_page=per_page
+            )
+            if res and res.get("results"):
+                return res
+        except Exception:
+            pass
         return None
     
-    try:
-        search_results = st.session_state.discogs_client.search(
-            search_query
-        )
-        
-        if search_results and "results" in search_results:
-            results = search_results.get("results", [])
-            if results:
-                return search_results
-    except Exception as e:
-        # print(f"Fehler bei automatischer Discogs-Suche: {e}")  # Deaktiviert wegen Streamlit stdout
-        pass
+    # Lauf 1: zuerst nur Cat-No mit API-Parameter catno (evtl. mit / liefert die API nichts → nochmal ohne /)
+    if cat_no:
+        out = do_search(cat_no, catno_param=cat_no)
+        if out:
+            return out
+        # Kern-Variante (z. B. BI 1544 ohne STEREO) direkt nach erster Suche versuchen
+        for variant in _cat_no_search_variants(cat_no):
+            if variant:
+                out = do_search(variant, catno_param=variant)
+                if out:
+                    return out
+        # Cat-No ohne Schrägstrich versuchen (z. B. "8 45 347 348"), viele APIs indexieren so
+        cat_no_api = re.sub(r"[\s/]+", " ", cat_no).strip()
+        if cat_no_api and cat_no_api != cat_no:
+            out = do_search(cat_no_api, catno_param=cat_no_api)
+            if out:
+                return out
+        if label:
+            q1 = f"{label} {cat_no}".strip()
+            out = do_search(q1, catno_param=cat_no)
+            if out:
+                return out
+        # Gleiche Varianten ohne catno-Parameter (reine Textsuche), falls API mit catno= nichts liefert
+        for variant in _cat_no_search_variants(cat_no):
+            if variant:
+                out = do_search(variant, catno_param=None, per_page=50)
+                if out:
+                    return out
+    
+    # Lauf 2: Artist - Title (mehr Treffer, damit Doppel-LPs etc. dabei sind)
+    if artist or title:
+        q2 = f"{artist or ''} - {title or ''}".strip()
+        if q2.startswith("- "):
+            q2 = q2[2:]
+        if q2.endswith(" -"):
+            q2 = q2[:-2]
+        if q2:
+            out = do_search(q2, per_page=100)
+            if out:
+                return out
+    
+    # Lauf 3: nur Artist oder nur Title
+    if artist and artist.strip():
+        out = do_search(artist.strip(), per_page=100)
+        if out:
+            return out
+    if title and title.strip():
+        out = do_search(title.strip(), per_page=100)
+        if out:
+            return out
     
     return None
 
 
-def update_fields_from_discogs(release_id: int, respect_manual_edits: bool = True) -> tuple:
+def _cat_no_match(scan_cat: str, discogs_cat: str) -> bool:
+    """True wenn Katalognummern übereinstimmen: exakt oder eine ist Präfix der anderen (z. B. BI 1544 vs. BI 1544 STEREO)."""
+    if not scan_cat or not discogs_cat:
+        return not scan_cat and not discogs_cat
+    if scan_cat == discogs_cat:
+        return True
+    # Präfix-Match: Discogs liefert oft kürzere Cat-No (z. B. BI 1544), Scan hat BI 1544 STEREO
+    if len(scan_cat) <= len(discogs_cat):
+        return discogs_cat.startswith(scan_cat)
+    return scan_cat.startswith(discogs_cat)
+
+
+def _get_catno_from_result(r: Dict[str, Any]) -> Optional[str]:
+    """Liest Cat-No aus einem Discogs-Suchergebnis: top-level catno oder labels[0].catno."""
+    c = r.get("catno")
+    if c is not None and str(c).strip():
+        return str(c).strip()
+    labels = r.get("labels") or r.get("label")
+    if labels and len(labels) > 0:
+        first = labels[0]
+        if isinstance(first, dict):
+            c = first.get("catno")
+        else:
+            c = getattr(first, "catno", None)
+        if c is not None and str(c).strip():
+            return str(c).strip()
+    return None
+
+
+def _pick_best_discogs_result(results: List[Dict[str, Any]], cat_no_val: str) -> Optional[Dict[str, Any]]:
+    """Wählt aus Discogs-Suchergebnissen das Release mit passender Katalognummer (lockere Normalisierung + Präfix). Ohne Match wird None zurückgegeben."""
+    if not results:
+        return None
+    cat_no_clean = _normalize_cat_no_for_match(cat_no_val)
+    if cat_no_clean:
+        for r in results:
+            r_catno_raw = _get_catno_from_result(r)
+            r_catno = _normalize_cat_no_for_match(r_catno_raw) if r_catno_raw else ""
+            if r_catno and _cat_no_match(cat_no_clean, r_catno):
+                return r
+    return None
+
+
+def _label_name_from_result(r: Dict[str, Any]) -> str:
+    """Liest den Label-Namen aus einem Discogs-Suchergebnis (label oder labels[0])."""
+    label = r.get("label")
+    if isinstance(label, list) and label:
+        first = label[0]
+        return (first.get("name") if isinstance(first, dict) else str(first)) or ""
+    if isinstance(label, str):
+        return label or ""
+    labels = r.get("labels")
+    if labels and len(labels) > 0:
+        first = labels[0]
+        if isinstance(first, dict):
+            return first.get("name") or ""
+        return str(first)
+    return ""
+
+
+def _sort_results_by_label(results: List[Dict[str, Any]], scan_label: str) -> List[Dict[str, Any]]:
+    """Sortiert Suchergebnisse so, dass Einträge mit passendem Label-Name (scan_label) zuerst kommen."""
+    scan_lower = (scan_label or "").strip().lower()
+    if not scan_lower:
+        return list(results)
+    return sorted(results, key=lambda r: (0 if scan_lower in _label_name_from_result(r).lower() else 1))
+
+
+def _normalize_for_compare(s: Optional[str]) -> str:
+    """Normalisiert String für Artist/Title-Vergleich (lower, strip, Umlaute vereinheitlicht, mehrfache Leerzeichen)."""
+    if s is None:
+        return ""
+    t = str(s).strip().lower()
+    # Umlaute vereinheitlichen, damit OCR „Schone“ mit API „Schöne“ matcht
+    for old, new in [("ä", "ae"), ("ö", "oe"), ("ü", "ue"), ("ß", "ss")]:
+        t = t.replace(old, new)
+    t = " ".join(t.split())
+    return t
+
+
+def _get_label_catno(lbl: Any) -> Optional[str]:
+    """Liest catno aus einem Label-Element (dict oder dict-ähnliches Objekt)."""
+    if lbl is None:
+        return None
+    if isinstance(lbl, dict):
+        return lbl.get("catno")
+    v = getattr(lbl, "catno", None)
+    if v is not None:
+        return v
+    try:
+        return lbl["catno"] if hasattr(lbl, "__getitem__") else None
+    except (KeyError, TypeError):
+        return None
+
+
+def _discogs_release_matches_scan(release_or_result: Dict[str, Any], scan_artist: str, scan_title: str,
+                                  scan_cat_no: str) -> bool:
+    """Prüft, ob Discogs-Release/Suchresultat zu Scan-Daten passt (Katalognummer + Artist/Title)."""
+    scan_cat = _normalize_cat_no_for_match(scan_cat_no)
+    if not scan_cat:
+        return True
+    # Cat-No: alle Labels prüfen (Doppel-LP kann zwei Cat-Nos haben, z. B. 8 45 347 und 8 45 348)
+    discogs_cat = ""
+    for lbl in (release_or_result.get("labels") or []):
+        c = _normalize_cat_no_for_match(_get_label_catno(lbl))
+        if c and _cat_no_match(scan_cat, c):
+            discogs_cat = c
+            break
+    if not discogs_cat and release_or_result.get("labels") and len(release_or_result["labels"]) > 0:
+        discogs_cat = _normalize_cat_no_for_match(_get_label_catno(release_or_result["labels"][0]))
+    if not discogs_cat:
+        discogs_cat = _normalize_cat_no_for_match(release_or_result.get("catno"))
+    if not discogs_cat or not _cat_no_match(scan_cat, discogs_cat):
+        return False
+    # Artist/Title: aus Release artists[0].name + title, oder Suchresultat title "Artist - Title"
+    discogs_artist = ""
+    discogs_title = ""
+    if release_or_result.get("artists") and len(release_or_result["artists"]) > 0:
+        discogs_artist = _normalize_for_compare(release_or_result["artists"][0].get("name"))
+    title_raw = (release_or_result.get("title") or "").strip()
+    # Unicode-Bindstriche (en-dash, em-dash) wie " - " behandeln für einheitliches Splitten
+    title_raw = re.sub(r"[\u2013\u2014\u2212]", " - ", title_raw)
+    if " - " in title_raw:
+        parts = title_raw.split(" - ", 1)
+        if not discogs_artist and len(parts) >= 1:
+            discogs_artist = _normalize_for_compare(parts[0])
+        if len(parts) >= 2:
+            discogs_title = _normalize_for_compare(parts[1])
+        else:
+            discogs_title = _normalize_for_compare(title_raw)
+    else:
+        discogs_title = _normalize_for_compare(title_raw)
+    sa = _normalize_for_compare(scan_artist)
+    st = _normalize_for_compare(scan_title)
+    if not sa and not st:
+        return True
+    artist_ok = (not sa or not discogs_artist or sa in discogs_artist or discogs_artist in sa or sa == discogs_artist)
+    title_ok = (not st or not discogs_title or st in discogs_title or discogs_title in st or st == discogs_title)
+    return bool(artist_ok and title_ok)
+
+
+def _parse_year_from_discogs(value: Any) -> Optional[int]:
+    """Extrahiert ein gültiges Jahr (1900–2100) aus String/Int von Discogs."""
+    if value is None:
+        return None
+    try:
+        s = str(value).strip()
+        if "-" in s:
+            s = s.split("-")[0].strip()
+        if not s or not s.isdigit():
+            return None
+        y = int(s)
+        return y if 1900 <= y <= 2100 else None
+    except (ValueError, TypeError):
+        return None
+
+
+def _extract_year_from_text(text: Any) -> Optional[int]:
+    """Sucht in beliebigem Text nach einer 4-stelligen Jahreszahl (1900–2100). Erster Treffer zählt."""
+    if text is None or not str(text).strip():
+        return None
+    match = re.search(r"\b(19\d{2}|20[0-2]\d)\b", str(text))
+    if match:
+        y = int(match.group(1))
+        return y if 1900 <= y <= 2100 else None
+    return None
+
+
+def _get_year_from_discogs_released_only(release: Dict[str, Any]) -> Optional[int]:
+    """
+    Ermittelt ein gültiges Jahr nur aus dem Discogs-Feld Veröffentlicht (API: year, released, released_formatted).
+    Kein Fallback auf date, notes, title oder Master.
+    """
+    year_int = _parse_year_from_discogs(release.get("year"))
+    if year_int is not None:
+        return year_int
+    year_int = _parse_year_from_discogs(release.get("released"))
+    if year_int is not None:
+        return year_int
+    year_int = _parse_year_from_discogs(release.get("released_formatted"))
+    return year_int
+
+
+def _get_year_from_discogs_release(release: Dict[str, Any], discogs_client: Any) -> Optional[int]:
+    """
+    Ermittelt ein gültiges Jahr aus einem Discogs-Release; wenn das Release keins hat, aus dem Master.
+    Priorität: year, released, released_formatted, date, notes, title, dann Master-Release.year.
+    (Wird z. B. in Einstellungen für Anzeige genutzt; für Übernahme ins Formular siehe _get_year_from_discogs_released_only.)
+    """
+    year_int = _parse_year_from_discogs(release.get("year"))
+    if year_int is not None:
+        return year_int
+    year_int = _parse_year_from_discogs(release.get("released"))
+    if year_int is not None:
+        return year_int
+    year_int = _parse_year_from_discogs(release.get("released_formatted"))
+    if year_int is not None:
+        return year_int
+    year_int = _parse_year_from_discogs(release.get("date"))
+    if year_int is not None:
+        return year_int
+    year_int = _extract_year_from_text(release.get("notes"))
+    if year_int is not None:
+        return year_int
+    year_int = _extract_year_from_text(release.get("title"))
+    if year_int is not None:
+        return year_int
+    master_id = release.get("master_id")
+    if master_id and discogs_client:
+        try:
+            master = discogs_client.get_master(int(master_id))
+            if master:
+                year_int = _parse_year_from_discogs(master.get("year"))
+                if year_int is not None:
+                    return year_int
+        except (TypeError, ValueError):
+            pass
+    return None
+
+
+@st.cache_data(ttl=3600)
+def _cached_discogs_search(_token: str, query: str, per_page: int = 20, catno: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Discogs-Suche gecacht, damit Re-Runs (z. B. nach Fullscreen-Klick) sofort aus dem Cache kommen."""
+    try:
+        client = DiscogsClient(token=_token)
+        return client.search(query, per_page=per_page, catno=catno)
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=3600)
+def _cached_discogs_get_release(_token: str, release_id: int) -> Optional[Dict[str, Any]]:
+    """Discogs get_release gecacht, damit Re-Runs (z. B. nach Fullscreen-Klick) sofort aus dem Cache kommen."""
+    try:
+        client = DiscogsClient(token=_token)
+        return client.get_release(release_id)
+    except Exception:
+        return None
+
+
+_fragment_decorator = getattr(st, "fragment", None)
+if _fragment_decorator is None:
+    def _fragment_decorator(f):
+        return f  # Fallback für Streamlit < 1.33: kein Fragment, voller Rerun bei Bearbeitung
+
+
+@_fragment_decorator
+def _render_delete_vinyl_fragment(item_id: int, item: Dict[str, Any], db: "Database") -> None:
+    """
+    Lösch-Button und Bestätigung als Fragment, damit nur dieser Block rerunt und die Seite nicht nach oben springt.
+    """
+    if st.button("🗑️ Datensatz löschen", type="secondary", use_container_width=True, key=f"delete_vinyl_button_{item_id}"):
+        st.session_state.show_delete_confirm = True
+
+    if st.session_state.get("show_delete_confirm", False):
+        st.warning("⚠️ **Sicherheitsabfrage:** Möchten Sie diese Platte wirklich aus dem Inventar entfernen?")
+        col_confirm, col_cancel_del = st.columns(2)
+
+        with col_confirm:
+            if st.button("✅ Ja, endgültig löschen", type="primary", use_container_width=True, key=f"confirm_delete_{item_id}"):
+                shopify_deleted = False
+                shopify_error = None
+                shopify_product_id = (item.get("shopify_product_id") or "").strip()
+                if shopify_product_id:
+                    shopify_client = st.session_state.get("shopify_client")
+                    if shopify_client:
+                        shopify_deleted, shopify_error = shopify_client.delete_product(shopify_product_id)
+                success = db.delete_record("inventory", item_id)
+                if success:
+                    msg = "✅ Platte erfolgreich gelöscht!"
+                    if shopify_product_id:
+                        if shopify_deleted:
+                            msg += " (auch bei Shopify entfernt.)"
+                        elif shopify_error:
+                            msg += f" Lokal gelöscht; bei Shopify konnte das Produkt nicht gelöscht werden: {shopify_error}"
+                    st.success(msg)
+                    st.session_state.edit_vinyl_data = {}
+                    st.session_state.edit_tracklist_table = {}
+                    st.session_state.selected_vinyl_id = None
+                    st.session_state.show_delete_confirm = False
+                    st.rerun()
+                else:
+                    st.error("❌ Fehler beim Löschen der Platte.")
+
+        with col_cancel_del:
+            if st.button("❌ Abbrechen", use_container_width=True, key=f"cancel_delete_{item_id}"):
+                st.session_state.show_delete_confirm = False
+                st.rerun()
+
+
+def _render_tracklist_expander(form_key_suffix: int):
+    """
+    Trackliste als bearbeitbare Tabellen.
+    (Kein Fragment: st.fragment führte beim ersten Klick auf „In Inventar speichern“
+    zu einem Rerun, der den Klick verlor. Ohne Fragment funktioniert der erste Klick.)
+    """
+    if "scan_tracklist_table" not in st.session_state:
+        st.session_state.scan_tracklist_table = []
+    if "manually_edited_fields" not in st.session_state:
+        st.session_state.manually_edited_fields = {}
+
+    cleaned_tracks = []
+    for track in st.session_state.scan_tracklist_table:
+        title = str(track.get("Titel", "")).strip()
+        length = str(track.get("Länge", "")).strip()
+        if not length and title:
+            time_match = re.search(r'\(?(\d{1,2}(?::|\')\d{2}(?::\d{2})?)[\)"]?', title)
+            if time_match:
+                length = time_match.group(1)
+                length = length.replace("'", ":")
+                title = re.sub(r'\s*\(?\d{1,2}(?::|\')\d{2}(?::\d{2})?[\)"]?\s*', '', title).strip()
+        cleaned_tracks.append({
+            "Seite": track.get("Seite", ""),
+            "Position": track.get("Position", ""),
+            "Titel": title,
+            "Länge": length
+        })
+    if cleaned_tracks != st.session_state.scan_tracklist_table:
+        st.session_state.scan_tracklist_table = cleaned_tracks
+
+    tracks_by_seite = {}
+    for track in st.session_state.scan_tracklist_table:
+        seite = str(track.get("Seite", "")).strip()
+        if not seite:
+            seite = "1"
+        if seite not in tracks_by_seite:
+            tracks_by_seite[seite] = []
+        tracks_by_seite[seite].append(track)
+    sorted_seiten = sorted(tracks_by_seite.keys(), key=lambda x: int(x) if x.isdigit() else 999)
+    updated_tracks = []
+
+    with st.expander("🎵 Trackliste & Details", expanded=True):
+        for seite in sorted_seiten:
+            tracks_for_seite = tracks_by_seite[seite]
+            st.markdown(f"### 💿 Seite {seite}")
+            df_data = []
+            for idx, t in enumerate(tracks_for_seite, start=1):
+                position = str(t.get("Position", "")).strip()
+                if not position:
+                    position = str(idx)
+                df_data.append({
+                    "Position": position,
+                    "Titel": str(t.get("Titel", "")).strip(),
+                    "Länge": str(t.get("Länge", "")).strip()
+                })
+            if df_data:
+                df = pd.DataFrame(df_data)
+            else:
+                df = pd.DataFrame(columns=["Position", "Titel", "Länge"])
+            edited_df = st.data_editor(
+                df,
+                column_config={
+                    "Position": st.column_config.TextColumn("Position", help="Track-Position (leer = auto)", width="small"),
+                    "Titel": st.column_config.TextColumn("Titel", help="Titel des Songs", width="large"),
+                    "Länge": st.column_config.TextColumn("Länge", help="Laufzeit (z.B. '3:45')", width="medium")
+                },
+                num_rows="dynamic",
+                use_container_width=True,
+                key=f"tracklist_seite_{seite}_{form_key_suffix}",
+                hide_index=True
+            )
+            for idx, record in enumerate(edited_df.to_dict("records"), start=1):
+                position = str(record.get("Position", "")).strip() if pd.notna(record.get("Position")) else ""
+                if not position:
+                    position = str(idx)
+                track = {
+                    "Seite": seite,
+                    "Position": position,
+                    "Titel": str(record.get("Titel", "")).strip() if pd.notna(record.get("Titel")) else "",
+                    "Länge": str(record.get("Länge", "")).strip() if pd.notna(record.get("Länge")) else ""
+                }
+                if track["Titel"]:
+                    updated_tracks.append(track)
+            st.markdown("---")
+
+        if st.button("➕ Seite hinzufügen", key=f"add_seite_{form_key_suffix}", use_container_width=False):
+            max_seite = 0
+            for track in st.session_state.scan_tracklist_table:
+                seite_str = str(track.get("Seite", "")).strip()
+                if seite_str.isdigit():
+                    max_seite = max(max_seite, int(seite_str))
+            new_seite = str(max_seite + 1)
+            st.session_state.scan_tracklist_table.append({
+                "Seite": new_seite,
+                "Position": "1",
+                "Titel": "",
+                "Länge": ""
+            })
+            st.session_state.manually_edited_fields["tracklist"] = True
+            st.rerun()
+
+        if not st.session_state.scan_tracklist_table:
+            st.info("💡 Die Trackliste wird automatisch von der KI oder Discogs gefüllt. Sie können auch manuell Zeilen hinzufügen oder bearbeiten.")
+
+    if updated_tracks != st.session_state.scan_tracklist_table:
+        st.session_state.scan_tracklist_table = updated_tracks
+        if updated_tracks:
+            st.session_state.manually_edited_fields["tracklist"] = True
+
+
+def update_fields_from_discogs(release_id: int, respect_manual_edits: bool = True,
+                               fallback_year: Any = None) -> tuple:
     """
     Aktualisiert Felder im Session State mit Daten aus Discogs Release.
     Nur wenn ein Release explizit vom Nutzer ausgewählt wurde.
@@ -1428,6 +2356,7 @@ def update_fields_from_discogs(release_id: int, respect_manual_edits: bool = Tru
     Args:
         release_id: Discogs Release-ID
         respect_manual_edits: Wenn True, überschreibt keine manuell bearbeiteten Felder
+        fallback_year: Optionales Jahr aus Suchresultat (z. B. wenn Release-Details kein Jahr haben)
         
     Returns:
         Tuple (success: bool, error_message: str)
@@ -1495,16 +2424,16 @@ def update_fields_from_discogs(release_id: int, respect_manual_edits: bool = Tru
             # print(f"Warnung beim Extrahieren von Label/Cat-No: {e}")  # Deaktiviert wegen Streamlit stdout
             pass
         
-        # Extrahiere Year (nur wenn nicht manuell bearbeitet)
+        # Extrahiere Year nur aus Veröffentlicht (year, released, released_formatted); sonst Fehlermeldung
         try:
-            release_year = release_details.get("year")
-            if release_year:
-                try:
-                    year_int = int(release_year)
-                    if not respect_manual_edits or not st.session_state.manually_edited_fields.get("year", False):
-                        st.session_state.scan_year = year_int
-                except (ValueError, TypeError):
-                    pass
+            if not respect_manual_edits or not st.session_state.manually_edited_fields.get("year", False):
+                year_int = _get_year_from_discogs_released_only(release_details)
+                if year_int is not None:
+                    st.session_state.scan_year = year_int
+                else:
+                    st.session_state.discogs_year_not_found_message = (
+                        "Bei Discogs wurde kein Veröffentlichungsjahr (Veröffentlicht) gefunden. Bitte Jahr manuell eintragen."
+                    )
         except Exception as e:
             # print(f"Warnung beim Extrahieren des Jahres: {e}")  # Deaktiviert wegen Streamlit stdout
             pass
@@ -1544,6 +2473,18 @@ def update_fields_from_discogs(release_id: int, respect_manual_edits: bool = Tru
                         st.session_state.scan_format = format_name
         except Exception as e:
             # print(f"Warnung beim Extrahieren des Formats: {e}")  # Deaktiviert wegen Streamlit stdout
+            pass
+        
+        # Extrahiere Genre (genres + styles von Discogs)
+        try:
+            if not respect_manual_edits or not st.session_state.manually_edited_fields.get("genre", False):
+                genres = release_details.get("genres", []) or []
+                styles = release_details.get("styles", []) or []
+                parts = [str(g).strip() for g in genres if g] + [str(s).strip() for s in styles if s]
+                genre_string = ", ".join(parts).strip() if parts else ""
+                if genre_string:
+                    st.session_state.scan_genre = genre_string
+        except Exception:
             pass
         
         # Extrahiere Trackliste (nur wenn nicht manuell bearbeitet)
@@ -1599,6 +2540,426 @@ def update_fields_from_discogs(release_id: int, respect_manual_edits: bool = Tru
         return False, error_msg
 
 
+def show_scan_queue():
+    """Scan-Warteschlange: Bilder hochladen oder aus Ordner wählen; Queue-Liste; nacheinander in Scan-Session bearbeiten."""
+    pending_dir = os.path.join(BASE_DIR, PENDING_SCANS_DIR)
+    os.makedirs(pending_dir, exist_ok=True)
+    if "scan_queue" not in st.session_state:
+        st.session_state.scan_queue = []
+    if "queue_upload_key_suffix" not in st.session_state:
+        st.session_state.queue_upload_key_suffix = 0
+    if "queue_cover_mode" not in st.session_state:
+        st.session_state.queue_cover_mode = "Nur 1 Cover"
+
+    st.header("Scan-Warteschlange")
+
+    cover_mode = st.radio(
+        "Art der Platte(n):",
+        ["Nur 1 Cover", "Front + Rückcover (2 Bilder)"],
+        key="queue_cover_mode",
+        horizontal=True,
+        help="Vorauswahl für die Zuordnung: Einzelcover oder Front- und Rückseite pro Platte."
+    )
+    is_single_cover = cover_mode == "Nur 1 Cover"
+
+    source = st.radio(
+        "Wie möchten Sie die Bilder bereitstellen?",
+        ["Bilder hochladen", "Aus Ordner wählen (USB/Cloud)"],
+        key="queue_source",
+        horizontal=True
+    )
+
+    if source == "Bilder hochladen":
+        if is_single_cover:
+            upload_files = st.file_uploader(
+                "Cover-Bilder hochladen (jedes Bild = eine Platte mit einem Cover)",
+                type=["jpg", "jpeg", "png"],
+                accept_multiple_files=True,
+                help="Jedes hochgeladene Bild wird als eine Platte mit einem Cover zugeordnet. Keine KI-Zuordnung nötig.",
+                key=f"queue_upload_batch_{st.session_state.queue_upload_key_suffix}"
+            )
+            num_files = len(upload_files) if upload_files else 0
+            if num_files > 0 and st.button("Einzelcover zur Warteschlange hinzufügen", type="primary", key="queue_batch_singles_btn"):
+                try:
+                    queue_singles = []
+                    for f in upload_files:
+                        queue_singles.append({
+                            "front_bytes": f.getvalue(),
+                            "back_bytes": None,
+                            "front_name": f.name,
+                            "back_name": None,
+                        })
+                    ki_singles_dir = os.path.join(pending_dir, "ki_singles")
+                    os.makedirs(ki_singles_dir, exist_ok=True)
+                    for fname in os.listdir(ki_singles_dir):
+                        try:
+                            os.remove(os.path.join(ki_singles_dir, fname))
+                        except Exception:
+                            pass
+                    for i, item in enumerate(queue_singles):
+                        with open(os.path.join(ki_singles_dir, f"{i + 1}.jpg"), "wb") as out:
+                            out.write(item["front_bytes"])
+                    st.session_state.scan_queue_pairs = []
+                    st.session_state.scan_queue_singles = queue_singles
+                    st.session_state.ki_pairs_dir = os.path.join(pending_dir, "ki_pairs")
+                    st.session_state.ki_singles_dir = ki_singles_dir
+                    st.session_state.batch_result_message = f"{len(queue_singles)} Platte(n) mit 1 Cover zur Warteschlange hinzugefügt."
+                    if "batch_error_message" in st.session_state:
+                        del st.session_state["batch_error_message"]
+                    if "scan_queue_failed" in st.session_state:
+                        del st.session_state["scan_queue_failed"]
+                    st.rerun()
+                except Exception as e:
+                    st.error("Fehler: " + str(e))
+        else:
+            gemini_available = st.session_state.get("vision_ocr") is not None
+            openai_available = st.session_state.get("openai_vision_ocr") is not None
+            if not gemini_available and not openai_available:
+                st.warning("Keine KI-API verfügbar. Bitte in den Einstellungen Gemini oder OpenAI aktivieren.")
+                return
+            upload_files = st.file_uploader(
+                "Cover-Bilder hochladen (2 Bilder pro Platte: zuerst Front-, dann Rückcover)",
+                type=["jpg", "jpeg", "png"],
+                accept_multiple_files=True,
+                help="Laden Sie für jede Platte zuerst das Front-, dann das Rückcover hoch (immer 2 Bilder pro Platte). Die KI ordnet bei Bedarf Front/Rück zu.",
+                key=f"queue_upload_batch_{st.session_state.queue_upload_key_suffix}"
+            )
+            num_files = len(upload_files) if upload_files else 0
+            if num_files > 0 and num_files % 2 != 0:
+                st.warning("Bitte eine gerade Anzahl von Bildern hochladen (2 pro Platte: Front, Rück).")
+            if num_files > 0 and num_files % 2 == 0 and st.button("Paare zur Warteschlange hinzufügen", type="primary", key="queue_batch_assign_btn"):
+                with st.spinner("Front/Rück wird zugeordnet..."):
+                    try:
+                        tmp_paths = []
+                        for f in upload_files:
+                            with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
+                                tmp.write(f.getvalue())
+                                tmp_paths.append(tmp.name)
+                        vision = st.session_state.openai_vision_ocr if openai_available else st.session_state.vision_ocr
+                        queue_pairs = []
+                        for k in range(0, len(tmp_paths), 2):
+                            i, j = k, k + 1
+                            paths_ij = [tmp_paths[i], tmp_paths[j]]
+                            classify = vision.classify_front_back(paths_ij)
+                            fi, bi = classify["front_index"], classify["back_index"]
+                            with open(paths_ij[fi], "rb") as fp:
+                                front_bytes = fp.read()
+                            with open(paths_ij[bi], "rb") as fp:
+                                back_bytes = fp.read()
+                            names_ij = [upload_files[i].name, upload_files[j].name]
+                            queue_pairs.append({
+                                "front_bytes": front_bytes,
+                                "back_bytes": back_bytes,
+                                "front_name": names_ij[fi],
+                                "back_name": names_ij[bi],
+                            })
+                        for p in tmp_paths:
+                            if os.path.exists(p):
+                                try:
+                                    os.remove(p)
+                                except Exception:
+                                    pass
+                        ki_pairs_dir = os.path.join(pending_dir, "ki_pairs")
+                        ki_singles_dir = os.path.join(pending_dir, "ki_singles")
+                        os.makedirs(ki_pairs_dir, exist_ok=True)
+                        os.makedirs(ki_singles_dir, exist_ok=True)
+                        for name in os.listdir(ki_pairs_dir):
+                            path = os.path.join(ki_pairs_dir, name)
+                            try:
+                                if os.path.isdir(path):
+                                    shutil.rmtree(path)
+                                else:
+                                    os.remove(path)
+                            except Exception:
+                                pass
+                        for i, item in enumerate(queue_pairs):
+                            pair_dir = os.path.join(ki_pairs_dir, str(i + 1))
+                            os.makedirs(pair_dir, exist_ok=True)
+                            with open(os.path.join(pair_dir, "front.jpg"), "wb") as f:
+                                f.write(item["front_bytes"])
+                            with open(os.path.join(pair_dir, "back.jpg"), "wb") as f:
+                                f.write(item["back_bytes"])
+                        st.session_state.scan_queue_pairs = queue_pairs
+                        st.session_state.scan_queue_singles = []
+                        st.session_state.ki_pairs_dir = ki_pairs_dir
+                        st.session_state.ki_singles_dir = ki_singles_dir
+                        st.session_state.batch_result_message = f"{len(queue_pairs)} Platte(n) mit 2 Bildern (Front + Rück) zur Warteschlange hinzugefügt."
+                        if "batch_error_message" in st.session_state:
+                            del st.session_state["batch_error_message"]
+                        if "scan_queue_failed" in st.session_state:
+                            del st.session_state["scan_queue_failed"]
+                        st.rerun()
+                    except Exception as e:
+                        st.session_state.batch_error_message = str(e)
+                        if "batch_result_message" in st.session_state:
+                            del st.session_state["batch_result_message"]
+                        st.rerun()
+        # Fehlermeldung + fehlgeschlagene Bilder (Expander)
+        if st.session_state.get("batch_error_message"):
+            st.error("Fehler bei der KI-Zuordnung: " + st.session_state.batch_error_message)
+            q_failed = st.session_state.get("scan_queue_failed") or []
+            if q_failed:
+                with st.expander(f"Bilder ohne Zuordnung ({len(q_failed)})", expanded=True):
+                    st.caption("Diese Bilder konnten nicht zugeordnet werden (z. B. fehlerhaft oder kein erkennbares Cover). Sie können sie erneut hochladen oder entfernen.")
+                    from PIL import Image
+                    import io
+                    failed_per_row = 6
+                    failed_thumb = 75
+                    for row_start in range(0, len(q_failed), failed_per_row):
+                        row_failed = q_failed[row_start : row_start + failed_per_row]
+                        fcols = st.columns(len(row_failed))
+                        for col_idx, (i, item) in enumerate(zip(range(row_start, row_start + len(row_failed)), row_failed)):
+                            with fcols[col_idx]:
+                                st.caption(f"**Bild {i + 1}**")
+                                try:
+                                    img = Image.open(io.BytesIO(item["front_bytes"]))
+                                    img.thumbnail((failed_thumb, failed_thumb))
+                                    st.image(img, width=failed_thumb)
+                                except Exception:
+                                    st.caption("–")
+                                st.caption(item.get("front_name", ""))
+            st.markdown("---")
+        # Meldung nach KI-Zuordnung + Expander-Liste (Paare und Einzelcover untereinander)
+        if st.session_state.get("batch_result_message"):
+            st.success(st.session_state.batch_result_message)
+            q_pairs = st.session_state.get("scan_queue_pairs") or []
+            q_singles = st.session_state.get("scan_queue_singles") or []
+            q_failed_ok = st.session_state.get("scan_queue_failed") or []
+            if q_failed_ok:
+                with st.expander(f"Nicht zugeordnet ({len(q_failed_ok)})", expanded=False):
+                    st.caption("Diese Bilder hat die KI nicht als Cover zugeordnet (z. B. kein Vinyl-Cover oder unsicher).")
+                    from PIL import Image
+                    import io
+                    failed_per_row = 6
+                    failed_thumb = 75
+                    for row_start in range(0, len(q_failed_ok), failed_per_row):
+                        row_failed = q_failed_ok[row_start : row_start + failed_per_row]
+                        fcols = st.columns(len(row_failed))
+                        for col_idx, (i, item) in enumerate(zip(range(row_start, row_start + len(row_failed)), row_failed)):
+                            with fcols[col_idx]:
+                                st.caption(f"**Bild {i + 1}**")
+                                try:
+                                    img = Image.open(io.BytesIO(item["front_bytes"]))
+                                    img.thumbnail((failed_thumb, failed_thumb))
+                                    st.image(img, width=failed_thumb)
+                                except Exception:
+                                    st.caption("–")
+                                st.caption(item.get("front_name", ""))
+            if q_pairs or q_singles:
+                if q_pairs:
+                    with st.expander(f"Gefundene Paare ({len(q_pairs)})", expanded=True):
+                        st.caption("Gespeichert in: " + (st.session_state.get("ki_pairs_dir") or "") + " – Unterordner 1, 2, … mit front.jpg und back.jpg")
+                        from PIL import Image
+                        import io
+                        pairs_per_row = 3
+                        thumb_size = 95
+                        for row_start in range(0, len(q_pairs), pairs_per_row):
+                            row_pairs = q_pairs[row_start : row_start + pairs_per_row]
+                            cols = st.columns(len(row_pairs))
+                            for col_idx, (i, item) in enumerate(zip(range(row_start, row_start + len(row_pairs)), row_pairs)):
+                                with cols[col_idx]:
+                                    st.caption(f"**Paar {i + 1}**")
+                                    try:
+                                        img_f = Image.open(io.BytesIO(item["front_bytes"]))
+                                        img_f.thumbnail((thumb_size, thumb_size))
+                                        st.image(img_f, caption="Front", width=thumb_size)
+                                    except Exception:
+                                        st.caption("Front –")
+                                    try:
+                                        img_b = Image.open(io.BytesIO(item["back_bytes"]))
+                                        img_b.thumbnail((thumb_size, thumb_size))
+                                        st.image(img_b, caption="Rück", width=thumb_size)
+                                    except Exception:
+                                        st.caption("Rück –")
+                if q_singles:
+                    with st.expander(f"Einzelcover ({len(q_singles)})", expanded=not q_pairs):
+                        st.caption("Gespeichert in: " + (st.session_state.get("ki_singles_dir") or ""))
+                        singles_per_row = 6
+                        single_thumb = 75
+                        for row_start in range(0, len(q_singles), singles_per_row):
+                            row_singles = q_singles[row_start : row_start + singles_per_row]
+                            scols = st.columns(len(row_singles))
+                            for col_idx, (i, item) in enumerate(zip(range(row_start, row_start + len(row_singles)), row_singles)):
+                                with scols[col_idx]:
+                                    st.caption(f"**Einzel {i + 1}**")
+                                    try:
+                                        img = Image.open(io.BytesIO(item["front_bytes"]))
+                                        img.thumbnail((single_thumb, single_thumb))
+                                        st.image(img, width=single_thumb)
+                                    except Exception:
+                                        st.caption("–")
+                if st.button("Zur Scan-Session", type="primary", key="queue_go_to_scan_btn"):
+                    if "batch_result_message" in st.session_state:
+                        del st.session_state["batch_result_message"]
+                    # Uploader beim nächsten Besuch der Warteschlange leeren (neuer Key = keine alten Dateien)
+                    st.session_state.queue_upload_key_suffix = st.session_state.get("queue_upload_key_suffix", 0) + 1
+                    st.session_state.navigate_to = "Scan-Session"
+                    st.rerun()
+            st.markdown("---")
+        if num_files > 0:
+            if is_single_cover:
+                st.caption(f"{num_files} Bild(er) ausgewählt. Klicken Sie „Einzelcover zur Warteschlange hinzufügen“.")
+            else:
+                st.caption(f"{num_files} Bild(er) ausgewählt (2 pro Platte). Klicken Sie „Paare zur Warteschlange hinzufügen“.")
+        return
+
+    # --- Aus Ordner wählen ---
+    if is_single_cover:
+        st.markdown("Kopieren Sie Fotos per USB oder Cloud in den Ordner unten. Wählen Sie ein Cover pro Platte.")
+    else:
+        st.markdown("Kopieren Sie Fotos per USB oder Cloud in den Ordner unten. Wählen Sie Front- und Rückcover (beide nötig) pro Platte.")
+    st.code(pending_dir, language=None)
+
+    allowed_suffixes = (".jpg", ".jpeg", ".png")
+    queue_files = []
+    try:
+        for name in os.listdir(pending_dir):
+            p = os.path.join(pending_dir, name)
+            if os.path.isfile(p) and name.lower().endswith(allowed_suffixes):
+                queue_files.append((name, p))
+    except OSError:
+        pass
+    queue_files.sort(key=lambda x: os.path.getmtime(x[1]), reverse=True)
+
+    if not queue_files:
+        st.info("Ordner ist leer. Bitte Fotos per USB oder Cloud hierher kopieren: " + pending_dir)
+        return
+
+    filenames = [x[0] for x in queue_files]
+    paths = [x[1] for x in queue_files]
+
+    st.markdown("**Bilder in der Warteschlange**")
+    cols = st.columns(min(4, len(queue_files)) or 1)
+    for i, (name, p) in enumerate(queue_files):
+        with cols[i % len(cols)]:
+            try:
+                from PIL import Image
+                img = Image.open(p)
+                img.thumbnail((120, 120))
+                st.image(img, caption=name, use_container_width=True)
+            except Exception:
+                st.caption(name)
+    st.markdown("---")
+    if is_single_cover:
+        st.markdown("**Cover wählen**")
+    else:
+        st.markdown("**Front- und Rückcover wählen**")
+
+    opt_placeholder = ["-- Nicht gewählt --"] + filenames
+    front_idx = st.selectbox(
+        "Cover wählen" if is_single_cover else "Frontcover wählen",
+        range(len(opt_placeholder)),
+        format_func=lambda i: opt_placeholder[i],
+        key="queue_front_select"
+    )
+    back_idx = 0
+    if not is_single_cover:
+        back_idx = st.selectbox(
+            "Rückcover wählen",
+            range(len(opt_placeholder)),
+            format_func=lambda i: opt_placeholder[i],
+            key="queue_back_select"
+        )
+
+    if front_idx == 0:
+        st.warning("Bitte wählen Sie ein Cover." if is_single_cover else "Bitte wählen Sie ein Frontcover.")
+        return
+    if not is_single_cover and back_idx == 0:
+        st.warning("Bitte wählen Sie ein Rückcover (bei „Front + Rückcover“ sind beide nötig).")
+        return
+
+    path_front = paths[front_idx - 1]
+    path_back = paths[back_idx - 1] if back_idx > 0 else None
+
+    add_from_folder_btn = st.button("Zur Warteschlange hinzufügen", type="primary", key="queue_add_folder_btn")
+    analyze_folder_btn = st.button("Direkt analysieren", key="queue_analyze_btn")
+    if add_from_folder_btn:
+        try:
+            with open(path_front, "rb") as f:
+                front_bytes = f.read()
+            back_bytes = None
+            if path_back:
+                with open(path_back, "rb") as f:
+                    back_bytes = f.read()
+            item = {
+                "front_bytes": front_bytes,
+                "back_bytes": back_bytes,
+                "front_name": os.path.basename(path_front),
+                "back_name": os.path.basename(path_back) if path_back else None,
+                "paths_to_remove": [path_front] + ([path_back] if path_back else []),
+            }
+            st.session_state.scan_queue.append(item)
+            st.rerun()
+        except Exception as e:
+            st.error("Fehler beim Lesen der Dateien: " + str(e))
+    if analyze_folder_btn:
+        try:
+            with open(path_front, "rb") as f:
+                st.session_state.cover_front_bytes = f.read()
+            st.session_state.cover_front_name = os.path.basename(path_front)
+            if path_back:
+                with open(path_back, "rb") as f:
+                    st.session_state.cover_back_bytes = f.read()
+                st.session_state.cover_back_name = os.path.basename(path_back)
+            else:
+                st.session_state.cover_back_bytes = None
+                st.session_state.cover_back_name = None
+            st.session_state.queue_file_paths_to_remove = [path_front] + ([path_back] if path_back else [])
+            st.session_state.analyze_from_queue = True
+            st.session_state.navigate_to = "Scan-Session"
+            st.rerun()
+        except Exception as e:
+            st.error("Fehler beim Lesen der Dateien: " + str(e))
+
+    st.markdown("---")
+    if len(st.session_state.scan_queue) == 0:
+        st.info("Noch keine Platten in der Warteschlange.")
+    else:
+        st.markdown(f"**{len(st.session_state.scan_queue)} Platten in der Warteschlange**")
+        cols = st.columns(min(4, len(st.session_state.scan_queue)) or 1)
+        for i, item in enumerate(st.session_state.scan_queue):
+            with cols[i % len(cols)]:
+                caption = f"Platte {i+1}"
+                try:
+                    from PIL import Image
+                    import io
+                    if "two_covers_bytes" in item:
+                        preview_bytes = item["two_covers_bytes"][0]
+                        caption = item.get("two_covers_names", [caption])[0] if item.get("two_covers_names") else caption
+                    else:
+                        preview_bytes = item["front_bytes"]
+                        caption = item.get("front_name", caption)
+                    img = Image.open(io.BytesIO(preview_bytes))
+                    img.thumbnail((120, 120))
+                    st.image(img, caption=caption, use_container_width=True)
+                except Exception:
+                    st.caption(caption)
+                if st.button(f"Platte {i+1} bearbeiten", key=f"queue_edit_ordner_{i}"):
+                    if "two_covers_bytes" in item:
+                        tmp_paths = []
+                        for b in item["two_covers_bytes"]:
+                            with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
+                                tmp.write(b)
+                                tmp_paths.append(tmp.name)
+                        st.session_state.pending_two_covers_paths = tmp_paths
+                        st.session_state.pending_two_covers_names = list(item.get("two_covers_names", []))
+                        st.session_state.do_assign_and_analyze_from_queue = True
+                        st.session_state.queue_file_paths_to_remove = list(item.get("paths_to_remove") or [])
+                        st.session_state.queue_current_index = i
+                        st.session_state.navigate_to = "Scan-Session"
+                        st.rerun()
+                    else:
+                        st.session_state.cover_front_bytes = item["front_bytes"]
+                        st.session_state.cover_back_bytes = item.get("back_bytes")
+                        st.session_state.cover_front_name = item.get("front_name", "")
+                        st.session_state.cover_back_name = item.get("back_name") or None
+                        st.session_state.queue_file_paths_to_remove = list(item.get("paths_to_remove") or [])
+                        st.session_state.queue_current_index = i
+                        st.session_state.analyze_from_queue = True
+                        st.session_state.navigate_to = "Scan-Session"
+                        st.rerun()
+
+
 def show_scan_session():
     """Interface für Vinyl-Cover Scan und Inventar-Aufnahme."""
     import time as _time_module  # Lokaler Import, damit "time" in dieser Funktion nicht von Nested-Funktion überschrieben wird
@@ -1631,6 +2992,109 @@ def show_scan_session():
     elif st.session_state.discogs_client is None:
         st.warning("⚠️ Discogs Client nicht verfügbar. Bitte konfigurieren Sie den Discogs Token in den Einstellungen.")
     
+    # Aus Warteschlange: Analyse einmalig auslösen
+    if st.session_state.get("analyze_from_queue"):
+        st.session_state.analyze_from_queue = False
+        st.session_state.run_analysis_from_queue = True
+        st.rerun()
+    
+    # Aus Warteschlange mit 2 unzugeordneten Covern: KI ordnet Front/Rück zu und löst Analyse aus
+    if st.session_state.get("do_assign_and_analyze_from_queue"):
+        pending_paths = st.session_state.get("pending_two_covers_paths") or []
+        if len(pending_paths) == 2 and (gemini_available or openai_available):
+            st.session_state.do_assign_and_analyze_from_queue = False
+            with st.spinner("🔄 KI ordnet Front und Rück zu..."):
+                try:
+                    vision = st.session_state.openai_vision_ocr if openai_available else st.session_state.vision_ocr
+                    result = vision.classify_front_back(pending_paths)
+                    fi, bi = result["front_index"], result["back_index"]
+                    pending_names = st.session_state.get("pending_two_covers_names") or ["", ""]
+                    with open(pending_paths[fi], "rb") as f:
+                        front_bytes = f.read()
+                    with open(pending_paths[bi], "rb") as f:
+                        back_bytes = f.read()
+                    st.session_state.cover_front_bytes = front_bytes
+                    st.session_state.cover_back_bytes = back_bytes
+                    st.session_state.cover_front_name = pending_names[fi] if fi < len(pending_names) else ""
+                    st.session_state.cover_back_name = pending_names[bi] if bi < len(pending_names) else ""
+                    st.session_state.cover_last_front_uploader_name = st.session_state.cover_front_name
+                    st.session_state.cover_last_back_uploader_name = st.session_state.cover_back_name
+                    st.session_state.pending_two_covers_paths = []
+                    st.session_state.pending_two_covers_names = []
+                    st.session_state.both_covers_upload_done = True
+                    st.session_state.do_analyze_after_classify = True
+                    for p in pending_paths:
+                        if os.path.exists(p):
+                            try:
+                                os.remove(p)
+                            except Exception:
+                                pass
+                    reset_metadata()
+                    st.rerun()
+                except Exception as e:
+                    st.session_state.do_assign_and_analyze_from_queue = True
+                    st.error(f"❌ Fehler bei Zuordnung: {e}")
+    
+    # Zwei Listen aus Scan-Warteschlange (Batch-KI): Platten mit 2 Bildern / mit 1 Bild
+    if "scan_queue_pairs" not in st.session_state:
+        st.session_state.scan_queue_pairs = []
+    if "scan_queue_singles" not in st.session_state:
+        st.session_state.scan_queue_singles = []
+    q_pairs = st.session_state.scan_queue_pairs
+    q_singles = st.session_state.scan_queue_singles
+    if q_pairs or q_singles:
+        st.markdown("---")
+        st.subheader("Aus Warteschlange (KI-Gruppierung)")
+        queue_thumb_size = 85
+        if q_pairs:
+            st.markdown(f"**Platten mit 2 Bildern ({len(q_pairs)})**")
+            cols_p = st.columns(min(8, len(q_pairs)) or 1)
+            for i, item in enumerate(q_pairs):
+                with cols_p[i % len(cols_p)]:
+                    try:
+                        from PIL import Image
+                        import io
+                        img = Image.open(io.BytesIO(item["front_bytes"]))
+                        img.thumbnail((queue_thumb_size, queue_thumb_size))
+                        st.image(img, caption=item.get("front_name", f"Paar {i+1}"), width=queue_thumb_size)
+                    except Exception:
+                        st.caption(item.get("front_name", f"Paar {i+1}"))
+                    if st.button(f"Platte {i+1} bearbeiten", key=f"scan_queue_pairs_btn_{i}"):
+                        st.session_state.cover_front_bytes = item["front_bytes"]
+                        st.session_state.cover_back_bytes = item.get("back_bytes")
+                        st.session_state.cover_front_name = item.get("front_name", "")
+                        st.session_state.cover_back_name = item.get("back_name") or None
+                        st.session_state.queue_list_key = "scan_queue_pairs"
+                        st.session_state.queue_current_index = i
+                        st.session_state.queue_file_paths_to_remove = []
+                        st.session_state.run_analysis_from_queue = True
+                        st.rerun()
+            st.markdown("")
+        if q_singles:
+            st.markdown(f"**Platten mit 1 Bild ({len(q_singles)})**")
+            cols_s = st.columns(min(8, len(q_singles)) or 1)
+            for i, item in enumerate(q_singles):
+                with cols_s[i % len(cols_s)]:
+                    try:
+                        from PIL import Image
+                        import io
+                        img = Image.open(io.BytesIO(item["front_bytes"]))
+                        img.thumbnail((queue_thumb_size, queue_thumb_size))
+                        st.image(img, caption=item.get("front_name", f"Einzel {i+1}"), width=queue_thumb_size)
+                    except Exception:
+                        st.caption(item.get("front_name", f"Einzel {i+1}"))
+                    if st.button(f"Platte {i+1} bearbeiten", key=f"scan_queue_singles_btn_{i}"):
+                        st.session_state.cover_front_bytes = item["front_bytes"]
+                        st.session_state.cover_back_bytes = None
+                        st.session_state.cover_front_name = item.get("front_name", "")
+                        st.session_state.cover_back_name = None
+                        st.session_state.queue_list_key = "scan_queue_singles"
+                        st.session_state.queue_current_index = i
+                        st.session_state.queue_file_paths_to_remove = []
+                        st.session_state.analyze_from_queue = True
+                        st.rerun()
+        st.markdown("---")
+    
     # Layout: Links Bild, Rechts Daten
     col1, col2 = st.columns([1, 1])
     
@@ -1638,123 +3102,228 @@ def show_scan_session():
         st.subheader("🖼️ Cover-Bilder")
         st.markdown("Laden Sie Front- und Rückseite hoch für bessere Erkennungsrate.")
         
-        # Zwei separate Upload-Felder für Front und Rückseite
-        # Verwende Counter im Key, um Widgets zu resetten
-        front_img = st.file_uploader(
-            "📸 Cover Frontseite",
+        # Session State für zugeordnete Bilder (links = Front, rechts = Rück)
+        if "cover_front_bytes" not in st.session_state:
+            st.session_state.cover_front_bytes = None
+        if "cover_back_bytes" not in st.session_state:
+            st.session_state.cover_back_bytes = None
+        if "cover_front_name" not in st.session_state:
+            st.session_state.cover_front_name = None
+        if "cover_back_name" not in st.session_state:
+            st.session_state.cover_back_name = None
+        if "cover_last_front_uploader_name" not in st.session_state:
+            st.session_state.cover_last_front_uploader_name = None
+        if "cover_last_back_uploader_name" not in st.session_state:
+            st.session_state.cover_last_back_uploader_name = None
+        if "pending_two_covers_paths" not in st.session_state:
+            st.session_state.pending_two_covers_paths = []
+        if "pending_two_covers_names" not in st.session_state:
+            st.session_state.pending_two_covers_names = []
+        if "do_analyze_after_classify" not in st.session_state:
+            st.session_state.do_analyze_after_classify = False
+        if "both_covers_upload_done" not in st.session_state:
+            st.session_state.both_covers_upload_done = False
+        if "analysis_result_message" not in st.session_state:
+            st.session_state.analysis_result_message = None
+        if "analysis_result_message_type" not in st.session_state:
+            st.session_state.analysis_result_message_type = None
+        if "analysis_result_warning" not in st.session_state:
+            st.session_state.analysis_result_warning = None
+        if "scan_enlarged_cover" not in st.session_state:
+            st.session_state.scan_enlarged_cover = None  # None | "front" | "back" – großes Bild in col1, Metadaten in col2 bearbeitbar
+
+        # Ein-Klick-Upload: Beide Cover auf einmal hochladen (2 Bilder)
+        both_covers_upload = st.file_uploader(
+            "Beide Cover auf einmal hochladen (2 Bilder)",
             type=["jpg", "jpeg", "png"],
-            help="Frontseite des Vinyl-Covers (JPG, JPEG oder PNG)",
-            key=f"upload_front_{st.session_state.upload_reset_counter}"
+            accept_multiple_files=True,
+            help="Wählen Sie genau 2 Bilder (Front- und Rückcover). Die KI ordnet sie automatisch zu.",
+            key=f"upload_both_covers_{st.session_state.upload_reset_counter}"
         )
-        
-        back_img = st.file_uploader(
-            "📄 Cover Rückseite (optional)",
-            type=["jpg", "jpeg", "png"],
-            help="Rückseite des Vinyl-Covers für bessere Erkennung von Label und Cat-No",
-            key=f"upload_back_{st.session_state.upload_reset_counter}"
-        )
-        
-        # Hinweistext für bessere Bildqualität
-        st.info("💡 **Tipp:** Vermeiden Sie Spiegelungen (Blitz) und sorgen Sie für gutes, gleichmäßiges Licht, um die Erkennungsrate zu verbessern.")
-        
-        # Prüfe ob neue Bilder hochgeladen wurden - lösche alte Session State Daten
-        if front_img is not None or back_img is not None:
-            # Neue Bilder hochgeladen - resette erkannte Daten
-            if "last_uploaded_files" not in st.session_state:
-                st.session_state.last_uploaded_files = (None, None)
-            
-            current_files = (front_img.name if front_img else None, back_img.name if back_img else None)
-            if current_files != st.session_state.last_uploaded_files:
-                # Neue Dateien - resette alle Metadaten
+        if both_covers_upload is not None and len(both_covers_upload) == 2 and not st.session_state.both_covers_upload_done:
+            # Genau 2 Dateien: Temp-Dateien anlegen und als „pending“ speichern (Zuordnung erst per KI)
+            tmp_paths = []
+            tmp_names = []
+            for f in both_covers_upload:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
+                    tmp.write(f.getvalue())
+                    tmp_paths.append(tmp.name)
+                    tmp_names.append(f.name)
+            st.session_state.pending_two_covers_paths = tmp_paths
+            st.session_state.pending_two_covers_names = tmp_names
+        elif both_covers_upload is not None and len(both_covers_upload) == 1:
+            # Eine Datei: nur bei neuem Upload zuordnen und zurücksetzen (nicht bei Rerun nach Analyse)
+            if both_covers_upload[0].name != st.session_state.cover_last_front_uploader_name:
+                st.session_state.cover_front_bytes = both_covers_upload[0].getvalue()
+                st.session_state.cover_front_name = both_covers_upload[0].name
+                st.session_state.cover_last_front_uploader_name = both_covers_upload[0].name
                 reset_metadata()
-                st.session_state.last_uploaded_files = current_files
-                # Lösche temporäre Dateien wenn vorhanden
-                if "temp_image_paths" in st.session_state:
-                    for tmp_path in st.session_state.temp_image_paths:
-                        if os.path.exists(tmp_path):
-                            try:
-                                os.unlink(tmp_path)
-                            except:
-                                pass
-                    del st.session_state.temp_image_paths
-        
-        # Zeige Bilder nebeneinander an
-        if front_img is not None or back_img is not None:
-            img_col1, img_col2 = st.columns(2)
-            
-            with img_col1:
-                if front_img is not None:
-                    st.image(front_img, caption="Frontseite", use_container_width=True)
+                st.session_state.pending_two_covers_paths = []
+                st.session_state.pending_two_covers_names = []
+
+        # Vergrößerter Modus: ein Cover groß in col1, Metadaten in col2 weiter bearbeitbar
+        enlarged = st.session_state.scan_enlarged_cover
+        if enlarged in ("front", "back"):
+            cover_bytes = st.session_state.cover_front_bytes if enlarged == "front" else st.session_state.cover_back_bytes
+            caption = "Frontcover" if enlarged == "front" else "Rückcover"
+            if cover_bytes:
+                st.markdown(f"**📸 {caption} (Vergrößert)**")
+                st.image(cover_bytes, caption=caption, use_container_width=True)
+            if st.button("← Zurück zur Übersicht", key="enlarged_back_btn", use_container_width=True, help="Zur normalen Cover-Ansicht wechseln"):
+                st.session_state.scan_enlarged_cover = None
+                st.rerun()
+        else:
+            # Normale Ansicht: Drei Spalten [ Frontcover ] [ Pfeile ] [ Rückcover ]
+            area_front, area_arrows, area_back = st.columns([2, 1, 2])
+            cover_display_width = 200
+
+            with area_front:
+                st.markdown("**📸 Frontcover**")
+                if st.session_state.cover_front_bytes:
+                    st.image(st.session_state.cover_front_bytes, caption="Frontcover", width=cover_display_width)
+                    if st.button("Zum Prüfen vergrößern", key="open_large_front", help="Bild groß anzeigen – Metadaten rechts weiter bearbeitbar"):
+                        st.session_state.scan_enlarged_cover = "front"
+                        st.rerun()
                 else:
-                    st.info("Frontseite fehlt")
-            
-            with img_col2:
-                if back_img is not None:
-                    st.image(back_img, caption="Rückseite", use_container_width=True)
+                    st.info("Frontcover (oben hochladen)")
+
+            with area_arrows:
+                st.markdown(" ")
+                swap_btn = False
+                if st.session_state.cover_front_bytes and st.session_state.cover_back_bytes:
+                    swap_btn = st.button("↔ **Tauschen**", key="cover_swap_btn", use_container_width=True, help="Front- und Rückcover vertauschen")
                 else:
-                    st.info("Rückseite optional")
-            
-            # Buttons für Analyse und Löschen
+                    st.caption("2 Bilder oben hochladen, dann können Sie sie hier tauschen.")
+
+            with area_back:
+                st.markdown("**📄 Rückcover**")
+                if st.session_state.cover_back_bytes:
+                    st.image(st.session_state.cover_back_bytes, caption="Rückcover", width=cover_display_width)
+                    if st.button("Zum Prüfen vergrößern", key="open_large_back", help="Bild groß anzeigen – Metadaten rechts weiter bearbeitbar"):
+                        st.session_state.scan_enlarged_cover = "back"
+                        st.rerun()
+                else:
+                    st.info("Rückcover (oben hochladen)")
+
+            if swap_btn:
+                a, b = st.session_state.cover_front_bytes, st.session_state.cover_back_bytes
+                na, nb = st.session_state.cover_front_name, st.session_state.cover_back_name
+                st.session_state.cover_front_bytes = b
+                st.session_state.cover_back_bytes = a
+                st.session_state.cover_front_name = nb
+                st.session_state.cover_back_name = na
+                st.rerun()
+
+        st.info("💡 **Tipp:** Vermeiden Sie Spiegelungen (Blitz) und sorgen Sie für gutes, gleichmäßiges Licht.")
+
+        # Button „Zuordnen und Analysieren“ nur wenn genau 2 Bilder pending
+        pending_paths = st.session_state.get("pending_two_covers_paths") or []
+        pending_names = st.session_state.get("pending_two_covers_names") or []
+        assign_and_analyze_btn = False
+        if len(pending_paths) == 2 and (gemini_available or openai_available):
+            assign_and_analyze_btn = st.button("✨ Zuordnen und Analysieren", type="primary", use_container_width=True, help="KI ordnet Front/Rück zu und startet die Metadaten-Analyse")
+        if assign_and_analyze_btn:
+            with st.spinner("🔄 KI ordnet Front und Rück zu..."):
+                try:
+                    vision = st.session_state.openai_vision_ocr if openai_available else st.session_state.vision_ocr
+                    result = vision.classify_front_back(pending_paths)
+                    fi, bi = result["front_index"], result["back_index"]
+                    with open(pending_paths[fi], "rb") as f:
+                        front_bytes = f.read()
+                    with open(pending_paths[bi], "rb") as f:
+                        back_bytes = f.read()
+                    st.session_state.cover_front_bytes = front_bytes
+                    st.session_state.cover_back_bytes = back_bytes
+                    st.session_state.cover_front_name = pending_names[fi]
+                    st.session_state.cover_back_name = pending_names[bi]
+                    st.session_state.cover_last_front_uploader_name = pending_names[fi]
+                    st.session_state.cover_last_back_uploader_name = pending_names[bi]
+                    st.session_state.pending_two_covers_paths = []
+                    st.session_state.pending_two_covers_names = []
+                    st.session_state.both_covers_upload_done = True
+                    st.session_state.do_analyze_after_classify = True
+                    reset_metadata()
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"❌ Fehler bei Zuordnung: {e}")
+
+        has_any_cover = st.session_state.cover_front_bytes is not None or st.session_state.cover_back_bytes is not None
+        if has_any_cover:
             btn_col1, btn_col2 = st.columns(2)
-            
             with btn_col1:
                 analyze_btn = st.button("🔍 Cover analysieren", type="primary", use_container_width=True)
-            
             with btn_col2:
                 clear_btn = st.button("🗑️ Bilder löschen", use_container_width=True)
+            # Nach „Zuordnen und Analysieren“ automatisch Analyse auslösen
+            if st.session_state.get("do_analyze_after_classify"):
+                analyze_btn = True
+                st.session_state.do_analyze_after_classify = False
+            # Aus Scan-Warteschlange: Analyse einmalig auslösen
+            if st.session_state.get("run_analysis_from_queue"):
+                analyze_btn = True
+                st.session_state.run_analysis_from_queue = False
             
-            # Button zum Löschen der Bilder
             if clear_btn:
-                # Lösche temporäre Dateien falls vorhanden
+                queue_paths = set(st.session_state.get("queue_file_paths_to_remove") or [])
                 if "scan_image_path" in st.session_state and st.session_state.scan_image_path:
                     if isinstance(st.session_state.scan_image_path, str):
-                        if os.path.exists(st.session_state.scan_image_path):
+                        if os.path.exists(st.session_state.scan_image_path) and st.session_state.scan_image_path not in queue_paths:
                             try:
                                 os.unlink(st.session_state.scan_image_path)
-                            except:
+                            except Exception:
                                 pass
                     elif isinstance(st.session_state.scan_image_path, list):
                         for path in st.session_state.scan_image_path:
-                            if os.path.exists(path):
+                            if os.path.exists(path) and path not in queue_paths:
                                 try:
                                     os.unlink(path)
-                                except:
+                                except Exception:
                                     pass
-                
-                # Nutze zentrale Reset-Funktion
+                for path in st.session_state.get("pending_two_covers_paths") or []:
+                    if os.path.exists(path):
+                        try:
+                            os.unlink(path)
+                        except Exception:
+                            pass
+                st.session_state.pending_two_covers_paths = []
+                st.session_state.pending_two_covers_names = []
+                st.session_state.both_covers_upload_done = False
                 reset_metadata()
                 st.session_state.last_uploaded_files = (None, None)
                 st.session_state.scan_image_path = None
-                
-                # Erhöhe Counter um Upload-Widgets zu resetten
+                st.session_state.cover_front_bytes = None
+                st.session_state.cover_back_bytes = None
+                st.session_state.cover_front_name = None
+                st.session_state.cover_back_name = None
+                st.session_state.cover_last_front_uploader_name = None
+                st.session_state.cover_last_back_uploader_name = None
                 st.session_state.upload_reset_counter += 1
-                
+                st.session_state.scan_enlarged_cover = None
+                if "queue_file_paths_to_remove" in st.session_state:
+                    del st.session_state["queue_file_paths_to_remove"]
                 st.success("✅ Bilder und Daten wurden gelöscht!")
                 st.rerun()
             
-            # Button für Bildanalyse
             if analyze_btn:
-                if front_img is None:
-                    st.error("❌ Bitte laden Sie mindestens die Frontseite hoch!")
+                if not st.session_state.cover_front_bytes:
+                    st.error("❌ Bitte laden Sie mindestens das Frontcover hoch!")
                 else:
-                    # KRITISCH: Reset alle Metadaten BEVOR neue Analyse startet
                     reset_metadata()
-                    
                     with st.spinner("🔄 KI analysiert..."):
                         try:
-                            # Speichere Bilder temporär
-                            temp_paths = []
-                            
-                            # Frontseite
-                            with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp_front:
-                                tmp_front.write(front_img.getvalue())
-                                temp_paths.append(tmp_front.name)
-                            
-                            # Rückseite (falls vorhanden)
-                            if back_img is not None:
-                                with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp_back:
-                                    tmp_back.write(back_img.getvalue())
-                                    temp_paths.append(tmp_back.name)
+                            queue_paths = st.session_state.get("queue_file_paths_to_remove") or []
+                            if queue_paths:
+                                temp_paths = list(queue_paths)
+                            else:
+                                temp_paths = []
+                                if st.session_state.cover_front_bytes:
+                                    with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp_front:
+                                        tmp_front.write(st.session_state.cover_front_bytes)
+                                        temp_paths.append(tmp_front.name)
+                                if st.session_state.cover_back_bytes:
+                                    with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp_back:
+                                        tmp_back.write(st.session_state.cover_back_bytes)
+                                        temp_paths.append(tmp_back.name)
                             
                             # Speichere temporäre Pfade für Deep Analysis (falls nötig)
                             st.session_state.temp_image_paths = temp_paths
@@ -1781,6 +3350,11 @@ def show_scan_session():
                                 except: pass
                                 # #endregion
                             
+                            # log_path und Log-Imports immer setzen (auch wenn nur Gemini genutzt wird)
+                            import json as json_log
+                            import os as os_log
+                            log_path = os.path.join(BASE_DIR, ".cursor", "debug.log")
+                            
                             # Analysiere Bilder mit verfügbarer API (OpenAI zuerst, dann Gemini als Fallback)
                             recognized_data = None
                             error_messages = []
@@ -1789,9 +3363,6 @@ def show_scan_session():
                             if openai_available:
                                 try:
                                     # #region agent log
-                                    import json as json_log
-                                    import os as os_log
-                                    log_path = os.path.join(BASE_DIR, ".cursor", "debug.log")
                                     try:
                                         with open(log_path, "a", encoding="utf-8") as f_log:
                                             f_log.write(json_log.dumps({"sessionId":"debug-session","runId":"pre-fix","hypothesisId":"A","location":"app.py:1477","message":"Before OpenAI analysis","data":{"openai_available":openai_available},"timestamp":int(os_log.path.getmtime(log_path) if os_log.path.exists(log_path) else 0)}) + "\n")
@@ -1857,10 +3428,11 @@ def show_scan_session():
                                         "tracklist": ""
                                     }
                             
-                            # Prüfe ob Ergebnis ein Dictionary oder eine Liste ist
+                            # Rückgabe-Normalisierung: Liste (z. B. bei einem Bild) in ein Dict überführen
                             if isinstance(recognized_data, list):
-                                # Falls Liste: nimm erstes Element (sollte bei Front+Back nicht passieren)
-                                if len(recognized_data) > 0:
+                                if len(recognized_data) == 1:
+                                    recognized_data = recognized_data[0]
+                                elif len(recognized_data) > 1:
                                     recognized_data = recognized_data[0]
                                 else:
                                     st.error("❌ Keine Daten von der Analyse erhalten.")
@@ -1876,20 +3448,24 @@ def show_scan_session():
                                     artist_val = str(recognized_data.get("artist", "") or "").strip()
                                     title_val = str(recognized_data.get("title", "") or "").strip()
                                     label_val = str(recognized_data.get("label", "") or "").strip()
-                                    cat_no_val = str(recognized_data.get("cat_no", "") or "").strip()
+                                    cat_no_val = _normalize_cat_no(recognized_data.get("cat_no", "") or "")
                                     
-                                    # Debug: Zeige erkannte Werte in der Konsole und als Info-Box
-                                    # print(f"KI hat erkannt: Artist='{artist_val}', Title='{title_val}', Label='{label_val}', Cat-No='{cat_no_val}'")  # Deaktiviert wegen Streamlit stdout
-                                    
+                                    # Sammle Meldungen für Anzeige in col2 nach st.rerun()
+                                    analysis_warnings = []
                                     if not artist_val or not title_val:
-                                        st.warning(f"⚠️ **Wichtig**: KI hat unvollständige Daten erkannt. Artist: '{artist_val}', Title: '{title_val}'. Bitte prüfen Sie die Felder manuell.")
-                                    else:
-                                        st.info(f"✅ KI hat erkannt: **{artist_val}** - **{title_val}**")
+                                        analysis_warnings.append(f"⚠️ **Wichtig**: KI hat unvollständige Daten erkannt. Artist: '{artist_val}', Title: '{title_val}'. Bitte prüfen Sie die Felder manuell.")
                                     
+                                    # Bei neuer Analyse: manuell bearbeitet zurücksetzen, damit Discogs/MusicBrainz Jahr etc. wieder setzen dürfen
+                                    st.session_state.manually_edited_fields = {
+                                        "artist": False, "title": False, "label": False,
+                                        "cat_no": False, "year": False, "tracklist": False, "genre": False,
+                                    }
                                     st.session_state.scan_artist = artist_val
                                     st.session_state.scan_title = title_val
                                     st.session_state.scan_label = label_val
                                     st.session_state.scan_cat_no = cat_no_val
+                                    if "year_late_fallback_done" in st.session_state:
+                                        del st.session_state["year_late_fallback_done"]
                                     
                                     # Jahr sicher parsen
                                     year_value = recognized_data.get("year")
@@ -1913,11 +3489,8 @@ def show_scan_session():
                                     tracklist_table = parse_tracklist_to_table(tracklist_text)
                                     st.session_state.scan_tracklist_table = tracklist_table
                                     
-                                    # Debug: Zeige Trackliste-Status
                                     if not tracklist_table:
-                                        st.warning("⚠️ Keine Trackliste erkannt. Versuchen Sie es mit der MusicBrainz/Discogs-Suche oder geben Sie sie manuell ein.")
-                                    else:
-                                        st.info(f"✅ Trackliste erkannt ({len(tracklist_table)} Tracks)")
+                                        analysis_warnings.append("⚠️ Keine Trackliste erkannt. Versuchen Sie es mit der MusicBrainz/Discogs-Suche oder geben Sie sie manuell ein.")
                                     
                                     # API-Reihenfolge: ZUERST MusicBrainz (mit Tracklisten), DANN Discogs
                                     # Beide APIs werden immer aufgerufen (wenn aktiviert)
@@ -1992,8 +3565,9 @@ def show_scan_session():
                                     # Discogs wird IMMER aufgerufen (auch wenn MusicBrainz Daten lieferte)
                                     # Discogs ergänzt MusicBrainz-Daten (z.B. Marktpreise) und überschreibt nur bei expliziter Nutzerauswahl
                                     discogs_enabled = st.session_state.get("settings_discogs_enabled", False)
+                                    _ensure_discogs_client()
                                     if not st.session_state.auto_search_performed and discogs_enabled and st.session_state.discogs_client:
-                                        if artist_val and title_val:
+                                        if (artist_val and title_val) or cat_no_val:
                                             st.session_state.auto_search_performed = True
                                             with st.spinner("🔍 Automatische Discogs-Suche..."):
                                                 try:
@@ -2008,10 +3582,74 @@ def show_scan_session():
                                                     if auto_search_results:
                                                         results = auto_search_results.get("results", [])
                                                         if results:
-                                                            st.session_state.scan_discogs_results = results
-                                                            st.session_state.deep_analysis_used = False  # Discogs gefunden
-                                                            # Info wird nach st.rerun() angezeigt
-                                                            # Hinweis: Discogs-Daten überschreiben MusicBrainz-Daten nur bei expliziter Nutzerauswahl
+                                                            st.session_state.deep_analysis_used = False
+                                                            best = _pick_best_discogs_result(results, cat_no_val)
+                                                            # Fallback: Wenn kein Treffer per Cat-No im Suchresultat (z. B. catno in API oft anders), Release laden und per Vollabgleich matchen
+                                                            if best is None and cat_no_val and st.session_state.discogs_client:
+                                                                for r in _sort_results_by_label(results, label_val)[:DISCOGS_FALLBACK_MAX_RELEASES]:
+                                                                    rid = r.get("id")
+                                                                    if not rid:
+                                                                        continue
+                                                                    try:
+                                                                        full_release = st.session_state.discogs_client.get_release(int(rid))
+                                                                        if full_release and _discogs_release_matches_scan(
+                                                                                full_release, artist_val, title_val, cat_no_val):
+                                                                            best = r
+                                                                            break
+                                                                    except Exception:
+                                                                        continue
+                                                            if best is None:
+                                                                st.session_state.scan_discogs_results = results
+                                                                st.session_state.discogs_no_catno_match_message = "Kein Treffer mit passender Katalognummer – bitte bei Bedarf manuell auswählen."
+                                                            else:
+                                                                release_id = best.get("id")
+                                                                if release_id and st.session_state.discogs_client:
+                                                                    try:
+                                                                        release_check = st.session_state.discogs_client.get_release(release_id)
+                                                                        if release_check and not _discogs_release_matches_scan(
+                                                                                release_check, artist_val, title_val, cat_no_val):
+                                                                            st.session_state.scan_discogs_results = results
+                                                                            st.session_state.discogs_no_catno_match_message = "Treffer stimmt nicht mit Katalognummer/Name überein – bitte manuell prüfen."
+                                                                            release_id = None
+                                                                    except Exception:
+                                                                        pass
+                                                                if release_id:
+                                                                    fallback_year = best.get("year") if best else None
+                                                                    if fallback_year is None and best and best.get("title"):
+                                                                        fallback_year = _extract_year_from_text(best.get("title"))
+                                                                    success, err_msg = update_fields_from_discogs(
+                                                                        release_id, respect_manual_edits=True,
+                                                                        fallback_year=fallback_year
+                                                                    )
+                                                                    if success:
+                                                                        st.session_state.scan_discogs_results = None
+                                                                        st.session_state.selected_discogs_release_id = release_id
+                                                                        # Absicherung: Jahr nur aus Veröffentlicht (year/released/released_formatted); sonst Fehlermeldung
+                                                                        if not st.session_state.scan_year and st.session_state.discogs_client:
+                                                                            try:
+                                                                                release = st.session_state.discogs_client.get_release(release_id)
+                                                                                if release:
+                                                                                    year_int = _get_year_from_discogs_released_only(release)
+                                                                                    if year_int is not None:
+                                                                                        st.session_state.scan_year = year_int
+                                                                                    else:
+                                                                                        st.session_state.discogs_year_not_found_message = (
+                                                                                            "Bei Discogs wurde kein Veröffentlichungsjahr (Veröffentlicht) gefunden. Bitte Jahr manuell eintragen."
+                                                                                        )
+                                                                            except Exception:
+                                                                                pass
+                                                                        year_info = f" (Jahr: {st.session_state.scan_year})" if st.session_state.scan_year else ""
+                                                                        st.session_state.discogs_auto_corrected_message = (
+                                                                            f"1 Discogs-Treffer – Daten abgeglichen und berichtigt. Informationen von Discogs wurden übernommen.{year_info}"
+                                                                            if len(results) == 1
+                                                                            else f"Discogs-Abgleich: Daten mit Release berichtigt ({len(results)} Treffer, bestes gewählt). Informationen von Discogs wurden übernommen.{year_info}"
+                                                                        )
+                                                                        # Form-Counter erhöhen, damit Jahr (und andere Felder) im UI sofort aktualisiert werden
+                                                                        st.session_state.form_reset_counter += 1
+                                                                    else:
+                                                                        st.session_state.scan_discogs_results = results
+                                                                else:
+                                                                    st.session_state.scan_discogs_results = results
                                                         else:
                                                             # Keine Ergebnisse gefunden - starte Deep Analysis
                                                             st.session_state.scan_discogs_results = None
@@ -2126,31 +3764,35 @@ def show_scan_session():
                                     # Erhöhe Form-Counter um Widgets zu aktualisieren
                                     st.session_state.form_reset_counter += 1
                                     
-                                    # Zeige Erfolgsmeldung und API-Status
+                                    # Meldungen für Anzeige in col2 nach st.rerun() speichern
                                     api_status_parts = []
                                     if musicbrainz_enabled:
                                         api_status_parts.append("MusicBrainz")
                                     if discogs_enabled and st.session_state.discogs_client:
                                         api_status_parts.append("Discogs")
-                                    
                                     if api_status_parts:
-                                        st.success(f"✅ Cover erfolgreich analysiert! APIs verwendet: {', '.join(api_status_parts)}")
+                                        st.session_state.analysis_result_message = f"✅ Cover erfolgreich analysiert! APIs verwendet: {', '.join(api_status_parts)}"
                                     else:
-                                        st.success("✅ Cover erfolgreich analysiert! Die Daten wurden in die Felder übernommen.")
-                                    
-                                    # Zeige Discogs-Status nach automatischer Suche (wenn durchgeführt)
-                                    if st.session_state.auto_search_performed:
-                                        if st.session_state.scan_discogs_results:
-                                            results = st.session_state.scan_discogs_results
-                                            st.info(f"✅ {len(results)} Discogs-Treffer automatisch gefunden!")
+                                        st.session_state.analysis_result_message = "✅ Cover erfolgreich analysiert! Die Daten wurden in die Felder übernommen."
+                                    st.session_state.analysis_result_message_type = "success"
+                                    st.session_state.analysis_result_warning = analysis_warnings if analysis_warnings else None
+                                    if st.session_state.auto_search_performed and st.session_state.scan_discogs_results:
+                                        results = st.session_state.scan_discogs_results
+                                        st.session_state.analysis_result_message = (st.session_state.analysis_result_message or "") + f" {len(results)} Discogs-Treffer gefunden."
+                                    if st.session_state.get("discogs_auto_corrected_message"):
+                                        st.session_state.analysis_result_message = (st.session_state.analysis_result_message or "") + " " + st.session_state.discogs_auto_corrected_message
+                                        del st.session_state["discogs_auto_corrected_message"]
                                     
                                     st.rerun()
                                 else:
                                     st.error(f"❌ Fehler bei Analyse: {recognized_data.get('error', 'Unbekannter Fehler')}")
+                                    st.rerun()
                             else:
                                 st.error(f"❌ Ungültiges Datenformat von der Analyse: {type(recognized_data)}")
+                                st.rerun()
                         except Exception as e:
                             st.error(f"❌ Fehler bei Bildanalyse: {e}")
+                            st.rerun()
                         # WICHTIG: Lösche temporäre Dateien NICHT hier, da sie für das Speichern benötigt werden
                         # Die Dateien werden erst nach erfolgreichem Speichern gelöscht (siehe reset_metadata)
         else:
@@ -2158,6 +3800,116 @@ def show_scan_session():
     
     with col2:
         st.subheader("📋 Metadaten")
+        
+        # Jahr aus Titel übernehmen wenn noch nicht gesetzt (z. B. "DIE TANZPLATTE 1987" -> 1987), vor allen Widgets
+        if not st.session_state.scan_year and st.session_state.get("scan_title"):
+            title_year = _extract_year_from_text(st.session_state.scan_title)
+            if title_year is not None:
+                st.session_state.scan_year = title_year
+        
+        # Später Fallback: Jahr per Katalognummer von Discogs holen, wenn nach Scan noch keins gesetzt ist (gecacht, damit Re-Runs schnell sind)
+        if (not st.session_state.scan_year
+                and not st.session_state.get("year_late_fallback_done")
+                and st.session_state.get("scan_cat_no")
+                and st.session_state.get("discogs_client")
+                and (st.session_state.get("scan_artist") or st.session_state.get("scan_title"))):
+            try:
+                _token = getattr(st.session_state.discogs_client, "token", None)
+                if not _token:
+                    st.session_state.year_late_fallback_done = True
+                else:
+                    cat_no = _normalize_cat_no(st.session_state.scan_cat_no)
+                    if cat_no:
+                        res = _cached_discogs_search(_token, cat_no, 20, cat_no)
+                        if not res or not res.get("results"):
+                            for variant in _cat_no_search_variants(cat_no):
+                                if variant:
+                                    res = _cached_discogs_search(_token, variant, 20, variant)
+                                    if res and res.get("results"):
+                                        break
+                        if not res or not res.get("results"):
+                            cat_no_alt = re.sub(r"[\s/]+", " ", cat_no).strip()
+                            if cat_no_alt:
+                                res = _cached_discogs_search(_token, cat_no_alt, 20, cat_no_alt)
+                        if not res or not res.get("results"):
+                            for variant in _cat_no_search_variants(cat_no):
+                                if variant:
+                                    res = _cached_discogs_search(_token, variant, 20, None)
+                                    if res and res.get("results"):
+                                        break
+                        if not res or not res.get("results"):
+                            artist = (st.session_state.get("scan_artist") or "").strip()
+                            title = (st.session_state.get("scan_title") or "").strip()
+                            if artist or title:
+                                q = f"{artist} - {title}".strip()
+                                if q.startswith("- "):
+                                    q = q[2:]
+                                if q.endswith(" -"):
+                                    q = q[:-2]
+                                if q:
+                                    res = _cached_discogs_search(_token, q, 20, None)
+                        if res and res.get("results"):
+                            best = _pick_best_discogs_result(res["results"], st.session_state.scan_cat_no)
+                            if best is None:
+                                for r in _sort_results_by_label(res["results"], st.session_state.get("scan_label") or "")[:DISCOGS_FALLBACK_MAX_RELEASES]:
+                                    rid = r.get("id")
+                                    if not rid:
+                                        continue
+                                    try:
+                                        release = _cached_discogs_get_release(_token, int(rid))
+                                        if release and _discogs_release_matches_scan(
+                                                release,
+                                                st.session_state.get("scan_artist", ""),
+                                                st.session_state.get("scan_title", ""),
+                                                st.session_state.get("scan_cat_no", "")):
+                                            best = r
+                                            break
+                                    except Exception:
+                                        continue
+                            if best:
+                                rid = best.get("id")
+                                if rid:
+                                    release = _cached_discogs_get_release(_token, int(rid))
+                                    if release:
+                                        y = _get_year_from_discogs_released_only(release)
+                                        success, err_msg = update_fields_from_discogs(
+                                            int(rid), respect_manual_edits=True, fallback_year=y
+                                        )
+                                        if success:
+                                            st.session_state.form_reset_counter = st.session_state.get("form_reset_counter", 0) + 1
+                                        else:
+                                            # Fallback: nur Jahr setzen, wenn update_fields_from_discogs fehlschlägt
+                                            if y is not None:
+                                                st.session_state.scan_year = y
+                                                st.session_state.form_reset_counter = st.session_state.get("form_reset_counter", 0) + 1
+                                            else:
+                                                st.session_state.discogs_year_not_found_message = (
+                                                    "Bei Discogs wurde kein Veröffentlichungsjahr (Veröffentlicht) gefunden. Bitte Jahr manuell eintragen."
+                                                )
+                                                st.session_state.form_reset_counter = st.session_state.get("form_reset_counter", 0) + 1
+                                        st.session_state.year_late_fallback_done = True
+            except Exception:
+                st.session_state.year_late_fallback_done = True
+        
+        # Analyse-Ergebnis-Meldung (nach st.rerun() sichtbar anzeigen)
+        msg = st.session_state.get("analysis_result_message")
+        msg_type = st.session_state.get("analysis_result_message_type") or "success"
+        if msg:
+            if msg_type == "info":
+                st.info(msg)
+            else:
+                st.success(msg)
+            st.session_state.analysis_result_message = None
+            st.session_state.analysis_result_message_type = None
+        warnings = st.session_state.get("analysis_result_warning")
+        if warnings is not None:
+            for w in (warnings if isinstance(warnings, list) else [warnings]):
+                if w:
+                    st.warning(w)
+            st.session_state.analysis_result_warning = None
+        year_err = st.session_state.pop("discogs_year_not_found_message", None)
+        if year_err:
+            st.error(year_err)
         
         # Warnung wenn Deep Analysis verwendet wurde
         if st.session_state.deep_analysis_used:
@@ -2203,49 +3955,145 @@ def show_scan_session():
                     st.session_state.manually_edited_fields["label"] = True
                 st.session_state.scan_label = label
         with col_catno:
-            cat_no = st.text_input("🔢 Cat-No", value=st.session_state.scan_cat_no, key=f"form_catno_{form_key_suffix}")
+            cat_no = st.text_input("🔢 Cat-No", value=st.session_state.scan_cat_no or "", key=f"form_catno_{form_key_suffix}")
             if cat_no != st.session_state.scan_cat_no:
                 if cat_no and st.session_state.scan_cat_no and cat_no != st.session_state.scan_cat_no:
                     st.session_state.manually_edited_fields["cat_no"] = True
                 st.session_state.scan_cat_no = cat_no
+                st.session_state.trigger_discogs_after_cat_no_edit = True
+        
+        # Discogs-Suche auslösen, wenn Cat-No manuell geändert wurde (z. B. Enter)
+        _ensure_discogs_client()
+        if st.session_state.get("trigger_discogs_after_cat_no_edit") and st.session_state.discogs_client and (
+                st.session_state.scan_artist or st.session_state.scan_title or st.session_state.scan_cat_no):
+            st.session_state.trigger_discogs_after_cat_no_edit = False
+            artist_val = st.session_state.scan_artist or ""
+            title_val = st.session_state.scan_title or ""
+            cat_no_val = st.session_state.scan_cat_no or ""
+            label_val = st.session_state.scan_label or ""
+            with st.spinner("🔍 Discogs-Suche nach Katalognummer..."):
+                try:
+                    auto_search_results = _auto_search_discogs(
+                        artist_val,
+                        title_val,
+                        cat_no_val,
+                        label_val
+                    )
+                    if auto_search_results:
+                        results = auto_search_results.get("results", [])
+                        if results:
+                            best = _pick_best_discogs_result(results, cat_no_val)
+                            if best is None and cat_no_val and st.session_state.discogs_client:
+                                for r in _sort_results_by_label(results, label_val)[:DISCOGS_FALLBACK_MAX_RELEASES]:
+                                    rid = r.get("id")
+                                    if not rid:
+                                        continue
+                                    try:
+                                        full_release = st.session_state.discogs_client.get_release(int(rid))
+                                        if full_release and _discogs_release_matches_scan(
+                                                full_release, artist_val, title_val, cat_no_val):
+                                            best = r
+                                            break
+                                    except Exception:
+                                        continue
+                            if best is None:
+                                st.session_state.scan_discogs_results = results
+                                st.session_state.discogs_no_catno_match_message = "Kein Treffer mit passender Katalognummer – bitte bei Bedarf manuell auswählen."
+                            else:
+                                release_id = best.get("id")
+                                if release_id and st.session_state.discogs_client:
+                                    try:
+                                        release_check = st.session_state.discogs_client.get_release(release_id)
+                                        if release_check and not _discogs_release_matches_scan(
+                                                release_check, artist_val, title_val, cat_no_val):
+                                            st.session_state.scan_discogs_results = results
+                                            st.session_state.discogs_no_catno_match_message = "Treffer stimmt nicht mit Katalognummer/Name überein – bitte manuell prüfen."
+                                            release_id = None
+                                    except Exception:
+                                        pass
+                                if release_id:
+                                    fallback_year = best.get("year") if best else None
+                                    if fallback_year is None and best and best.get("title"):
+                                        fallback_year = _extract_year_from_text(best.get("title"))
+                                    success, err_msg = update_fields_from_discogs(
+                                        release_id, respect_manual_edits=True,
+                                        fallback_year=fallback_year
+                                    )
+                                    if success:
+                                        st.session_state.scan_discogs_results = None
+                                        st.session_state.selected_discogs_release_id = release_id
+                                        if not st.session_state.scan_year and st.session_state.discogs_client:
+                                            try:
+                                                release = st.session_state.discogs_client.get_release(release_id)
+                                                if release:
+                                                    year_int = _get_year_from_discogs_released_only(release)
+                                                    if year_int is not None:
+                                                        st.session_state.scan_year = year_int
+                                                    else:
+                                                        st.session_state.discogs_year_not_found_message = (
+                                                            "Bei Discogs wurde kein Veröffentlichungsjahr (Veröffentlicht) gefunden. Bitte Jahr manuell eintragen."
+                                                        )
+                                            except Exception:
+                                                pass
+                                        year_info = f" (Jahr: {st.session_state.scan_year})" if st.session_state.scan_year else ""
+                                        success_msg = (
+                                            f"Discogs-Suche erfolgreich. Daten wurden übernommen.{year_info} "
+                                            "Bitte fehlende Felder (z. B. Jahr) unten im Formular ergänzen."
+                                        )
+                                        st.session_state.analysis_result_message = success_msg
+                                        st.session_state.analysis_result_message_type = "success"
+                                        st.session_state.form_reset_counter += 1
+                                    else:
+                                        st.session_state.scan_discogs_results = results
+                                else:
+                                    st.session_state.scan_discogs_results = results
+                            st.rerun()
+                        else:
+                            st.session_state.scan_discogs_results = None
+                            st.rerun()
+                    else:
+                        st.session_state.scan_discogs_results = None
+                        st.rerun()
+                except Exception:
+                    st.session_state.trigger_discogs_after_cat_no_edit = False
+                    st.rerun()
         
         # Jahr-Input mit Session State - leer lassen wenn kein Jahr gefunden
-        from datetime import datetime
+        from datetime import datetime, date, timedelta
         current_year = datetime.now().year
         
-        # Bestimme Default-Wert: Session State Jahr wenn vorhanden und gültig, sonst None (leer)
-        if st.session_state.scan_year and st.session_state.scan_year >= 1900 and st.session_state.scan_year <= current_year:
+        # Bestimme Default: jedes gültige Jahr 1900–2100 anzeigen (inkl. Reissues > current_year)
+        if st.session_state.scan_year and 1900 <= st.session_state.scan_year <= 2100:
             year_default = st.session_state.scan_year
         else:
-            # Wenn kein Jahr vorhanden oder ungültig, nutze None (leer)
             year_default = None
         
-        # Verwende einen Platzhalter-Wert für number_input (kann nicht None sein)
-        # Verwende 0 als Platzhalter, der dann als "leer" interpretiert wird
         placeholder_value = 0
-        if year_default is not None:
-            display_value = year_default
-        else:
-            display_value = placeholder_value
+        display_value = year_default if year_default is not None else placeholder_value
+        year_key = f"form_year_{form_key_suffix}"
+        # Widget-State explizit setzen, damit number_input das Jahr nach Discogs/Scan zuverlässig anzeigt
+        year_for_widget = int(display_value) if display_value is not None else 0
+        st.session_state[year_key] = year_for_widget
         
         year_input = st.number_input(
             "📅 Jahr", 
             min_value=0, 
-            max_value=current_year,
-            value=display_value,
-            help="Jahr der Veröffentlichung (0 = leer/unbekannt, kann leer bleiben)",
-            key=f"form_year_{form_key_suffix}"
+            max_value=2100,
+            value=year_for_widget,
+            help="Jahr der Veröffentlichung (0 = leer/unbekannt)",
+            key=year_key
         )
         
-        # Wenn Jahr = 0 (Platzhalter) oder < 1900, behandle als None (leer)
         if year_input == 0 or year_input < 1900:
             year = None
         else:
-            year = year_input
+            year = int(year_input)
         
-        if year != st.session_state.scan_year:
-            # Prüfe ob Jahr manuell geändert wurde (nicht durch KI/Discogs)
-            if year is not None and st.session_state.scan_year is not None and year != st.session_state.scan_year:
+        # 0 nicht übernehmen wenn bereits gültiges Jahr gesetzt (z. B. von Discogs), sonst würden wir es löschen
+        if year_input == 0 and st.session_state.scan_year and 1900 <= st.session_state.scan_year <= 2100:
+            pass  # scan_year beibehalten
+        elif year != st.session_state.scan_year:
+            if year is not None and st.session_state.scan_year is not None:
                 st.session_state.manually_edited_fields["year"] = True
             st.session_state.scan_year = year
         
@@ -2283,142 +4131,21 @@ def show_scan_session():
             if st.session_state.scan_format and current_format and st.session_state.scan_format != current_format:
                 st.session_state.manually_edited_fields["format"] = True
         
-        # Trackliste - Gruppierte Anzeige mit separaten Tabellen für Seite 1 und Seite 2
-        with st.expander("🎵 Trackliste & Details", expanded=True):
-            # Stelle sicher, dass scan_tracklist_table initialisiert ist
-            if "scan_tracklist_table" not in st.session_state:
-                st.session_state.scan_tracklist_table = []
-            
-            # Bereinige Trackliste: Extrahiere Laufzeiten aus Titeln falls nötig
-            cleaned_tracks = []
-            for track in st.session_state.scan_tracklist_table:
-                title = str(track.get("Titel", "")).strip()
-                length = str(track.get("Länge", "")).strip()
-                
-                # Wenn Länge leer ist, aber im Titel eine Zeitangabe vorhanden ist, extrahiere sie
-                if not length and title:
-                    # Suche nach Zeitformat (sowohl : als auch ')
-                    time_match = re.search(r'\(?(\d{1,2}(?::|\')\d{2}(?::\d{2})?)[\)"]?', title)
-                    if time_match:
-                        length = time_match.group(1)
-                        # Konvertiere ' zu : für einheitliches Format
-                        length = length.replace("'", ":")
-                        # Entferne die Länge aus dem Titel
-                        title = re.sub(r'\s*\(?\d{1,2}(?::|\')\d{2}(?::\d{2})?[\)"]?\s*', '', title).strip()
-                
-                cleaned_tracks.append({
-                    "Seite": track.get("Seite", ""),
-                    "Position": track.get("Position", ""),
-                    "Titel": title,
-                    "Länge": length
-                })
-            
-            # Aktualisiere Session State mit bereinigten Daten
-            if cleaned_tracks != st.session_state.scan_tracklist_table:
-                st.session_state.scan_tracklist_table = cleaned_tracks
-            
-            # Gruppiere Tracks nach Seiten (dynamisch für beliebig viele Seiten)
-            tracks_by_seite = {}
-            for track in st.session_state.scan_tracklist_table:
-                seite = str(track.get("Seite", "")).strip()
-                # Wenn Seite leer ist, verwende "1" als Standard
-                if not seite:
-                    seite = "1"
-                if seite not in tracks_by_seite:
-                    tracks_by_seite[seite] = []
-                tracks_by_seite[seite].append(track)
-            
-            # Sortiere Seiten numerisch (1, 2, 3, 4, ...)
-            sorted_seiten = sorted(tracks_by_seite.keys(), key=lambda x: int(x) if x.isdigit() else 999)
-            
-            updated_tracks = []
-            
-            # Dynamische Anzeige für alle gefundenen Seiten
-            for seite in sorted_seiten:
-                tracks_for_seite = tracks_by_seite[seite]
-                
-                # Überschrift für diese Seite
-                st.markdown(f"### 💿 Seite {seite}")
-                
-                # Auto-Nummerierung: Wenn Position leer ist, generiere automatisch 1, 2, 3...
-                df_data = []
-                for idx, t in enumerate(tracks_for_seite, start=1):
-                    position = str(t.get("Position", "")).strip()
-                    # Wenn Position leer, nutze automatische Nummerierung
-                    if not position:
-                        position = str(idx)
-                    df_data.append({
-                        "Position": position,
-                        "Titel": str(t.get("Titel", "")).strip(),
-                        "Länge": str(t.get("Länge", "")).strip()
-                    })
-                
-                if df_data:
-                    df = pd.DataFrame(df_data)
-                else:
-                    df = pd.DataFrame(columns=["Position", "Titel", "Länge"])
-                
-                # Data Editor für diese Seite
-                edited_df = st.data_editor(
-                    df,
-                    column_config={
-                        "Position": st.column_config.TextColumn("Position", help="Track-Position (leer = auto, z.B. '1', '2', 'A1')", width="small"),
-                        "Titel": st.column_config.TextColumn("Titel", help="Titel des Songs", width="large"),
-                        "Länge": st.column_config.TextColumn("Länge", help="Laufzeit (z.B. '3:45', '4:12')", width="medium")
-                    },
-                    num_rows="dynamic",
-                    use_container_width=True,
-                    key=f"tracklist_seite_{seite}_{form_key_suffix}",
-                    hide_index=True
-                )
-                
-                # Konvertiere zurück - mit Auto-Nummerierung wenn Position leer
-                for idx, record in enumerate(edited_df.to_dict('records'), start=1):
-                    position = str(record.get("Position", "")).strip() if pd.notna(record.get("Position")) else ""
-                    # Auto-Nummerierung wenn Position leer
-                    if not position:
-                        position = str(idx)
-                    track = {
-                        "Seite": seite,
-                        "Position": position,
-                        "Titel": str(record.get("Titel", "")).strip() if pd.notna(record.get("Titel")) else "",
-                        "Länge": str(record.get("Länge", "")).strip() if pd.notna(record.get("Länge")) else ""
-                    }
-                    if track["Titel"]:
-                        updated_tracks.append(track)
-                
-                st.markdown("---")
-            
-            # Button zum Hinzufügen einer neuen Seite
-            if st.button("➕ Seite hinzufügen", key=f"add_seite_{form_key_suffix}", use_container_width=False):
-                # Finde die höchste vorhandene Seiten-Nummer
-                max_seite = 0
-                for track in st.session_state.scan_tracklist_table:
-                    seite_str = str(track.get("Seite", "")).strip()
-                    if seite_str.isdigit():
-                        max_seite = max(max_seite, int(seite_str))
-                
-                # Füge eine leere Seite hinzu
-                new_seite = str(max_seite + 1)
-                st.session_state.scan_tracklist_table.append({
-                    "Seite": new_seite,
-                    "Position": "1",
-                    "Titel": "",
-                    "Länge": ""
-                })
-                st.session_state.manually_edited_fields["tracklist"] = True
-                st.rerun()
-            
-            # Prüfe ob Änderungen vorgenommen wurden
-            if updated_tracks != st.session_state.scan_tracklist_table:
-                st.session_state.scan_tracklist_table = updated_tracks
-                if updated_tracks:  # Nur markieren wenn tatsächlich Tracks vorhanden
-                    st.session_state.manually_edited_fields["tracklist"] = True
-            
-            # Info-Text (nur wenn keine Tracks vorhanden)
-            if not st.session_state.scan_tracklist_table:
-                st.info("💡 Die Trackliste wird automatisch von der KI oder Discogs gefüllt. Sie können auch manuell Zeilen hinzufügen oder bearbeiten.")
+        # Genre-Eingabe
+        genre_val = st.text_input(
+            "Genre",
+            value=st.session_state.scan_genre or "",
+            key=f"form_genre_{form_key_suffix}",
+            help="Musikgenre (z. B. von Discogs übernommen)"
+        )
+        if genre_val != st.session_state.scan_genre:
+            if genre_val and st.session_state.scan_genre and genre_val != st.session_state.scan_genre:
+                st.session_state.manually_edited_fields["genre"] = True
+            st.session_state.scan_genre = genre_val
         
+        # Trackliste (ohne Fragment, damit erster Klick auf „In Inventar speichern“ zuverlässig funktioniert)
+        _render_tracklist_expander(form_key_suffix)
+
         # Stückzahl-Eingabe
         quantity = st.number_input(
             "📦 Stückzahl",
@@ -2680,9 +4407,19 @@ def show_scan_session():
                     else:
                         st.warning("⚠️ Bitte füllen Sie mindestens Artist, Title oder Cat-No aus.")
             
-            # Zeige Discogs-Ergebnisse - Top 5 mit expliziter Auswahl (KEINE automatische Auswahl)
-            if st.session_state.scan_discogs_results:
+            # Nach Auto-Berichtigung: nur Erfolgsmeldung und ggf. Median-Preis (keine Top-5-Liste)
+            if st.session_state.get("selected_discogs_release_id") and not st.session_state.get("scan_discogs_results"):
+                st.caption("✅ Daten mit Discogs abgeglichen und berichtigt.")
+                if st.session_state.get("discogs_median_price") is not None:
+                    st.metric("📊 Median-Preis (Discogs)", f"{st.session_state.discogs_median_price:.2f} EUR")
+                if st.session_state.get("scan_suggested_price") is not None:
+                    st.metric("💡 Vorschlagspreis", f"{st.session_state.scan_suggested_price:.2f} EUR")
+            # Zeige Discogs-Ergebnisse - Top 5 nur wenn nicht automatisch berichtigt (manuelle Suche oder Auto-Berichtigung fehlgeschlagen)
+            elif st.session_state.scan_discogs_results:
                 st.markdown("### 🎵 Discogs Ergebnisse (Top 5)")
+                no_catno_msg = st.session_state.pop("discogs_no_catno_match_message", None)
+                if no_catno_msg:
+                    st.warning(no_catno_msg)
                 st.info("💡 **Wichtig:** Wählen Sie explizit ein Release aus, um die Felder mit Discogs-Daten zu aktualisieren. KI-Daten werden nicht automatisch überschrieben.")
                 
                 # Top 5 Ergebnisse für übersichtliche Anzeige
@@ -2733,8 +4470,13 @@ def show_scan_session():
                                 st.session_state.last_processed_release_id = release_id
                                 
                                 with st.spinner("💰 Lade Release-Details und aktualisiere Felder..."):
-                                    # Nutze Update-Funktion mit Schutz für manuell bearbeitete Felder
-                                    success, error_message = update_fields_from_discogs(release_id, respect_manual_edits=True)
+                                    fallback_yr = selected_result.get("year") if selected_result else None
+                                    if fallback_yr is None and selected_result and selected_result.get("title"):
+                                        fallback_yr = _extract_year_from_text(selected_result.get("title"))
+                                    success, error_message = update_fields_from_discogs(
+                                        release_id, respect_manual_edits=True,
+                                        fallback_year=fallback_yr
+                                    )
                                     
                                     if success:
                                         # Discogs-Daten übernommen - Deep Analysis Flag zurücksetzen
@@ -2751,7 +4493,8 @@ def show_scan_session():
                                         
                                         # Aktualisiere UI
                                         st.session_state.form_reset_counter += 1
-                                        st.success("✅ Felder wurden mit Discogs-Daten aktualisiert! (Manuell bearbeitete Felder wurden geschützt.)")
+                                        year_hint = f" Jahr: {st.session_state.scan_year}." if st.session_state.scan_year else ""
+                                        st.success(f"✅ Felder wurden mit Discogs-Daten aktualisiert.{year_hint} (Manuell bearbeitete Felder wurden geschützt.)")
                                         st.rerun()
                                     else:
                                         st.error(f"❌ Fehler beim Abrufen der Discogs-Daten: {error_message}")
@@ -2823,6 +4566,7 @@ def show_scan_session():
         
         # Speichern in Inventar
         save_all_btn = st.button("💾 In Inventar speichern", type="primary", use_container_width=True, key="save_inventory")
+        show_success_message("", "save_inventory")
         
         # Kopiere Bilder in permanentes Verzeichnis
         def copy_images_to_permanent(image_paths, record_id=None, artist=None, title=None):
@@ -2842,7 +4586,7 @@ def show_scan_session():
                 return None
             
             # Erstelle Basisverzeichnis für Vinyl-Bilder
-            base_dir = Path("vinyl_images")
+            base_dir = Path(COVERS_ABS)
             base_dir.mkdir(exist_ok=True)
             
             permanent_paths = []
@@ -3078,7 +4822,7 @@ def show_scan_session():
                     log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cursor", "debug.log")
                     with open(log_path, "a", encoding="utf-8") as f_log:
                         import json as json_log
-                        from datetime import datetime
+                        from datetime import datetime, date, timedelta
                         f_log.write(json_log.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H1","location":"app.py:3106","message":"Before items_to_save creation","data":{"has_media_condition_local":"media_condition" in locals(),"has_sleeve_condition_local":"sleeve_condition" in locals(),"scan_media_condition":st.session_state.get("scan_media_condition"),"scan_sleeve_condition":st.session_state.get("scan_sleeve_condition")},"timestamp":int(datetime.now().timestamp()*1000)}) + "\n")
                 except: pass
                 # #endregion
@@ -3143,6 +4887,7 @@ def show_scan_session():
                     "cat_no": cat_no if cat_no else None,
                     "year": int(year) if year else None,
                     "format": st.session_state.scan_format if st.session_state.scan_format else None,
+                    "genre": (st.session_state.get("scan_genre") or "").strip() or None,
                     "pricing": float(pricing) if pricing else None,
                     "purchase_price": purchase_price_float,  # Einkaufspreis aus Scan-Session
                     "quantity": quantity_int,
@@ -3190,6 +4935,9 @@ def show_scan_session():
                             
                             # Spezifische Erfolgsmeldung für Duplikat-Fall
                             success_msg = f"Duplikat gefunden, Stückzahl erweitert um {added_quantity} (von {old_quantity} auf {new_quantity})"
+                            fields_supplemented = result.get("fields_supplemented") or []
+                            if fields_supplemented:
+                                success_msg += f". Fehlende Angaben ergänzt: {', '.join(fields_supplemented)}"
                             st.session_state.duplicate_success_message = success_msg
                             st.session_state.inventory_success_message = success_msg
                             st.session_state.scan_success_message_shown_at = _time_module.time()
@@ -3259,13 +5007,44 @@ def show_scan_session():
                     first_sync_done = True
                     # Erfolgsmeldung und Navigation
                     if saved_count > 0:
+                        # Warteschlangen-Dateien löschen (nach Speichern in vinyl_images)
+                        for p in st.session_state.get("queue_file_paths_to_remove") or []:
+                            if os.path.exists(p):
+                                try:
+                                    os.remove(p)
+                                except Exception:
+                                    pass
+                        if "queue_file_paths_to_remove" in st.session_state:
+                            del st.session_state["queue_file_paths_to_remove"]
+                        qkey = st.session_state.get("queue_list_key")
+                        idx = st.session_state.get("queue_current_index")
+                        if qkey and qkey in st.session_state and isinstance(st.session_state[qkey], list) and idx is not None and 0 <= idx < len(st.session_state[qkey]):
+                            st.session_state[qkey].pop(idx)
+                            if "queue_list_key" in st.session_state:
+                                del st.session_state["queue_list_key"]
+                            if "queue_current_index" in st.session_state:
+                                del st.session_state["queue_current_index"]
+                        elif idx is not None and isinstance(idx, int):
+                            if "scan_queue" in st.session_state and 0 <= idx < len(st.session_state.scan_queue):
+                                st.session_state.scan_queue.pop(idx)
+                            if "queue_current_index" in st.session_state:
+                                del st.session_state["queue_current_index"]
+                            if st.session_state.get("scan_queue") and len(st.session_state.scan_queue) > 0:
+                                st.session_state.navigate_to = "Scan-Warteschlange"
                         current_dups = st.session_state.get("items_with_duplicates", [])
                         if not current_dups:
-                            # Meldung unter Speicher-Button anzeigen, nicht sofort navigieren
+                            # Meldung unter Speicher-Button anzeigen
+                            set_success_message(
+                                f"✅ {saved_count} {'Item' if saved_count == 1 else 'Items'} erfolgreich synchronisiert!",
+                                "save_inventory"
+                            )
                             st.session_state.inventory_refresh_needed = True
                             st.rerun()
                         else:
-                            st.success(f"✅ {saved_count} {'Item' if saved_count == 1 else 'Items'} erfolgreich synchronisiert!")
+                            set_success_message(
+                                f"✅ {saved_count} {'Item' if saved_count == 1 else 'Items'} erfolgreich synchronisiert!",
+                                "save_inventory"
+                            )
                             reset_metadata()
                             st.session_state.inventory_refresh_needed = True
                             st.session_state.navigate_to = "Lager-Verwaltung"
@@ -3419,6 +5198,9 @@ def show_scan_session():
                                         new_quantity = result.get("new_quantity", 0)
                                         added_quantity = new_quantity - old_quantity
                                         success_msg = f"Duplikat gefunden, Stückzahl erweitert um {added_quantity} (von {old_quantity} auf {new_quantity})"
+                                        fields_supplemented_ui = result.get("fields_supplemented") or []
+                                        if fields_supplemented_ui:
+                                            success_msg += f". Fehlende Angaben ergänzt: {', '.join(fields_supplemented_ui)}"
                                         st.session_state.duplicate_success_message = success_msg
                                         st.session_state.inventory_success_message = success_msg
                                         st.session_state.scan_success_message_shown_at = _time_module.time()
@@ -3477,6 +5259,31 @@ def show_scan_session():
                                                     })
                                             except Exception as e:
                                                 pass
+                                    
+                                    # Warteschlangen-Dateien nach erfolgreichem Speichern löschen
+                                    for p in st.session_state.get("queue_file_paths_to_remove") or []:
+                                        if os.path.exists(p):
+                                            try:
+                                                os.remove(p)
+                                            except Exception:
+                                                pass
+                                    if "queue_file_paths_to_remove" in st.session_state:
+                                        del st.session_state["queue_file_paths_to_remove"]
+                                    qkey = st.session_state.get("queue_list_key")
+                                    idx = st.session_state.get("queue_current_index")
+                                    if qkey and qkey in st.session_state and isinstance(st.session_state[qkey], list) and idx is not None and 0 <= idx < len(st.session_state[qkey]):
+                                        st.session_state[qkey].pop(idx)
+                                        if "queue_list_key" in st.session_state:
+                                            del st.session_state["queue_list_key"]
+                                        if "queue_current_index" in st.session_state:
+                                            del st.session_state["queue_current_index"]
+                                    elif idx is not None and isinstance(idx, int):
+                                        if "scan_queue" in st.session_state and 0 <= idx < len(st.session_state.scan_queue):
+                                            st.session_state.scan_queue.pop(idx)
+                                        if "queue_current_index" in st.session_state:
+                                            del st.session_state["queue_current_index"]
+                                        if st.session_state.get("scan_queue") and len(st.session_state.scan_queue) > 0:
+                                            st.session_state.navigate_to = "Scan-Warteschlange"
                                     
                                     # Entferne verarbeitetes Item aus Session State
                                     st.session_state.items_with_duplicates = [
@@ -3671,6 +5478,31 @@ def show_scan_session():
                                         pass
                                 
                                 st.success(f"✅ Neuer Eintrag erstellt (ID: {record_id})")
+                            
+                            # Warteschlangen-Dateien nach erfolgreichem Speichern löschen
+                            for p in st.session_state.get("queue_file_paths_to_remove") or []:
+                                if os.path.exists(p):
+                                    try:
+                                        os.remove(p)
+                                    except Exception:
+                                        pass
+                            if "queue_file_paths_to_remove" in st.session_state:
+                                del st.session_state["queue_file_paths_to_remove"]
+                            qkey = st.session_state.get("queue_list_key")
+                            idx = st.session_state.get("queue_current_index")
+                            if qkey and qkey in st.session_state and isinstance(st.session_state[qkey], list) and idx is not None and 0 <= idx < len(st.session_state[qkey]):
+                                st.session_state[qkey].pop(idx)
+                                if "queue_list_key" in st.session_state:
+                                    del st.session_state["queue_list_key"]
+                                if "queue_current_index" in st.session_state:
+                                    del st.session_state["queue_current_index"]
+                            elif idx is not None and isinstance(idx, int):
+                                if "scan_queue" in st.session_state and 0 <= idx < len(st.session_state.scan_queue):
+                                    st.session_state.scan_queue.pop(idx)
+                                if "queue_current_index" in st.session_state:
+                                    del st.session_state["queue_current_index"]
+                                if st.session_state.get("scan_queue") and len(st.session_state.scan_queue) > 0:
+                                    st.session_state.navigate_to = "Scan-Warteschlange"
                                 
                         except Exception as e:
                             st.error(f"❌ Fehler beim Synchronisieren: {str(e)}")
@@ -3749,6 +5581,176 @@ def show_scan_session():
             st.session_state.scan_success_message_shown_at = 0
 
 
+def show_kleinanzeigen_assistant():
+    """Eigene Seite für den Kleinanzeigen-Assistenten mit Auswahl von Platten."""
+    st.header("📋 Kleinanzeigen-Assistent")
+    db = st.session_state.db
+
+    # Session State für ausgewählte Platten-IDs initialisieren
+    if "kleinanzeigen_selected_ids" not in st.session_state:
+        st.session_state.kleinanzeigen_selected_ids = []
+
+    selected_ids = st.session_state.kleinanzeigen_selected_ids
+    config = db.get_company_settings() or {}
+    all_inventory = db.get_all_records("inventory")
+    inventory_by_id = {int(i["id"]): i for i in all_inventory}
+
+    def _fmt_opt(iid):
+        it = inventory_by_id.get(iid)
+        if not it:
+            return str(iid)
+        a = (it.get("artist") or "").strip()
+        t = (it.get("title") or "").strip()
+        y = it.get("year") or ""
+        return f"{a} – {t}" + (f" ({y})" if y else "")
+
+    st.caption("Wähle Platten aus dem Inventar. Generiere Titel und Beschreibung zum Kopieren bei Kleinanzeigen.")
+    st.markdown("---")
+
+    # Suche und Filter
+    with st.expander("🔍 Suche und Filter", expanded=True):
+        search_query = st.text_input(
+            "🔍 Volltextsuche",
+            value=st.session_state.get("kleinanzeigen_search", ""),
+            placeholder="Artist, Title, Label, Cat-No...",
+            key="kleinanzeigen_search_input",
+        )
+        st.session_state.kleinanzeigen_search = search_query
+        col_f1, col_f2 = st.columns(2)
+        with col_f1:
+            status_options = ["Alle", "available", "sold", "reserved"]
+            status_labels = {"available": "✅ Verfügbar", "sold": "💰 Verkauft", "reserved": "🔒 Reserviert"}
+            status_filter = st.selectbox(
+                "Status",
+                status_options,
+                format_func=lambda x: status_labels.get(x, x) if x != "Alle" else x,
+                key="kleinanzeigen_status_filter",
+            )
+        with col_f2:
+            condition_options = ["Alle", "M", "NM", "VG+", "VG", "G", "P"]
+            condition_filter = st.selectbox(
+                "Zustand",
+                condition_options,
+                key="kleinanzeigen_condition_filter",
+            )
+        sort_options_ka = {
+            "Neueste zuerst": "created_at DESC",
+            "Künstler (A-Z)": "artist ASC",
+            "Titel (A-Z)": "title ASC",
+            "Jahr (absteigend)": "year DESC",
+            "Preis (niedrig → hoch)": "pricing ASC",
+        }
+        current_sort = st.session_state.get("kleinanzeigen_sort", "Neueste zuerst")
+        sort_index = list(sort_options_ka.keys()).index(current_sort) if current_sort in sort_options_ka else 0
+        sort_selection = st.selectbox(
+            "Sortierung",
+            list(sort_options_ka.keys()),
+            index=sort_index,
+            key="kleinanzeigen_sort_select",
+        )
+        st.session_state.kleinanzeigen_sort = sort_selection
+        if st.button("🔄 Filter zurücksetzen", key="kleinanzeigen_filter_reset", use_container_width=True):
+            st.session_state.kleinanzeigen_search = ""
+            st.session_state.kleinanzeigen_sort = "Neueste zuerst"
+            st.rerun()
+
+    # Gefiltertes Inventar für die Auswahl
+    filters = {}
+    if status_filter != "Alle":
+        filters["status"] = status_filter
+    if condition_filter != "Alle":
+        filters["media_condition"] = condition_filter
+    order_by = sort_options_ka.get(sort_selection, "created_at DESC")
+    filtered_inventory = db.search_inventory(
+        query=search_query.strip() if search_query else None,
+        filters=filters if filters else None,
+        order_by=order_by,
+    )
+    st.markdown("---")
+
+    # Ausgewählte Platten anzeigen
+    if selected_ids:
+        st.subheader(f"Gewählte Platten ({len(selected_ids)})")
+        for item_id in list(selected_ids):
+            item = inventory_by_id.get(item_id)
+            if not item:
+                if st.button("🗑️ Entfernen (nicht gefunden)", key=f"kleinanzeigen_remove_{item_id}", use_container_width=True):
+                    st.session_state.kleinanzeigen_selected_ids = [x for x in selected_ids if x != item_id]
+                    st.rerun()
+                continue
+            artist = item.get("artist", "") or ""
+            title = item.get("title", "") or ""
+            year = item.get("year", "") or ""
+            display = f"{artist} – {title}" + (f" ({year})" if year else "")
+            col1, col2 = st.columns([4, 1])
+            with col1:
+                st.markdown(f"• **{display}**")
+            with col2:
+                if st.button("🗑️ Entfernen", key=f"kleinanzeigen_remove_{item_id}", use_container_width=True):
+                    st.session_state.kleinanzeigen_selected_ids = [x for x in selected_ids if x != item_id]
+                    st.rerun()
+        st.markdown("---")
+
+    # Platte aus Inventar hinzufügen
+    st.subheader("Platte hinzufügen")
+    if filtered_inventory:
+        add_options = [i["id"] for i in filtered_inventory]
+        add_selected = st.selectbox(
+            "Platte aus Inventar auswählen",
+            options=add_options,
+            format_func=lambda x: _fmt_opt(x),
+            key="kleinanzeigen_add_select"
+        )
+        if st.button("➕ Zum Assistenten hinzufügen", key="kleinanzeigen_add_btn", use_container_width=True):
+            if add_selected and add_selected not in selected_ids:
+                st.session_state.kleinanzeigen_selected_ids = list(selected_ids) + [add_selected]
+                st.rerun()
+    elif all_inventory:
+        st.info("Keine Platten entsprechen den Filterkriterien. Passe Suche oder Filter an.")
+    else:
+        st.info("Kein Inventar vorhanden. Scanne zuerst Platten in der Scan-Session.")
+    st.markdown("---")
+
+    # Vorschau für ausgewählte Platten
+    if selected_ids:
+        st.subheader("Vorschau & Export")
+        preview_ids = [iid for iid in selected_ids if inventory_by_id.get(iid)]
+        if preview_ids:
+            preview_item_id = st.radio(
+                "Platte für Vorschau wählen",
+                options=preview_ids,
+                format_func=_fmt_opt,
+                key="kleinanzeigen_preview_radio"
+            )
+            item = inventory_by_id.get(preview_item_id)
+            if item:
+                _pricing = item.get("pricing")
+                price_val = st.number_input(
+                    "Preis (optional, €)",
+                    min_value=0.0,
+                    value=float(_pricing) if _pricing is not None else 0.0,
+                    step=0.5,
+                    format="%.2f",
+                    key="kleinanzeigen_preview_price"
+                )
+                price_use = price_val if price_val and price_val > 0 else None
+                result = generate_kleinanzeigen_listing(item, config, price=price_use)
+                st.markdown("**Titel**")
+                st.caption("Zum Kopieren: Klicke auf das Symbol rechts in der Box.")
+                st.code(result["title"], language=None)
+                st.markdown("**Beschreibung**")
+                st.caption("Zum Kopieren: Klicke auf das Symbol rechts in der Box.")
+                st.code(result["description"], language=None)
+                st.link_button(
+                    "Zu Kleinanzeigen wechseln ↗",
+                    "https://www.kleinanzeigen.de/p-anzeige-aufgeben.html",
+                    use_container_width=True,
+                    type="secondary",
+                )
+    else:
+        st.info("Füge Platten hinzu, um Titel und Beschreibung zu generieren.")
+
+
 def show_inventory():
     """Erweiterte Bestandsverwaltung mit Filtern und Volltextsuche."""
     st.header("📦 Inventar")
@@ -3825,7 +5827,7 @@ def show_inventory():
         # Erfassungsdatum Filter
         st.subheader("📅 Erfassungsdatum")
         
-        from datetime import datetime, timedelta
+        from datetime import datetime, date, timedelta
         
         date_from = st.date_input(
             "Von",
@@ -3983,11 +5985,111 @@ def show_inventory():
         order_by=order_by_clause
     )
     
+    # Status konsistent halten: Stückzahl 0 → Status "verkauft"
+    for item in inventory:
+        qty = item.get("quantity")
+        if isinstance(qty, str) and " von " in qty:
+            try:
+                qty = int(qty.split(" von ")[0])
+            except (ValueError, IndexError):
+                qty = 0
+        else:
+            qty = int(qty if qty is not None else 0)
+        if qty == 0 and item.get("status") != "sold":
+            try:
+                db.update_record("inventory", item["id"], {"status": "sold"})
+                item["status"] = "sold"
+            except Exception:
+                pass
+    
     # Zeige persistierte Erfolgsmeldung falls vorhanden (bleibt bestehen bis neue Aktion)
     if success_message:
-        st.success(success_message)
+        message_type = st.session_state.get("inventory_message_type", "success")
+        if message_type == "info":
+            st.info(success_message)
+            if "inventory_message_type" in st.session_state:
+                del st.session_state["inventory_message_type"]
+        else:
+            st.success(success_message)
         # Meldung bleibt bestehen bis neue Aktion ausgeführt wird
         # Wird nur gelöscht durch reset_metadata() oder explizite Löschung bei neuer Aktion
+    
+    # Fehlerdetails vom Shopify-Bulk-Upload anzeigen (einmalig, danach aus Session State entfernen)
+    bulk_errors = st.session_state.get("shopify_bulk_error_details")
+    if bulk_errors:
+        with st.expander("Fehlerdetails (Shopify-Bulk-Upload)", expanded=True):
+            for item_id, artist, title, err_msg in bulk_errors:
+                label = f"ID {item_id}"
+                if artist or title:
+                    label += f" ({artist or ''} – {title or ''})"
+                st.text(f"{label}: {err_msg}")
+        if "shopify_bulk_error_details" in st.session_state:
+            del st.session_state["shopify_bulk_error_details"]
+    
+    # Veröffentlichungs-Warnungen (Produkt hochgeladen, aber nicht auf Online Store veröffentlicht)
+    pub_errors = st.session_state.get("shopify_bulk_publication_errors")
+    if pub_errors:
+        st.warning(f"{len(pub_errors)} Produkt(e) hochgeladen, aber nicht auf dem Verkaufskanal „Online Store“ veröffentlicht.")
+        with st.expander("Details (Veröffentlichung Online Store)", expanded=False):
+            first_msg = pub_errors[0][3] if pub_errors else ""
+            st.caption(f"Beispiel: {first_msg}")
+            for item_id, artist, title, err_msg in pub_errors[:10]:
+                label = f"ID {item_id}"
+                if artist or title:
+                    label += f" ({artist or ''} – {title or ''})"
+                st.text(f"{label}: {err_msg}")
+            if len(pub_errors) > 10:
+                st.caption(f"… und {len(pub_errors) - 10} weitere.")
+        if "shopify_bulk_publication_errors" in st.session_state:
+            del st.session_state["shopify_bulk_publication_errors"]
+    
+    # Fehlerdetails vom Stückzahl-Abgleich (Von Shopify übernehmen) anzeigen
+    sync_errors = st.session_state.get("shopify_sync_error_details")
+    if sync_errors:
+        with st.expander("Fehlerdetails (Stückzahl von Shopify übernehmen)", expanded=True):
+            for item_id, artist, title, err_msg in sync_errors:
+                label = f"ID {item_id}"
+                if artist or title:
+                    label += f" ({artist or ''} – {title or ''})"
+                st.text(f"{label}: {err_msg}")
+        if "shopify_sync_error_details" in st.session_state:
+            del st.session_state["shopify_sync_error_details"]
+    
+    # Fehlerdetails vom Stückzahl-Push (Nach Shopify übertragen) anzeigen
+    push_errors = st.session_state.get("shopify_push_error_details")
+    if push_errors:
+        with st.expander("Fehlerdetails (Stückzahl nach Shopify übertragen)", expanded=True):
+            for item_id, artist, title, err_msg in push_errors:
+                label = f"ID {item_id}"
+                if artist or title:
+                    label += f" ({artist or ''} – {title or ''})"
+                st.text(f"{label}: {err_msg}")
+        if "shopify_push_error_details" in st.session_state:
+            del st.session_state["shopify_push_error_details"]
+    
+    # Fehlerdetails vom Preis/Metadaten-Push anzeigen
+    meta_push_errors = st.session_state.get("shopify_metadata_push_error_details")
+    if meta_push_errors:
+        with st.expander("Fehlerdetails (Preis und Metadaten nach Shopify übertragen)", expanded=True):
+            for item_id, artist, title, err_msg in meta_push_errors:
+                label = f"ID {item_id}"
+                if artist or title:
+                    label += f" ({artist or ''} – {title or ''})"
+                st.text(f"{label}: {err_msg}")
+        if "shopify_metadata_push_error_details" in st.session_state:
+            del st.session_state["shopify_metadata_push_error_details"]
+    
+    # Fehlerdetails vom Preis/Metadaten-Pull (Von Shopify übernehmen) anzeigen
+    meta_pull_errors = st.session_state.get("shopify_metadata_pull_error_details")
+    if meta_pull_errors:
+        with st.expander("Fehlerdetails (Preis und Metadaten von Shopify übernehmen)", expanded=True):
+            for item_id, artist, title, err_msg in meta_pull_errors:
+                label = f"ID {item_id}"
+                if artist or title:
+                    label += f" ({artist or ''} – {title or ''})"
+                st.text(f"{label}: {err_msg}")
+        if "shopify_metadata_pull_error_details" in st.session_state:
+            del st.session_state["shopify_metadata_pull_error_details"]
     
     # Lösche inventory_refresh_needed Flag nach Verwendung (aber nicht die Erfolgsmeldung)
     if inventory_refresh_needed and "inventory_refresh_needed" in st.session_state:
@@ -4017,6 +6119,266 @@ def show_inventory():
     
     # Tabelle anzeigen
     if inventory:
+        # Shopify (nur wenn verbunden)
+        shopify_client = st.session_state.get("shopify_client")
+        if shopify_client:
+            # Auto-Sync: Beim Öffnen Stückzahl von Shopify holen (einmal pro Aufruf der Seite)
+            company_settings = db.get_company_settings() or {}
+            if company_settings.get("shopify_auto_sync_quantity_on_load", 0) == 1 and not st.session_state.get("inventory_shopify_auto_sync_done"):
+                to_sync = [i for i in inventory if (i.get("shopify_product_id") or "").strip()]
+                updated = 0
+                sync_error_details = []
+                for item in to_sync:
+                    item_id = item.get("id")
+                    sid = (item.get("shopify_product_id") or "").strip()
+                    try:
+                        available, err_msg = shopify_client.get_inventory_available_for_product(sid)
+                        if err_msg:
+                            sync_error_details.append((item_id, item.get("artist"), item.get("title"), err_msg))
+                        elif available is not None:
+                            status = "sold" if available == 0 else "available"
+                            db.update_record("inventory", item_id, {"quantity": available, "max_quantity": available, "status": status})
+                            updated += 1
+                    except Exception as e:
+                        sync_error_details.append((item_id, item.get("artist"), item.get("title"), str(e)))
+                st.session_state["inventory_shopify_auto_sync_done"] = True
+                if sync_error_details:
+                    st.session_state["shopify_sync_error_details"] = sync_error_details
+                if updated:
+                    st.session_state["inventory_refresh_needed"] = True
+                    st.session_state["inventory_success_message"] = f"Stückzahl von Shopify übernommen ({updated} Einträge)."
+                st.rerun()
+            st.markdown("**🛒 Shopify**")
+            already_in_shopify = sum(1 for i in inventory if (i.get("shopify_product_id") or "").strip())
+            can_upload = len(inventory) - already_in_shopify
+            if can_upload == 0 and len(inventory) > 0:
+                st.info("Alle angezeigten Einträge sind bereits in Shopify. Es werden keine Daten hochgeladen.")
+            elif len(inventory) > 0:
+                st.caption(f"Von {len(inventory)} angezeigten Einträgen sind {already_in_shopify} bereits in Shopify. {can_upload} können hochgeladen werden.")
+            if st.button("🛒 Alle angezeigten zu Shopify hochladen", key="shopify_bulk_upload", use_container_width=True):
+                to_upload = [i for i in inventory if not (i.get("shopify_product_id") or "").strip()]
+                skipped = len(inventory) - len(to_upload)
+                uploaded = 0
+                errors = 0
+                error_details = []
+                db.ensure_inventory_shopify_product_id_column()
+                if not to_upload:
+                    st.session_state["inventory_success_message"] = "Nichts zu hochladen (alle angezeigten Einträge sind bereits in Shopify)."
+                    st.session_state["inventory_message_type"] = "info"
+                    st.rerun()
+                else:
+                    progress_bar = st.progress(0.0)
+                    publication_errors = []
+                    for idx, item in enumerate(to_upload):
+                        try:
+                            item_id = item.get("id")
+                            record_data = _inventory_item_to_shopify_record(item)
+                            _add_shopify_zustand_to_record(record_data, db)
+                            resolved_paths = _resolve_inventory_image_paths(item.get("image_paths"), Path(COVERS_ABS).parent)
+                            product_id, err_msg, pub_warning = shopify_client.create_vinyl_product(record_data, image_paths=resolved_paths)
+                            if err_msg:
+                                errors += 1
+                                error_details.append((item_id, item.get("artist"), item.get("title"), err_msg))
+                            else:
+                                if pub_warning:
+                                    publication_errors.append((item_id, item.get("artist"), item.get("title"), pub_warning))
+                                try:
+                                    db.update_record("inventory", item_id, {"shopify_product_id": product_id})
+                                    uploaded += 1
+                                except Exception as e:
+                                    errors += 1
+                                    error_details.append((item_id, item.get("artist"), item.get("title"), f"Speichern der Produkt-ID fehlgeschlagen: {e}"))
+                        except Exception as e:
+                            errors += 1
+                            error_details.append((item.get("id"), item.get("artist"), item.get("title"), str(e)))
+                        progress_bar.progress((idx + 1) / len(to_upload))
+                    progress_bar.empty()
+                    parts = []
+                    if uploaded:
+                        parts.append(f"{uploaded} zu Shopify hochgeladen")
+                    if skipped:
+                        parts.append(f"{skipped} übersprungen (bereits in Shopify)")
+                    if errors:
+                        parts.append(f"{errors} Fehler")
+                    if publication_errors:
+                        parts.append(f"{len(publication_errors)} nicht auf Verkaufskanal 'Online Store' veröffentlicht")
+                    st.session_state["inventory_success_message"] = " ".join(parts) + "." if parts else ""
+                    if error_details:
+                        st.session_state["shopify_bulk_error_details"] = error_details
+                    if publication_errors:
+                        st.session_state["shopify_bulk_publication_errors"] = publication_errors
+                    st.rerun()
+            # Von Shopify übernehmen (Stückzahl + Preis/Metadaten)
+            if st.button("⬇️ Von Shopify übernehmen", key="shopify_pull_all", use_container_width=True, help="Stückzahl und Preis/Metadaten von Shopify in die App holen (alle angezeigten, verknüpften Einträge)."):
+                to_pull = [i for i in inventory if (i.get("shopify_product_id") or "").strip()]
+                qty_updated = 0
+                meta_updated = 0
+                sync_error_details = []
+                pull_error_details = []
+                for item in to_pull:
+                    item_id = item.get("id")
+                    sid = (item.get("shopify_product_id") or "").strip()
+                    try:
+                        available, err_msg = shopify_client.get_inventory_available_for_product(sid)
+                        if err_msg:
+                            sync_error_details.append((item_id, item.get("artist"), item.get("title"), err_msg))
+                        elif available is not None:
+                            status = "sold" if available == 0 else "available"
+                            db.update_record("inventory", item_id, {"quantity": available, "max_quantity": available, "status": status})
+                            qty_updated += 1
+                    except Exception as e:
+                        sync_error_details.append((item_id, item.get("artist"), item.get("title"), str(e)))
+                    try:
+                        record_data, err_msg = shopify_client.get_product_details_for_sync(sid)
+                        if err_msg:
+                            pull_error_details.append((item_id, item.get("artist"), item.get("title"), err_msg))
+                        elif record_data:
+                            db.update_record("inventory", item_id, record_data)
+                            meta_updated += 1
+                    except Exception as e:
+                        pull_error_details.append((item_id, item.get("artist"), item.get("title"), str(e)))
+                parts = []
+                if qty_updated or meta_updated:
+                    if qty_updated:
+                        parts.append(f"{qty_updated} Stückzahl")
+                    if meta_updated:
+                        parts.append(f"{meta_updated} Preis/Metadaten")
+                    st.session_state["inventory_success_message"] = "Von Shopify übernommen: " + ", ".join(parts) + "."
+                else:
+                    st.session_state["inventory_success_message"] = "Keine mit Shopify verknüpften Einträge zum Übernehmen."
+                if sync_error_details:
+                    st.session_state["shopify_sync_error_details"] = sync_error_details
+                if pull_error_details:
+                    st.session_state["shopify_metadata_pull_error_details"] = pull_error_details
+                st.session_state["inventory_refresh_needed"] = True
+                st.rerun()
+            # Nach Shopify übertragen (Stückzahl + Preis/Metadaten)
+            if st.button("⬆️ Nach Shopify übertragen", key="shopify_push_all", use_container_width=True, help="Stückzahl und Preis/Metadaten von der App nach Shopify senden (alle angezeigten, verknüpften Einträge)."):
+                to_push = [i for i in inventory if (i.get("shopify_product_id") or "").strip()]
+                pushed_qty = 0
+                pushed_meta = 0
+                push_error_details = []
+                meta_error_details = []
+                for item in to_push:
+                    item_id = item.get("id")
+                    sid = (item.get("shopify_product_id") or "").strip()
+                    qty_raw = item.get("quantity")
+                    if isinstance(qty_raw, str) and " von " in qty_raw:
+                        try:
+                            qty = int(qty_raw.split(" von ")[0])
+                        except (ValueError, IndexError):
+                            qty = 0
+                    else:
+                        qty = int(qty_raw if qty_raw is not None else 0)
+                    qty = max(0, qty)
+                    try:
+                        err_msg = shopify_client.set_inventory_quantity_for_product(sid, qty)
+                        if err_msg:
+                            push_error_details.append((item_id, item.get("artist"), item.get("title"), err_msg))
+                        else:
+                            pushed_qty += 1
+                    except Exception as e:
+                        push_error_details.append((item_id, item.get("artist"), item.get("title"), str(e)))
+                    try:
+                        record_data = _inventory_item_to_shopify_record(item)
+                        _add_shopify_zustand_to_record(record_data, db)
+                        err_msg = shopify_client.update_vinyl_product(sid, record_data)
+                        if err_msg:
+                            meta_error_details.append((item_id, item.get("artist"), item.get("title"), err_msg))
+                        else:
+                            pushed_meta += 1
+                    except Exception as e:
+                        meta_error_details.append((item_id, item.get("artist"), item.get("title"), str(e)))
+                parts = []
+                if pushed_qty or pushed_meta:
+                    if pushed_qty:
+                        parts.append(f"{pushed_qty} Stückzahl")
+                    if pushed_meta:
+                        parts.append(f"{pushed_meta} Preis/Metadaten")
+                    st.session_state["inventory_success_message"] = "Nach Shopify übertragen: " + ", ".join(parts) + "."
+                else:
+                    st.session_state["inventory_success_message"] = "Keine mit Shopify verknüpften Einträge zum Übertragen."
+                if push_error_details:
+                    st.session_state["shopify_push_error_details"] = push_error_details
+                if meta_error_details:
+                    st.session_state["shopify_metadata_push_error_details"] = meta_error_details
+                st.rerun()
+            with st.expander("🔧 Erweitert"):
+                current_ids = [i["id"] for i in inventory]
+                prev_selected = st.session_state.get("inventory_shopify_selected_ids", [])
+                default_selected = [x for x in prev_selected if x in current_ids]
+                selection_options = current_ids
+                def _format_inventory_option(item_id):
+                    it = next((i for i in inventory if i.get("id") == item_id), None)
+                    if it:
+                        return f"ID {item_id}: {it.get('artist', '')} – {it.get('title', '')}"
+                    return str(item_id)
+                st.multiselect(
+                    "Platten für Zurücksetzen auswählen",
+                    options=selection_options,
+                    default=default_selected,
+                    format_func=_format_inventory_option,
+                    key="inventory_shopify_selected_ids",
+                    help="Nur ausgewählte Einträge werden beim Button darunter zurückgesetzt."
+                )
+                ids_for_reset = st.session_state.get("inventory_shopify_selected_ids", [])
+                to_reset_selected = [i for i in inventory if i.get("id") in ids_for_reset and (i.get("shopify_product_id") or "").strip()]
+                if st.button(
+                    "Verknüpfung für ausgewählte zurücksetzen",
+                    key="shopify_reset_selected",
+                    use_container_width=True,
+                    help="Setzt die Shopify-Verknüpfung nur für die hier ausgewählten Platten zurück.",
+                    disabled=len(to_reset_selected) == 0,
+                ):
+                    db.ensure_inventory_shopify_product_id_column()
+                    reset_count = 0
+                    reset_errors = 0
+                    for i in to_reset_selected:
+                        try:
+                            db.update_record("inventory", i["id"], {"shopify_product_id": ""})
+                            reset_count += 1
+                        except Exception:
+                            reset_errors += 1
+                    if reset_count:
+                        msg = f"Verknüpfung für {reset_count} ausgewählte Platte(n) zurückgesetzt."
+                        if reset_errors:
+                            msg += f" ({reset_errors} Fehler.)"
+                        st.session_state["inventory_success_message"] = msg
+                    else:
+                        st.session_state["inventory_success_message"] = "Keine Verknüpfungen zum Zurücksetzen bei den Ausgewählten."
+                    st.session_state["inventory_shopify_selected_ids"] = [x for x in ids_for_reset if x not in [i["id"] for i in to_reset_selected]]
+                    st.session_state["inventory_refresh_needed"] = True
+                    st.rerun()
+                if len(ids_for_reset) > 0 and len(to_reset_selected) == 0:
+                    st.caption("Hinweis: Keine der ausgewählten Platten hat eine Shopify-Verknüpfung.")
+                if st.button(
+                    "Alle angezeigten Verknüpfungen zurücksetzen",
+                    key="shopify_bulk_reset",
+                    use_container_width=True,
+                    help="Löscht die gespeicherte Verknüpfung zu Shopify für alle angezeigten Einträge (z. B. nach Löschung der Produkte in Shopify).",
+                ):
+                    db.ensure_inventory_shopify_product_id_column()
+                    to_reset = [i for i in inventory if (i.get("shopify_product_id") or "").strip()]
+                    reset_count = 0
+                    reset_errors = 0
+                    for i in to_reset:
+                        try:
+                            db.update_record("inventory", i["id"], {"shopify_product_id": ""})
+                            reset_count += 1
+                        except Exception:
+                            reset_errors += 1
+                    if reset_count:
+                        msg = f"{reset_count} Verknüpfungen zurückgesetzt."
+                        if reset_errors:
+                            msg += f" ({reset_errors} Fehler beim Zurücksetzen.)"
+                        st.session_state["inventory_success_message"] = msg
+                    elif reset_errors and not reset_count:
+                        st.session_state["inventory_success_message"] = f"Zurücksetzen fehlgeschlagen ({reset_errors} Fehler)."
+                    else:
+                        st.session_state["inventory_success_message"] = "Keine Verknüpfungen zum Zurücksetzen bei den angezeigten Einträgen."
+                    st.rerun()
+            st.markdown("---")
+        
         # Erstelle DataFrame - WICHTIG: Die Reihenfolge aus inventory wird beibehalten
         # (die Sortierung wurde bereits in search_inventory angewendet)
         df = pd.DataFrame(inventory)
@@ -4073,15 +6435,6 @@ def show_inventory():
         if "year" in df.columns:
             df["year"] = df["year"].apply(lambda x: int(x) if pd.notna(x) and x else "")
         
-        # Lade Einstellung für Zustandsbewertung (vor Formatierung)
-        company_settings = db.get_company_settings() or {}
-        show_condition_rating = company_settings.get("show_condition_rating", 1) == 1
-        
-        # Formatierung für Zustands-Spalten nur wenn aktiviert
-        if show_condition_rating:
-            if "general_condition" in df.columns:
-                df["general_condition"] = df["general_condition"].apply(lambda x: condition_labels.get(x, x) if x else "VG")
-        
         # Status auf Deutsch konvertieren
         # WICHTIG: Speichere ursprünglichen Status vor Formatierung für Button-Logik
         if "status" in df.columns:
@@ -4099,12 +6452,8 @@ def show_inventory():
         # WICHTIG: ID Spalte ausblenden, aber im Hintergrund behalten für Auswahl
         # Wähle relevante Spalten für Anzeige (OHNE "id" und "max_quantity" - wird ausgeblendet, da in quantity integriert)
         
-        display_columns = ["artist", "title", "label", "cat_no", "year", "format",
+        display_columns = ["artist", "title", "label", "cat_no", "year", "format", "genre",
                           "purchase_price", "pricing", "quantity", "sold_quantity", "status", "created_at"]
-        
-        # Füge Zustands-Spalten nur hinzu wenn aktiviert
-        if show_condition_rating:
-            display_columns.extend(["general_condition"])
         
         available_columns = [col for col in display_columns if col in df.columns]
         
@@ -4116,11 +6465,11 @@ def show_inventory():
             "cat_no": "Katalog-Nr.",
             "year": "Jahr",
             "format": "Format",
+            "genre": "Genre",
             "purchase_price": "Einkaufspreis",
             "pricing": "Verkaufspreis",
             "quantity": "Stückzahl",
             "sold_quantity": "Verkaufte Einheiten",
-            "general_condition": "Allgemeiner Zustand",
             "status": "Status",
             "created_at": "Erfasst am"
         }
@@ -4162,12 +6511,26 @@ def show_inventory():
                     current_selection = option
                     break
         
-        selected_option = st.selectbox(
-            "Platte auswählen:",
-            selection_options,
-            index=selection_options.index(current_selection) if current_selection else 0,
-            key="vinyl_selection_dropdown"
-        )
+        col_sel, col_btn = st.columns([3, 1])
+        with col_sel:
+            selected_option = st.selectbox(
+                "Platte auswählen:",
+                selection_options,
+                index=selection_options.index(current_selection) if current_selection else 0,
+                key="vinyl_selection_dropdown"
+            )
+        with col_btn:
+            can_send = selected_option and selected_option != "-- Keine Auswahl --"
+            new_id = selection_dict.get(selected_option) if can_send else None
+            if st.button("📋 Zum Kleinanzeigen-Assistenten", key="inv_to_kleinanzeigen", use_container_width=True, disabled=not can_send, help="Platte zum Kleinanzeigen-Assistenten hinzufügen und dorthin wechseln"):
+                if new_id:
+                    if "kleinanzeigen_selected_ids" not in st.session_state:
+                        st.session_state.kleinanzeigen_selected_ids = []
+                    ids = st.session_state.kleinanzeigen_selected_ids
+                    if new_id not in ids:
+                        st.session_state.kleinanzeigen_selected_ids = list(ids) + [new_id]
+                    st.session_state.navigate_to = "📋 Kleinanzeigen-Assistent"
+                    st.rerun()
         
         # Speichere ausgewählte ID im Session State (nur wenn sich die Auswahl geändert hat)
         if selected_option and selected_option != "-- Keine Auswahl --":
@@ -4232,7 +6595,15 @@ def show_inventory():
                 # #endregion
         
         for idx, row in df_display.iterrows():
-            html_table += "<tr>"
+            # Hervorhebung für Zeilen, die noch nicht bei Shopify hochgeladen sind
+            not_on_shopify = False
+            if idx < len(df_list):
+                item = df_list[int(idx)]
+                not_on_shopify = not ((item.get("shopify_product_id") or "").strip())
+            if not_on_shopify:
+                html_table += "<tr style='background-color: #e7f3ff;'>"
+            else:
+                html_table += "<tr>"
             for col in df_display.columns:
                 value = str(row[col]) if pd.notna(row[col]) else ""
                 # "Nr." Spalte zentriert formatieren
@@ -4252,21 +6623,265 @@ def show_inventory():
         
         st.markdown("---")
         
-        # Export-Option (mit deutschen Spaltennamen und "Nr." Spalte, aber ohne ID)
-        csv = df_display.to_csv(index=False)
-        st.download_button(
-            label="📥 Als CSV exportieren",
-            data=csv,
-            file_name=f"inventory_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-            mime="text/csv"
-        )
+        # Export: interne Spaltennamen, keine Formatierung, zum Wiedereinfuegen geeignet
+        _inventory_export_columns = [
+            "artist", "title", "label", "cat_no", "year", "format", "genre", "pricing", "purchase_price",
+            "quantity", "max_quantity", "status", "media_condition", "sleeve_condition",
+            "general_condition", "individual_condition_enabled", "individual_condition_text",
+            "tracklist", "image_paths", "condition_grading"
+        ]
+        export_rows = []
+        for item in inventory:
+            row = {}
+            for col in _inventory_export_columns:
+                val = item.get(col)
+                if val is None:
+                    if col in ("quantity", "max_quantity", "individual_condition_enabled"):
+                        row[col] = 0
+                    elif col in ("pricing", "purchase_price"):
+                        row[col] = 0.0
+                    elif col == "year":
+                        row[col] = ""
+                    else:
+                        row[col] = ""
+                elif isinstance(val, (list, dict)):
+                    row[col] = json.dumps(val, ensure_ascii=False) if val else ""
+                else:
+                    row[col] = val
+            export_rows.append(row)
+        if export_rows:
+            df_export = pd.DataFrame(export_rows, columns=_inventory_export_columns)
+            csv_roundtrip = df_export.to_csv(index=False, encoding="utf-8-sig", quoting=csv.QUOTE_NONNUMERIC)
+            st.download_button(
+                label="📥 Inventar als CSV exportieren",
+                data=csv_roundtrip,
+                file_name=f"inventory_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                mime="text/csv",
+                key="inventory_export_roundtrip"
+            )
+        st.caption("Exportierte CSV mit denselben Spalten unten zum Wiedereinfuegen hochladen. Duplikate (gleiche Katalognummer) werden aktualisiert.")
     else:
         st.info("🔍 Keine Einträge gefunden. Passen Sie die Filter an oder fügen Sie neue Einträge hinzu.")
+    
+    # Inventar importieren (Round-Trip-Format wie beim Export) – nur hier bei Inventar sichtbar
+    st.markdown("---")
+    st.markdown("#### 📋 Inventar importieren")
+    st.markdown("Laden Sie eine CSV-Datei hoch, die Sie zuvor mit dem Inventar-Export erstellt haben. Eintraege mit gleicher Katalognummer werden aktualisiert (Menge addiert), sonst neu angelegt.")
+    uploaded_inventory_csv = st.file_uploader(
+        "CSV-Datei auswaehlen",
+        type=["csv"],
+        help="UTF-8-CSV mit Spalten: artist, title, label, cat_no, year, format, pricing, purchase_price, quantity, max_quantity, status, ...",
+        key="upload_inventory_csv"
+    )
+    if uploaded_inventory_csv is not None:
+        if st.button("📤 Inventar aus CSV einfügen", type="primary", use_container_width=True, key="import_inventory_csv"):
+            db_inv = st.session_state.get("db")
+            if not db_inv:
+                st.error("Keine Datenbankverbindung.")
+            else:
+                try:
+                    raw = uploaded_inventory_csv.getvalue().decode("utf-8-sig") or uploaded_inventory_csv.getvalue().decode("utf-8")
+                    df_imp = pd.read_csv(io.StringIO(raw), dtype=str, keep_default_na=False)
+                except Exception as e:
+                    st.error(f"CSV konnte nicht gelesen werden: {e}")
+                    df_imp = None
+                if df_imp is not None and not df_imp.empty:
+                    allowed_cols = [
+                        "artist", "title", "label", "cat_no", "year", "format", "genre", "pricing", "purchase_price",
+                        "quantity", "max_quantity", "status", "media_condition", "sleeve_condition",
+                        "general_condition", "individual_condition_enabled", "individual_condition_text",
+                        "tracklist", "image_paths", "condition_grading"
+                    ]
+                    inserted = 0
+                    updated = 0
+                    errors = 0
+                    for idx, row in df_imp.iterrows():
+                        record = {}
+                        for col in allowed_cols:
+                            if col not in df_imp.columns:
+                                continue
+                            v = row.get(col, "")
+                            if pd.isna(v) or v == "":
+                                if col in ("quantity", "max_quantity", "individual_condition_enabled"):
+                                    record[col] = 0
+                                elif col in ("pricing", "purchase_price"):
+                                    record[col] = 0.0
+                                elif col == "year":
+                                    record[col] = None
+                                else:
+                                    record[col] = "" if col != "year" else None
+                            else:
+                                if col in ("quantity", "max_quantity", "individual_condition_enabled"):
+                                    try:
+                                        record[col] = int(float(str(v).strip()))
+                                    except (ValueError, TypeError):
+                                        record[col] = 0
+                                elif col in ("pricing", "purchase_price"):
+                                    try:
+                                        record[col] = float(str(v).replace(",", ".").strip())
+                                    except (ValueError, TypeError):
+                                        record[col] = 0.0
+                                elif col == "year":
+                                    try:
+                                        y = str(v).strip()
+                                        record[col] = int(float(y)) if y else None
+                                    except (ValueError, TypeError):
+                                        record[col] = None
+                                else:
+                                    record[col] = str(v).strip() if v is not None else ""
+                        if not record.get("artist") and not record.get("title"):
+                            continue
+                        if not record.get("artist"):
+                            record["artist"] = ""
+                        if not record.get("title"):
+                            record["title"] = ""
+                        if "cat_no" not in record or record.get("cat_no") is None:
+                            record["cat_no"] = ""
+                        try:
+                            out = db_inv.sync_to_inventory(record)
+                            if out.get("status") == "inserted":
+                                inserted += 1
+                            else:
+                                updated += 1
+                        except Exception:
+                            errors += 1
+                    st.success(f"Import abgeschlossen: {inserted} neu eingefuegt, {updated} aktualisiert." + (f" {errors} Zeilen mit Fehler." if errors else ""))
+                    st.session_state["inventory_refresh_needed"] = True
+                elif df_imp is not None and df_imp.empty:
+                    st.warning("Die CSV-Datei enthaelt keine Zeilen.")
     
     # Detailansicht wenn eine Platte ausgewählt wurde
     if st.session_state.get("selected_vinyl_id"):
         st.markdown("---")
         show_vinyl_detail_view(st.session_state.selected_vinyl_id, db)
+
+
+def _resolve_inventory_image_paths(image_paths_raw: Any, base_dir: Path) -> List[str]:
+    """
+    Löst image_paths aus der DB zu absoluten Pfaden auf; nur existierende Dateien.
+    
+    Args:
+        image_paths_raw: image_paths aus Item (str/JSON-Liste oder Liste).
+        base_dir: Basisverzeichnis für relative Pfade (z.B. Path(BASE_DIR)).
+    
+    Returns:
+        Liste absoluter Pfade zu existierenden Dateien.
+    """
+    if not image_paths_raw:
+        return []
+    paths: List[str] = []
+    if isinstance(image_paths_raw, list):
+        for p in image_paths_raw:
+            if isinstance(p, str) and p.strip():
+                paths.append(p.strip())
+            elif p is not None:
+                paths.append(str(p))
+    elif isinstance(image_paths_raw, str):
+        s = image_paths_raw.strip()
+        if not s:
+            return []
+        try:
+            parsed = json.loads(s)
+            if isinstance(parsed, list):
+                for p in parsed:
+                    if isinstance(p, str) and p.strip():
+                        paths.append(p.strip())
+                    elif p is not None:
+                        paths.append(str(p))
+            elif isinstance(parsed, str) and parsed.strip():
+                paths.append(parsed.strip())
+        except (json.JSONDecodeError, TypeError):
+            paths.append(s)
+    base = base_dir.resolve() if base_dir else Path.cwd()
+    result: List[str] = []
+    for p in paths:
+        path_obj = Path(p)
+        if not path_obj.is_absolute():
+            path_obj = base / path_obj
+        path_obj = path_obj.resolve()
+        if path_obj.is_file():
+            result.append(str(path_obj))
+    return result
+
+
+def _inventory_item_to_shopify_record(item: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Baut aus einem Inventar-Datensatz das record_data-Dict für create_vinyl_product.
+    """
+    media = (item.get("media_condition") or item.get("general_condition") or "").strip()
+    sleeve = (item.get("sleeve_condition") or item.get("general_condition") or "").strip()
+    # Rohe Stückzahl für Shopify: bei "X von Y" die erste Zahl, sonst quantity; Fallback 1
+    quantity_raw = item.get("quantity")
+    if isinstance(quantity_raw, str) and " von " in quantity_raw:
+        try:
+            quantity = int(quantity_raw.split(" von ")[0])
+        except (ValueError, IndexError):
+            quantity = 1
+    else:
+        quantity = int(quantity_raw if quantity_raw is not None else 1)
+    quantity = max(0, quantity)
+    individual_enabled = item.get("individual_condition_enabled") or 0
+    individual_text = (item.get("individual_condition_text") or "").strip() or None
+    return {
+        "id": item.get("id"),
+        "artist": (item.get("artist") or "").strip(),
+        "title": (item.get("title") or "").strip(),
+        "label": (item.get("label") or "").strip(),
+        "cat_no": (item.get("cat_no") or "").strip(),
+        "year": item.get("year"),
+        "format": (item.get("format") or "").strip(),
+        "genre": (item.get("genre") or "").strip(),
+        "pricing": item.get("pricing"),
+        "tracklist": item.get("tracklist"),
+        "media_condition": media or None,
+        "sleeve_condition": sleeve or None,
+        "general_condition": (item.get("general_condition") or "").strip(),
+        "quantity": quantity,
+        "individual_condition_enabled": 1 if individual_enabled else 0,
+        "individual_condition_text": individual_text,
+    }
+
+
+# Shopify-Zustandsbeschreibung: Standardtexte (bearbeitbar in Einstellungen)
+SHOPIFY_ZUSTAND_DEFAULT_1 = (
+    "Bei diesem Angebot handelt es sich um einen allgemeinen Artikel ohne detaillierte Zustandsbewertung. "
+    "Die Abbildung des Artikels ist ein von uns aufgenommenes Beispielbild und muss nicht exakt dem zu erwerbenden Artikel entsprechen."
+)
+SHOPIFY_ZUSTAND_DEFAULT_2 = (
+    "Der angebotene Artikel ist gebraucht und kann dem Alter entsprechende Gebrauchsspuren aufweisen."
+)
+SHOPIFY_ZUSTAND_DEFAULT_3 = (
+    "Wir legen stetig einen sehr hohen Wert auf die Qualität unserer angebotenen Ware."
+)
+SHOPIFY_ZUSTAND_AFTER_CONDITION_DEFAULT = (
+    "Sollten Sie unerwarteter Weise doch einmal nicht zufrieden mit der Qualität Ihres erworbenen Artikels sein, "
+    "dann kontaktieren Sie uns bitte ebenfalls. Wir finden immer eine Lösung für Ihr Problem."
+)
+
+
+SHOPIFY_DEFAULT_CATEGORY = "Schallplatten und LPs in Musik & Tonaufnahmen"
+
+
+def _add_shopify_zustand_to_record(record_data: Dict[str, Any], db: Database) -> None:
+    """
+    Ergänzt record_data um die vier konfigurierbaren Zustandsabsätze und den
+    Zustandstext für die allgemeine Zustandsbewertung aus den Einstellungen.
+    Modifiziert record_data in-place.
+    """
+    settings = db.get_company_settings() or {}
+    record_data["shopify_zustand_1"] = (settings.get("shopify_zustand_1") or "").strip() or SHOPIFY_ZUSTAND_DEFAULT_1
+    record_data["shopify_zustand_2"] = (settings.get("shopify_zustand_2") or "").strip() or SHOPIFY_ZUSTAND_DEFAULT_2
+    record_data["shopify_zustand_3"] = (settings.get("shopify_zustand_3") or "").strip() or SHOPIFY_ZUSTAND_DEFAULT_3
+    record_data["shopify_zustand_customer"] = (settings.get("shopify_zustand_customer") or "").strip()
+    record_data["shopify_zustand_after_condition"] = (settings.get("shopify_zustand_after_condition") or "").strip() or SHOPIFY_ZUSTAND_AFTER_CONDITION_DEFAULT
+    # Zustandstext für allgemeine Zustandsbewertung (condition_texts: M, NM, VG+, VG, G, P)
+    try:
+        condition_texts = json.loads(settings.get("condition_texts") or "{}")
+    except (TypeError, ValueError):
+        condition_texts = {}
+    general_condition = (record_data.get("general_condition") or "").strip()
+    record_data["shopify_zustand_general"] = (condition_texts.get(general_condition, "") or "").strip()
+    record_data["shopify_category"] = (settings.get("shopify_default_category") or "").strip() or SHOPIFY_DEFAULT_CATEGORY
 
 
 def show_vinyl_detail_view(item_id: int, db: Database, inline: bool = False):
@@ -4301,6 +6916,91 @@ def show_vinyl_detail_view(item_id: int, db: Database, inline: bool = False):
                 del st.session_state.vinyl_selection_dropdown
             st.session_state.edit_vinyl_data = {}
             st.session_state.edit_tracklist_table = {}
+            st.rerun()
+    
+    # Shopify: Einzel-Upload (nur wenn verbunden)
+    shopify_client = st.session_state.get("shopify_client")
+    if shopify_client and not inline:
+        st.markdown("---")
+        st.subheader("🛒 Shopify")
+        shopify_product_id = (item.get("shopify_product_id") or "").strip()
+        if shopify_product_id:
+            st.success("✅ Bereits in Shopify hochgeladen.")
+            api_settings = db.get_company_settings() or {}
+            store = (api_settings.get("shopify_store_url") or "").strip()
+            store = normalize_shopify_store_url(store) if store else ""
+            if store:
+                numeric_id = shopify_product_id.split("/")[-1]
+                admin_url = f"https://{store}/admin/products/{numeric_id}"
+                st.link_button("In Shopify öffnen", admin_url, use_container_width=True)
+            if st.button("⬇️ Von Shopify übernehmen", key=f"shopify_pull_one_{item_id}", use_container_width=True, help="Stückzahl und Preis/Metadaten von Shopify in die App holen."):
+                available, err_q = shopify_client.get_inventory_available_for_product(shopify_product_id)
+                if err_q:
+                    st.error(f"❌ Stückzahl: {err_q}")
+                elif available is not None:
+                    status = "sold" if available == 0 else "available"
+                    db.update_record("inventory", item_id, {"quantity": available, "max_quantity": available, "status": status})
+                record_data, err_m = shopify_client.get_product_details_for_sync(shopify_product_id)
+                if err_m:
+                    st.error(f"❌ Metadaten: {err_m}")
+                elif record_data:
+                    db.update_record("inventory", item_id, record_data)
+                if not err_q and not err_m:
+                    st.success("Von Shopify übernommen.")
+                    st.session_state["inventory_refresh_needed"] = True
+                    st.rerun()
+            if st.button("⬆️ Nach Shopify übertragen", key=f"shopify_push_one_{item_id}", use_container_width=True, help="Stückzahl und Preis/Metadaten von der App nach Shopify senden."):
+                qty_raw = item.get("quantity")
+                qty = int(qty_raw.split(" von ")[0]) if isinstance(qty_raw, str) and " von " in qty_raw else int(qty_raw if qty_raw is not None else 0)
+                qty = max(0, qty)
+                err_q = shopify_client.set_inventory_quantity_for_product(shopify_product_id, qty)
+                record_data = _inventory_item_to_shopify_record(item)
+                _add_shopify_zustand_to_record(record_data, db)
+                err_m = shopify_client.update_vinyl_product(shopify_product_id, record_data)
+                if err_q:
+                    st.error(f"❌ Stückzahl: {err_q}")
+                if err_m:
+                    st.error(f"❌ Metadaten: {err_m}")
+                if not err_q and not err_m:
+                    st.success("Nach Shopify übertragen.")
+                    st.rerun()
+            if st.button("🔄 Verknüpfung zurücksetzen", key=f"shopify_reset_{item_id}", use_container_width=True, help="Löscht die gespeicherte Verknüpfung (z. B. wenn das Produkt in Shopify gelöscht wurde). Danach kannst du erneut hochladen."):
+                try:
+                    db.ensure_inventory_shopify_product_id_column()
+                    db.update_record("inventory", item_id, {"shopify_product_id": ""})
+                    st.success("Verknüpfung zurückgesetzt. Du kannst die Platte erneut zu Shopify hochladen.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"❌ Zurücksetzen fehlgeschlagen: {e}")
+        else:
+            if st.button("🛒 Nach Shopify hochladen", key=f"shopify_upload_{item_id}", use_container_width=True):
+                record_data = _inventory_item_to_shopify_record(item)
+                _add_shopify_zustand_to_record(record_data, db)
+                resolved_paths = _resolve_inventory_image_paths(item.get("image_paths"), Path(COVERS_ABS).parent)
+                product_id, err_msg, pub_warning = shopify_client.create_vinyl_product(record_data, image_paths=resolved_paths)
+                if err_msg:
+                    st.error(f"❌ {err_msg}")
+                else:
+                    try:
+                        db.ensure_inventory_shopify_product_id_column()
+                        db.update_record("inventory", item_id, {"shopify_product_id": product_id})
+                        st.success("✅ Erfolgreich in Shopify hochgeladen.")
+                        if pub_warning:
+                            st.warning(f"Produkt erstellt, aber nicht im Shop sichtbar: {pub_warning}")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"❌ Produkt in Shopify erstellt, aber Speichern der ID fehlgeschlagen: {e}")
+    
+    # Zum Kleinanzeigen-Assistenten
+    if not inline:
+        st.markdown("---")
+        if st.button("📋 Zum Kleinanzeigen-Assistenten", key=f"to_kleinanzeigen_{item_id}", use_container_width=True, help="Fügt diese Platte dem Kleinanzeigen-Assistenten hinzu und wechselt dorthin."):
+            if "kleinanzeigen_selected_ids" not in st.session_state:
+                st.session_state.kleinanzeigen_selected_ids = []
+            ids = st.session_state.kleinanzeigen_selected_ids
+            if item_id not in ids:
+                st.session_state.kleinanzeigen_selected_ids = list(ids) + [item_id]
+            st.session_state.navigate_to = "📋 Kleinanzeigen-Assistent"
             st.rerun()
     
     st.markdown("---")
@@ -4452,8 +7152,8 @@ def show_vinyl_detail_view(item_id: int, db: Database, inline: bool = False):
                 cols = st.columns(min(3, num_images))
             
             images_found = False
-            # Basis-Verzeichnis für relative Pfade (Verzeichnis der app.py)
-            base_dir = Path(__file__).parent.resolve()
+            # Basis-Verzeichnis für relative Pfade (vinyl_images liegt unter COVERS_ABS; parent = Basis für "vinyl_images/...")
+            base_dir = Path(COVERS_ABS).parent.resolve()
             
             for idx, img_path in enumerate(image_list):
                 if img_path:
@@ -4495,6 +7195,20 @@ def show_vinyl_detail_view(item_id: int, db: Database, inline: bool = False):
                         if img_path_str and not os.path.isabs(img_path_str):
                             img_path_str = os.path.join(os.getcwd(), img_path_str)
                         img_path_str = os.path.normpath(img_path_str)
+                    
+                    # Fallback: absoluter Pfad existiert nicht (z. B. DB von anderem PC) – versuche vinyl_images/ relativ zu COVERS_ABS-Basis
+                    if img_path_str and Path(img_path_str).is_absolute() and not Path(img_path_str).exists():
+                        path_str_norm = img_path_str.replace("\\", "/")
+                        if "vinyl_images" in path_str_norm:
+                            try:
+                                idx_vin = path_str_norm.index("vinyl_images")
+                                suffix = path_str_norm[idx_vin:]
+                                candidate = base_dir / suffix
+                                candidate = candidate.resolve()
+                                if candidate.is_file():
+                                    img_path_str = str(candidate)
+                            except (ValueError, OSError):
+                                pass
                     
                     # Prüfe ob Datei existiert
                     if img_path_str and Path(img_path_str).exists():
@@ -4546,7 +7260,7 @@ def show_vinyl_detail_view(item_id: int, db: Database, inline: bool = False):
                             
                             debug_info.append(f"**Datei existiert:** {Path(img_path_str).exists() if img_path_str else 'N/A'}")
                             debug_info.append(f"**Absoluter Pfad:** {Path(img_path_str).is_absolute() if img_path_str else 'N/A'}")
-                            debug_info.append(f"**Basis-Verzeichnis (app.py):** {base_dir}")
+                            debug_info.append(f"**Basis-Verzeichnis (BASE_DIR):** {base_dir}")
                             debug_info.append(f"**Arbeitsverzeichnis:** {os.getcwd()}")
                             
                             with st.expander("🔍 Debug-Informationen"):
@@ -4677,6 +7391,7 @@ def show_vinyl_detail_view(item_id: int, db: Database, inline: bool = False):
             "cat_no": item.get("cat_no", ""),
             "year": item.get("year"),
             "format": item.get("format", ""),
+            "genre": item.get("genre", ""),
             "pricing": item.get("pricing", 0.0),
             "purchase_price": item.get("purchase_price"),
             "quantity": quantity_from_db,  # WICHTIG: Verwende rohe, nicht formatierte Werte
@@ -4740,6 +7455,9 @@ def show_vinyl_detail_view(item_id: int, db: Database, inline: bool = False):
                 edit_data["format"] = ""
         else:
             edit_data["format"] = format_selection
+        
+        genre = st.text_input("Genre", value=edit_data.get("genre", ""), key="edit_genre")
+        edit_data["genre"] = genre
         
         # Hole rohe quantity und max_quantity Werte (nicht formatiert)
         quantity_raw = edit_data.get("quantity", 1)
@@ -4945,16 +7663,9 @@ def show_vinyl_detail_view(item_id: int, db: Database, inline: bool = False):
     # Trackliste bearbeiten
     st.subheader("🎵 Trackliste")
     
-    # Lade Trackliste aus Datenbank (JSON-String)
-    tracklist_json = edit_data.get("tracklist", "")
-    if tracklist_json:
-        try:
-            tracklist_table = json.loads(tracklist_json)
-        except:
-            # Fallback: Versuche als String zu parsen
-            tracklist_table = parse_tracklist_to_table(tracklist_json)
-    else:
-        tracklist_table = []
+    # Lade Trackliste aus Datenbank (unterstützt JSON, Dict, HTML, Plain-Text; leitet Seite aus Position ab)
+    tracklist_raw = edit_data.get("tracklist", "")
+    tracklist_table = _extract_tracklist_table(tracklist_raw) if tracklist_raw else []
     
     # Initialisiere edit_tracklist_table im Session State
     if "edit_tracklist_table" not in st.session_state or st.session_state.edit_tracklist_table.get("_id") != item_id:
@@ -5138,7 +7849,7 @@ def show_vinyl_detail_view(item_id: int, db: Database, inline: bool = False):
                     return None
                 
                 # Erstelle Basisverzeichnis für Vinyl-Bilder
-                base_dir = Path("vinyl_images")
+                base_dir = Path(COVERS_ABS)
                 base_dir.mkdir(exist_ok=True)
                 
                 permanent_paths = []
@@ -5242,6 +7953,7 @@ def show_vinyl_detail_view(item_id: int, db: Database, inline: bool = False):
                 "cat_no": cat_no if cat_no else None,
                 "year": year if year and year > 0 else None,
                 "format": edit_data.get("format") if edit_data.get("format") else None,
+                "genre": (edit_data.get("genre") or "").strip() or None,
                 "pricing": float(pricing) if pricing else None,
                 "purchase_price": float(purchase_price) if purchase_price is not None else None,
                 "quantity": new_quantity,
@@ -5280,38 +7992,14 @@ def show_vinyl_detail_view(item_id: int, db: Database, inline: bool = False):
         show_success_message("", save_vinyl_key)
     
     with col_delete:
-        if st.button("🗑️ Datensatz löschen", type="secondary", use_container_width=True, key=f"delete_vinyl_button_{item_id}"):
-            st.session_state.show_delete_confirm = True
-    
+        _render_delete_vinyl_fragment(item_id, item, db)
+
     with col_cancel:
         if st.button("❌ Abbrechen", use_container_width=True, key=f"cancel_edit_{item_id}"):
             st.session_state.edit_vinyl_data = {}
             st.session_state.edit_tracklist_table = {}
             st.session_state.selected_vinyl_id = None
             st.rerun()
-    
-    # Lösch-Bestätigung
-    if st.session_state.get("show_delete_confirm", False):
-        st.warning("⚠️ **Sicherheitsabfrage:** Möchten Sie diese Platte wirklich aus dem Inventar entfernen?")
-        col_confirm, col_cancel_del = st.columns(2)
-        
-        with col_confirm:
-            if st.button("✅ Ja, endgültig löschen", type="primary", use_container_width=True, key=f"confirm_delete_{item_id}"):
-                success = db.delete_record("inventory", item_id)
-                if success:
-                    st.success("✅ Platte erfolgreich gelöscht!")
-                    st.session_state.edit_vinyl_data = {}
-                    st.session_state.edit_tracklist_table = {}
-                    st.session_state.selected_vinyl_id = None
-                    st.session_state.show_delete_confirm = False
-                    st.rerun()
-                else:
-                    st.error("❌ Fehler beim Löschen der Platte.")
-        
-        with col_cancel_del:
-            if st.button("❌ Abbrechen", use_container_width=True, key=f"cancel_delete_{item_id}"):
-                st.session_state.show_delete_confirm = False
-                st.rerun()
 
 
 def migrate_existing_images():
@@ -5320,8 +8008,8 @@ def migrate_existing_images():
     Erstellt für jede Platte einen eigenen Ordner basierend auf Artist-Title.
     """
     db = st.session_state.db
-    base_dir = Path("vinyl_images")
-    images_dir = Path("images")
+    base_dir = Path(COVERS_ABS)
+    images_dir = Path(BASE_DIR) / "images"
     
     # Prüfe ob images/ Verzeichnis existiert
     if not images_dir.exists():
@@ -5428,221 +8116,127 @@ def migrate_existing_images():
         }
 
 
-def check_local_data_status() -> Dict[str, Any]:
-    """Prüft ob lokale Daten vorhanden sind und gibt Status zurück."""
-    status = {
-        "db_exists": False,
-        "db_size": 0,
-        "images_exists": False,
-        "images_count": 0,
-        "invoices_exists": False,
-        "invoices_count": 0,
-        "total_size": 0
-    }
-    
-    # Prüfe Datenbank
-    db_path = Path("vinyl.db")
-    if db_path.exists():
-        status["db_exists"] = True
-        status["db_size"] = db_path.stat().st_size
-        status["total_size"] += status["db_size"]
-    
-    # Prüfe WAL-Dateien
-    for wal_file in ["vinyl.db-shm", "vinyl.db-wal"]:
-        wal_path = Path(wal_file)
-        if wal_path.exists():
-            status["total_size"] += wal_path.stat().st_size
-    
-    # Prüfe Bilder
-    images_dir = Path("vinyl_images")
-    if images_dir.exists() and images_dir.is_dir():
-        status["images_exists"] = True
-        image_files = list(images_dir.rglob("*.jpg")) + list(images_dir.rglob("*.jpeg")) + list(images_dir.rglob("*.png"))
-        status["images_count"] = len(image_files)
-        for img_file in image_files:
-            status["total_size"] += img_file.stat().st_size
-    
-    # Prüfe Rechnungen
-    invoices_dir = Path("invoices")
-    if invoices_dir.exists() and invoices_dir.is_dir():
-        status["invoices_exists"] = True
-        pdf_files = list(invoices_dir.glob("*.pdf"))
-        status["invoices_count"] = len(pdf_files)
-        for pdf_file in pdf_files:
-            status["total_size"] += pdf_file.stat().st_size
-    
-    return status
-
-
-def download_database_zip() -> Optional[bytes]:
-    """Erstellt ZIP-Datei mit allen lokalen Daten."""
-    try:
-        # #region agent log
-        import json as json_log
-        import os as os_log
-        log_path = os.path.join(BASE_DIR, ".cursor", "debug.log")
+@st.fragment
+def _render_discogs_test_fragment(discogs_token: str) -> None:
+    """Discogs API-Test UI als Fragment – nur dieser Block aktualisiert sich beim Klick (kein voller Seiten-Reload)."""
+    st.caption("Optional: API-Test – prüft, ob Suche und Release-Daten (z. B. Jahr) von Discogs ankommen.")
+    if st.button("🔍 Discogs API-Test ausführen", key="discogs_api_test_btn", help="Führt eine Test-Suche durch und zeigt die Antwort der API inkl. Jahr/Veröffentlicht."):
         try:
-            cwd = Path.cwd()
-            cwd_str = str(cwd)
-            cwd_abs = str(cwd.resolve())
-            with open(log_path, "a", encoding="utf-8") as f_log:
-                f_log.write(json_log.dumps({"sessionId":"debug-session","runId":"pre-fix","hypothesisId":"B","location":"app.py:4195","message":"download_database_zip entry","data":{"cwd":cwd_str,"cwd_abs":cwd_abs},"timestamp":int(os_log.path.getmtime(log_path) if os_log.path.exists(log_path) else 0)}) + "\n")
-        except Exception as log_e:
-            pass
-        # #endregion
-        
-        # Erstelle temporäres ZIP im Speicher
-        zip_buffer = tempfile.NamedTemporaryFile(delete=False, suffix='.zip')
-        zip_path = zip_buffer.name
-        zip_buffer.close()
-        
-        # Aktuell genutzte Datenbank (z. B. vinyl_localhost.db) oder Fallback vinyl.db
-        db_file_name = "vinyl.db"
-        if "db" in st.session_state and hasattr(st.session_state.db, "db_path"):
-            db_file_name = st.session_state.db.db_path
-        
-        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-            # Füge Datenbank hinzu
-            db_path = Path(db_file_name)
-            if db_path.exists():
-                zipf.write(db_path, db_file_name)
-            
-            # Füge WAL-Dateien hinzu
-            for wal_file in [f"{db_file_name}-shm", f"{db_file_name}-wal"]:
-                wal_path = Path(wal_file)
-                if wal_path.exists():
-                    zipf.write(wal_path, wal_file)
-            
-            # Füge Bilder hinzu
-            images_dir = Path("vinyl_images").resolve()
-            # #region agent log
-            try:
-                images_dir_str = str(images_dir)
-                images_dir_abs = str(images_dir.resolve()) if images_dir.exists() else "not_exists"
-                images_dir_is_abs = images_dir.is_absolute()
-                with open(log_path, "a", encoding="utf-8") as f_log:
-                    f_log.write(json_log.dumps({"sessionId":"debug-session","runId":"pre-fix","hypothesisId":"E","location":"app.py:4216","message":"images_dir before rglob","data":{"images_dir":images_dir_str,"images_dir_abs":images_dir_abs,"is_absolute":images_dir_is_abs,"exists":images_dir.exists()},"timestamp":int(os_log.path.getmtime(log_path) if os_log.path.exists(log_path) else 0)}) + "\n")
-            except Exception as log_e:
-                pass
-            # #endregion
-            if images_dir.exists() and images_dir.is_dir():
-                for img_file in images_dir.rglob("*"):
-                    if img_file.is_file():
-                        # #region agent log
-                        try:
-                            img_file_str = str(img_file)
-                            img_file_abs = str(img_file.resolve())
-                            img_file_is_abs = img_file.is_absolute()
-                            cwd_for_rel = str(Path.cwd())
-                            try:
-                                rel_attempt = img_file.relative_to(Path.cwd())
-                                rel_str = str(rel_attempt)
-                                rel_success = True
-                            except ValueError as rel_err:
-                                rel_str = str(rel_err)
-                                rel_success = False
-                            with open(log_path, "a", encoding="utf-8") as f_log:
-                                f_log.write(json_log.dumps({"sessionId":"debug-session","runId":"pre-fix","hypothesisId":"A","location":"app.py:4220","message":"before relative_to","data":{"img_file":img_file_str,"img_file_abs":img_file_abs,"img_file_is_abs":img_file_is_abs,"cwd":cwd_for_rel,"relative_to_success":rel_success,"relative_to_result":rel_str},"timestamp":int(os_log.path.getmtime(log_path) if os_log.path.exists(log_path) else 0)}) + "\n")
-                        except Exception as log_e:
-                            pass
-                        # #endregion
-                        arcname = img_file.relative_to(Path.cwd())
-                        zipf.write(img_file, str(arcname).replace("\\", "/"))
-            
-            # Füge Rechnungen hinzu
-            invoices_dir = Path("invoices").resolve()
-            if invoices_dir.exists() and invoices_dir.is_dir():
-                for pdf_file in invoices_dir.glob("*.pdf"):
-                    arcname = pdf_file.relative_to(Path.cwd())
-                    zipf.write(pdf_file, str(arcname).replace("\\", "/"))
-        
-        # Lese ZIP-Datei
-        with open(zip_path, 'rb') as f:
-            zip_data = f.read()
-        
-        # Lösche temporäre Datei
-        os.unlink(zip_path)
-        
-        return zip_data
-    except Exception as e:
-        # #region agent log
-        try:
-            import json as json_log
-            import os as os_log
-            import traceback
-            log_path = os.path.join(BASE_DIR, ".cursor", "debug.log")
-            with open(log_path, "a", encoding="utf-8") as f_log:
-                f_log.write(json_log.dumps({"sessionId":"debug-session","runId":"pre-fix","hypothesisId":"ALL","location":"app.py:4238","message":"exception caught","data":{"error_type":type(e).__name__,"error_msg":str(e),"traceback":traceback.format_exc()},"timestamp":int(os_log.path.getmtime(log_path) if os_log.path.exists(log_path) else 0)}) + "\n")
-        except Exception as log_e:
-            pass
-        # #endregion
-        st.error(f"Fehler beim Erstellen der ZIP-Datei: {e}")
-        return None
-
-
-def upload_database_zip(uploaded_file) -> Dict[str, Any]:
-    """Lädt ZIP hoch und extrahiert Daten."""
-    try:
-        # Validiere Dateityp
-        if uploaded_file.type != "application/zip" and not uploaded_file.name.endswith('.zip'):
-            return {"success": False, "message": "Bitte laden Sie eine ZIP-Datei hoch."}
-        
-        # Erstelle Backup-Verzeichnis
-        backup_dir = Path("backups")
-        backup_dir.mkdir(exist_ok=True)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        backup_zip = backup_dir / f"backup_{timestamp}.zip"
-        
-        # Erstelle Backup der aktuellen Daten
-        current_backup = download_database_zip()
-        if current_backup:
-            with open(backup_zip, 'wb') as f:
-                f.write(current_backup)
-        
-        # Unter Windows bleiben DB-Dateien oft gemappt (WinError 1224).
-        # ZIP in persistenten Ordner pending_restore extrahieren, DB schließen,
-        # Flag setzen; im nächsten Run (bevor DB geöffnet wird) nach cwd kopieren.
-        restore_dir = Path.cwd() / "pending_restore"
-        if restore_dir.exists():
-            shutil.rmtree(restore_dir)
-        restore_dir.mkdir()
-        
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".zip") as tmp:
-            tmp.write(uploaded_file.getvalue())
-            zip_path = tmp.name
-        try:
-            with zipfile.ZipFile(zip_path, 'r') as zipf:
-                file_list = zipf.namelist()
-                has_db = any('vinyl' in f and f.endswith('.db') for f in file_list)
-                has_images = any('vinyl_images' in f for f in file_list)
-                has_invoices = any('invoices' in f for f in file_list)
-                if not has_db and not has_images and not has_invoices:
-                    os.unlink(zip_path)
-                    return {"success": False, "message": "ZIP-Datei enthält keine gültigen Daten (vinyl.db/vinyl_*.db, vinyl_images/ oder invoices/)."}
-                zipf.extractall(restore_dir)
-        finally:
-            try:
-                os.unlink(zip_path)
-            except Exception:
-                pass
-        
-        if "db" in st.session_state:
-            try:
-                st.session_state.db.close()
-            except Exception:
-                pass
-            del st.session_state["db"]
-        st.session_state["pending_restore"] = True
-        
-        return {
-            "success": True,
-            "message": f"Daten erfolgreich hochgeladen! Backup erstellt: {backup_zip.name}",
-            "backup_file": str(backup_zip)
-        }
-    except zipfile.BadZipFile:
-        return {"success": False, "message": "Ungültige ZIP-Datei."}
-    except Exception as e:
-        return {"success": False, "message": f"Fehler beim Hochladen: {e}"}
+            client = DiscogsClient(token=discogs_token)
+            search_res = client.search("Nirvana Nevermind", per_page=3)
+            if not search_res or not search_res.get("results"):
+                st.warning("⚠️ Suche lieferte keine Ergebnisse. Prüfen Sie den Token und die Internetverbindung.")
+            else:
+                results = search_res["results"]
+                first = results[0]
+                release_id = first.get("id")
+                year_from_search = first.get("year")
+                st.info(f"✅ Suche OK: {len(results)} Treffer. Erstes Release-ID: {release_id}, Jahr (Suchresultat): {year_from_search!r}")
+                if release_id:
+                    release = client.get_release(int(release_id))
+                    if not release:
+                        st.error("❌ Release-Details konnten nicht abgerufen werden.")
+                    else:
+                        st.success("✅ Release-Details abgerufen.")
+                        artists = release.get("artists", [])
+                        labels = release.get("labels", [])
+                        formats = release.get("formats", [])
+                        tracklist_raw = release.get("tracklist", [])
+                        tracklist_str = client.extract_tracklist(release) if hasattr(client, "extract_tracklist") else ""
+                        notes_raw = release.get("notes") or ""
+                        meta = {
+                            "artist": artists[0].get("name") if artists else None,
+                            "title": release.get("title"),
+                            "label": labels[0].get("name") if labels else None,
+                            "cat_no": labels[0].get("catno") if labels else None,
+                            "year": release.get("year"),
+                            "released": release.get("released"),
+                            "released_formatted": release.get("released_formatted"),
+                            "date": release.get("date"),
+                            "format": formats[0] if formats else None,
+                            "notes": (notes_raw[:300] + "...") if len(notes_raw) > 300 else (notes_raw or None),
+                            "tracklist_anzahl": len(tracklist_raw),
+                            "tracklist_anfang": (tracklist_str[:300] + "...") if len(tracklist_str) > 300 else (tracklist_str or "(leer)"),
+                        }
+                        st.markdown("**Alle Metadaten (wie von der App genutzt):**")
+                        st.json(meta)
+                        y, rel, rel_fmt = meta.get("year"), meta.get("released"), meta.get("released_formatted")
+                        if y is None and not rel and not rel_fmt:
+                            st.warning("⚠️ Bei diesem Release sind year, released und released_formatted leer. Die App würde ggf. aus „notes“ oder dem Suchresultat ein Jahr übernehmen.")
+        except Exception as e:
+            st.error(f"❌ Discogs API-Test fehlgeschlagen: {e}")
+    st.caption("Test mit eigener Katalognummer – prüft, ob ein bestimmtes Release gefunden wird und das Jahr ankommt.")
+    test_catno = st.text_input(
+        "Katalognummer für Test",
+        value="1C 066 14 7197 1",
+        key="discogs_test_catno",
+        placeholder="z. B. 1C 066 14 7197 1"
+    )
+    if st.button("🔍 Test mit dieser Katalognummer", key="discogs_test_catno_btn", help="Sucht bei Discogs nach der Katalognummer und zeigt Release inkl. Jahr."):
+        if not test_catno or not test_catno.strip():
+            st.warning("Bitte eine Katalognummer eingeben.")
+        else:
+            cat_no = _normalize_cat_no(test_catno.strip())
+            if not cat_no:
+                st.warning("Nach Normalisierung keine Katalognummer übrig (z. B. nur Anführungszeichen).")
+            else:
+                try:
+                    client = DiscogsClient(token=discogs_token)
+                    search_res = client.search(cat_no, per_page=10, catno=cat_no)
+                    if not search_res or not search_res.get("results"):
+                        st.warning(f"⚠️ Keine Treffer für Katalognummer: {cat_no}. Evtl. Schreibweise prüfen.")
+                        st.caption("Im Scan wird bei fehlendem Treffer automatisch nach Künstler und Titel gesucht.")
+                    else:
+                        results = search_res["results"]
+                        cat_clean = _normalize_cat_no_for_match(cat_no)
+                        best = None
+                        for r in results:
+                            r_catno_raw = _get_catno_from_result(r)
+                            r_catno = _normalize_cat_no_for_match(r_catno_raw) if r_catno_raw else ""
+                            if r_catno and _cat_no_match(cat_clean, r_catno):
+                                best = r
+                                break
+                        if not best:
+                            best = results[0]
+                            st.info(f"Kein exakter Cat-No-Match; erstes Ergebnis verwendet: {best.get('title')} (Cat: {best.get('catno')!r})")
+                        else:
+                            st.info(f"✅ Treffer mit passender Katalognummer: {best.get('title')} (Cat: {best.get('catno')!r})")
+                        release_id = best.get("id")
+                        if release_id:
+                            release = client.get_release(int(release_id))
+                            if not release:
+                                st.error("❌ Release-Details konnten nicht abgerufen werden.")
+                            else:
+                                st.success("✅ Release gefunden.")
+                                artists = release.get("artists", [])
+                                labels = release.get("labels", [])
+                                formats = release.get("formats", [])
+                                tracklist_str = client.extract_tracklist(release) if hasattr(client, "extract_tracklist") else ""
+                                tracklist_raw = release.get("tracklist", [])
+                                notes_raw = release.get("notes") or ""
+                                meta = {
+                                    "artist": artists[0].get("name") if artists else None,
+                                    "title": release.get("title"),
+                                    "label": labels[0].get("name") if labels else None,
+                                    "cat_no": labels[0].get("catno") if labels else None,
+                                    "year": release.get("year"),
+                                    "released": release.get("released"),
+                                    "released_formatted": release.get("released_formatted"),
+                                    "date": release.get("date"),
+                                    "format": formats[0] if formats else None,
+                                    "notes": (notes_raw[:300] + "...") if len(notes_raw) > 300 else (notes_raw or None),
+                                    "tracklist_anzahl": len(tracklist_raw),
+                                    "tracklist_anfang": (tracklist_str[:300] + "...") if len(tracklist_str) > 300 else (tracklist_str or "(leer)"),
+                                }
+                                st.markdown("**Alle Metadaten (wie von der App genutzt):**")
+                                st.json(meta)
+                                year_int = _get_year_from_discogs_release(release, client)
+                                if year_int is not None:
+                                    st.success(f"→ Das Jahr würde in der App als **{year_int}** übernommen.")
+                                else:
+                                    st.warning("Dieses Release hat bei Discogs kein gültiges Jahr (year/released/notes/title) – in der App würde kein Jahr gesetzt.")
+                except Exception as e:
+                    st.error(f"❌ Test fehlgeschlagen: {e}")
 
 
 def show_settings():
@@ -5651,6 +8245,170 @@ def show_settings():
     
     # Rechtlicher Hinweis
     st.info("ℹ️ **Rechtlicher Hinweis:** VinylLocal AI speichert alle Daten benutzerspezifisch. Externe Datenabfragen erfolgen nur auf ausdrücklichen Wunsch des Nutzers.")
+    
+    st.markdown("---")
+    
+    # System & Speicher Status (von Sidebar hierher verlegt)
+    try:
+        _covers_dir = get_covers_dir()
+        _covers_rel = os.path.relpath(_covers_dir, BASE_DIR) if os.path.isabs(_covers_dir) else _covers_dir
+        _result = run_full_system_check(
+            project_root=BASE_DIR,
+            db=st.session_state.get("db"),
+            gemini_key_loaded=st.session_state.get("vision_ocr") is not None,
+            covers_dir_name=_covers_rel,
+        )
+    except Exception as e:
+        _result = {
+            "structure": {"ok": False, "message": str(e)},
+            "database": {"ok": False, "message": str(e)},
+            "disk": {"ok": False, "status": "red", "message": str(e), "free_mb": 0.0, "total_mb": 0.0, "used_mb": 0.0},
+            "api": {"ok": None, "message": str(e)},
+        }
+    with st.expander("🛠️ System & Speicher Status", expanded=False):
+        try:
+            _cfg = sys.modules.get("config")
+            _load_dir = (os.path.dirname(os.path.abspath(_cfg.__file__)) if _cfg and getattr(_cfg, "__file__", None) else BASE_DIR)
+            st.caption(f"**App-Ordner (Code geladen aus):** `{_load_dir}`")
+            st.caption("Beim Update genau diesen Ordner als Zielordner waehlen.")
+        except Exception:
+            st.caption(f"**App-Ordner:** `{BASE_DIR}`")
+        for _label, _key in [("Struktur & Pfade", "structure"), ("Datenbank", "database"), ("API (Gemini)", "api")]:
+            _item = _result.get(_key, {})
+            _ok = _item.get("ok")
+            _msg = _item.get("message", "")
+            _icon = "✅" if _ok is True else ("❌" if _ok is False else "⚠️")
+            st.markdown(f"{_icon} **{_label}:** {_msg}")
+        _disk = _result.get("disk", {})
+        _ok = _disk.get("ok")
+        _icon = "✅" if _ok is True else ("❌" if _ok is False else "⚠️")
+        st.markdown(f"{_icon} **Speicherplatz:** {_disk.get('message', '')}")
+        _total_mb = _disk.get("total_mb") or 0
+        _used_mb = _disk.get("used_mb") or 0
+        if _total_mb > 0:
+            st.progress(min(1.0, max(0.0, _used_mb / _total_mb)))
+        if st.button("Diagnose-Report erstellen", key="diagnose_report_settings"):
+            try:
+                _cfg = sys.modules.get("config")
+                _config_path = os.path.abspath(_cfg.__file__) if _cfg and getattr(_cfg, "__file__", None) else ""
+                _config_dir = os.path.dirname(_config_path) if _config_path else BASE_DIR
+                _report_lines = [
+                    "=== VinylLocal Installations-Diagnose ===",
+                    f"Erstellt: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}",
+                    f"Gepruefter Ordner: {BASE_DIR}",
+                    "",
+                    f"APP_VERSION: {APP_VERSION}",
+                    f"Code geladen aus: {_config_dir}",
+                    f"sys.executable: {getattr(sys, 'executable', '')}",
+                    f"Als EXE (frozen): {getattr(sys, 'frozen', False)}",
+                    "",
+                    "--- Hauptordner (Dateien + Aenderungsdatum) ---",
+                ]
+                _main_dir = BASE_DIR
+                for _name in ["app.py", "config.py", "main_desktop.py", "VinylLocal.exe", "start.bat"]:
+                    _p = os.path.join(_main_dir, _name)
+                    if os.path.exists(_p):
+                        _mtime = datetime.fromtimestamp(os.path.getmtime(_p)).strftime("%d.%m.%Y %H:%M") if os.path.isfile(_p) else "-"
+                        _size = os.path.getsize(_p) if os.path.isfile(_p) else 0
+                        _report_lines.append(f"{_name}: {_mtime}  {_size} Bytes")
+                    else:
+                        _report_lines.append(f"{_name}: nicht vorhanden")
+                _report_lines.append("")
+                try:
+                    _cp = os.path.join(_main_dir, "config.py")
+                    if os.path.isfile(_cp):
+                        with open(_cp, "r", encoding="utf-8") as _f:
+                            for _line in _f:
+                                if "APP_VERSION" in _line and "=" in _line:
+                                    _report_lines.append(f"Version in config.py: {_line.strip()}")
+                                    break
+                except Exception:
+                    pass
+                _report_lines.extend(["", "--- Ordner _internal ---"])
+                _internal_dir = os.path.join(_main_dir, "_internal")
+                if os.path.isdir(_internal_dir):
+                    _ip = os.path.join(_internal_dir, "app.py")
+                    if os.path.isfile(_ip):
+                        _report_lines.append("_internal\\app.py vorhanden")
+                        _mtime = datetime.fromtimestamp(os.path.getmtime(_ip)).strftime("%d.%m.%Y %H:%M")
+                        _report_lines.append(f"{_mtime}  {os.path.getsize(_ip)} Bytes app.py")
+                    _ic = os.path.join(_internal_dir, "config.py")
+                    if os.path.isfile(_ic):
+                        try:
+                            with open(_ic, "r", encoding="utf-8") as _f:
+                                for _line in _f:
+                                    if "APP_VERSION" in _line and "=" in _line:
+                                        _report_lines.append(_line.strip())
+                                        break
+                        except Exception:
+                            pass
+                else:
+                    _report_lines.append("_internal nicht vorhanden (z.B. nur start.bat-Installation)")
+                _report_lines.extend(["", "--- last_update.txt (vom Update-Skript) ---"])
+                for _folder, _label in [(_main_dir, "Hauptordner"), (_internal_dir, "_internal")]:
+                    _lu = os.path.join(_folder, "last_update.txt")
+                    if os.path.isfile(_lu):
+                        try:
+                            with open(_lu, "r", encoding="utf-8") as _f:
+                                _report_lines.append(f"{_label}: " + _f.read().strip().replace("\n", " | "))
+                        except Exception:
+                            _report_lines.append(f"{_label}: vorhanden")
+                    elif os.path.isdir(_folder):
+                        _report_lines.append(f"{_label}: nicht vorhanden")
+                _report_lines.extend([
+                    "",
+                    "============================================================",
+                    "AUSWERTUNG / WO LIEGT DAS PROBLEM?",
+                    "============================================================",
+                    "",
+                    "VinylLocal.exe laedt den Code aus dem Ordner _internal,",
+                    "NICHT aus dem Hauptordner.",
+                    "",
+                    "Richtige Reihenfolge beim Update:",
+                    "  1) Updates (Hauptordner) – Update_ausfuehren.bat macht das zuerst.",
+                    "  2) Internal (_internal) – die BAT aktualisiert _internal danach.",
+                    "  3) App starten (VinylLocal.exe oder start.bat).",
+                    "",
+                    "last_update.txt wird von Update_ausfuehren.bat erstellt, wenn das",
+                    "Update durchgelaufen ist. Fehlt die Datei, wurde die BAT nicht",
+                    "ausgefuehrt oder ist vorher abgebrochen.",
+                    "",
+                    "Wenn _internal AELTERE Daten hat als der Hauptordner:",
+                    "  Das Update hat _internal nicht aktualisiert. Die App zeigt",
+                    "  weiter die alte Version.",
+                    "",
+                    "LOESUNG:",
+                    "  1. Update_ausfuehren.bat ausfuehren (Reihenfolge: Updates, dann Internal),",
+                    "     ggf. als Administrator. Danach App neu starten.",
+                    "  2. ODER manuell: app.py, config.py, main_desktop.py sowie die",
+                    "     Ordner logic, database, core vom Hauptordner in _internal",
+                    "     kopieren (bestehende Dateien ersetzen). Dann VinylLocal.exe neu starten.",
+                    "",
+                    "=== Ende.",
+                ])
+                _report_path = os.path.join(BASE_DIR, "VinylLocal_Diagnose.txt")
+                with open(_report_path, "w", encoding="utf-8") as _f:
+                    _f.write("\n".join(_report_lines))
+                _saved_locations = [_report_path]
+                try:
+                    _desk = os.path.join(os.path.expanduser("~"), "Desktop", "VinylLocal_Diagnose.txt")
+                    if os.path.isdir(os.path.dirname(_desk)):
+                        import shutil
+                        shutil.copy2(_report_path, _desk)
+                        _saved_locations.append(_desk)
+                except Exception:
+                    pass
+                st.success("Report gespeichert: " + "; ".join(_saved_locations))
+                try:
+                    if sys.platform == "win32":
+                        import subprocess
+                        subprocess.Popen(["explorer", "/select", os.path.normpath(_report_path)], creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                except Exception:
+                    pass
+                st.caption("Der Ordner mit der Datei sollte sich geoeffnet haben. Sonst: Im App-Installationsordner (dort wo VinylLocal.exe liegt) nach VinylLocal_Diagnose.txt suchen.")
+                st.caption("Zusaetzlich: Im Update-Ordner 'Diagnose_Installation.bat' ausfuehren – Report ueber einen gewaehlten Ordner (ohne App).")
+            except Exception as e:
+                st.error(f"Report fehlgeschlagen: {e}")
     
     st.markdown("---")
     
@@ -5812,6 +8570,8 @@ def show_settings():
                 except Exception as e:
                     st.error(f"❌ Discogs-Verbindung fehlgeschlagen: {e}")
                     st.session_state.discogs_client = None
+                # Fragment: nur dieser Block aktualisiert sich beim Test-Klick (kein voller Seiten-Reload)
+                _render_discogs_test_fragment(discogs_token)
             else:
                 st.warning("⚠️ Bitte geben Sie einen Discogs Token ein.")
                 st.session_state.discogs_client = None
@@ -5820,6 +8580,158 @@ def show_settings():
             # Deaktiviere Client wenn Checkbox deaktiviert
             st.session_state.discogs_client = None
             st.info("ℹ️ Discogs-Suche ist deaktiviert. Es wird nur die lokale KI-Analyse verwendet.")
+        
+        st.markdown("---")
+        
+        # Shopify (OAuth)
+        shopify_enabled = st.checkbox(
+            "🛒 Shopify aktivieren",
+            value=api_settings.get("shopify_enabled", 0) == 1 if api_settings else False,
+            help="Aktiviert die Anbindung an Ihren Shopify-Shop (OAuth)"
+        )
+        shopify_store_url = (api_settings.get("shopify_store_url") or "").strip() if api_settings else ""
+        shopify_access_token = (api_settings.get("shopify_access_token") or "").strip() if api_settings else ""
+        
+        if shopify_enabled:
+            shopify_connected = bool(shopify_store_url and shopify_access_token)
+            if st.session_state.get("shopify_oauth_success"):
+                st.success("✅ Shopify erfolgreich verbunden.")
+                del st.session_state.shopify_oauth_success
+            if shopify_connected:
+                shopify_client_id = (api_settings.get("shopify_client_id") or "").strip() or None
+                shopify_client_secret = (api_settings.get("shopify_client_secret") or "").strip() or None
+                try:
+                    from config import get_app_url
+                    client = ShopifyClient(store_url=shopify_store_url, access_token=shopify_access_token)
+                    success, err_msg, shop_info = client.test_connection()
+                    if success and isinstance(shop_info, dict):
+                        shop_name = shop_info.get("name", shopify_store_url) or shopify_store_url
+                        st.success(f"✅ Verbunden mit: **{shop_name}**")
+                    else:
+                        st.success(f"✅ Verbunden mit: **{shopify_store_url}**")
+                    if success:
+                        try:
+                            pub_id = client.get_online_store_publication_id()
+                            st.caption("Verwendete Publication-ID (Online Store): " + (pub_id or "Keine Publication gefunden"))
+                        except Exception:
+                            st.caption("Verwendete Publication-ID (Online Store): Konnte nicht ermittelt werden.")
+                except Exception:
+                    st.success(f"✅ Verbunden mit: **{shopify_store_url}**")
+                if st.button("🔌 Verbindung trennen", key="shopify_disconnect_btn"):
+                    settings = db.get_company_settings() or {}
+                    settings["shopify_store_url"] = None
+                    settings["shopify_access_token"] = None
+                    settings["shopify_enabled"] = 0
+                    db.update_company_settings(settings)
+                    if "shopify_client" in st.session_state:
+                        del st.session_state.shopify_client
+                    st.rerun()
+                shopify_auto_sync_quantity_on_load = st.checkbox(
+                    "Beim Öffnen der Lager-Verwaltung Stückzahl von Shopify holen",
+                    value=api_settings.get("shopify_auto_sync_quantity_on_load", 0) == 1 if api_settings else False,
+                    help="Aktualisiert die lokale Stückzahl automatisch beim Aufruf der Inventar-Seite (z. B. nach Verkäufen in Shopify)."
+                )
+                with st.expander("Shopify-Beschreibung (Zustandsbeschreibung)"):
+                    st.caption("Diese Absätze erscheinen in der Produktbeschreibung bei Shopify unter „Zustandsbeschreibung“. Leer = Absatz wird weggelassen.")
+                    shopify_zustand_1 = st.text_area(
+                        "Absatz 1 (Allgemein / Beispielbild-Hinweis)",
+                        value=SHOPIFY_ZUSTAND_DEFAULT_1 if api_settings.get("shopify_zustand_1") is None else (api_settings.get("shopify_zustand_1") or ""),
+                        height=80,
+                        key="shopify_zustand_1"
+                    )
+                    shopify_zustand_2 = st.text_area(
+                        "Absatz 2 (Gebraucht / Qualität)",
+                        value=SHOPIFY_ZUSTAND_DEFAULT_2 if api_settings.get("shopify_zustand_2") is None else (api_settings.get("shopify_zustand_2") or ""),
+                        height=80,
+                        key="shopify_zustand_2"
+                    )
+                    shopify_zustand_3 = st.text_area(
+                        "Absatz 3 (Zustandsgarantie VG+ bis NM / Kontakt)",
+                        value=SHOPIFY_ZUSTAND_DEFAULT_3 if api_settings.get("shopify_zustand_3") is None else (api_settings.get("shopify_zustand_3") or ""),
+                        height=80,
+                        key="shopify_zustand_3"
+                    )
+                    shopify_zustand_customer = st.text_area(
+                        "Absatz 4 (Kundenservice / Unzufriedenheit)",
+                        value=api_settings.get("shopify_zustand_customer", "") or "",
+                        height=80,
+                        key="shopify_zustand_customer"
+                    )
+                    shopify_zustand_after_condition = st.text_area(
+                        "Absatz nach Zustand (Kontakt / Unzufriedenheit)",
+                        value=SHOPIFY_ZUSTAND_AFTER_CONDITION_DEFAULT if api_settings.get("shopify_zustand_after_condition") is None else (api_settings.get("shopify_zustand_after_condition") or ""),
+                        height=80,
+                        key="shopify_zustand_after_condition"
+                    )
+                    st.caption("Die folgende Kategorie wird beim Export zu Shopify als Metafeld (vinyl.product_category) übertragen.")
+                    shopify_default_category = st.text_input(
+                        "Kategorie (Shopify / Google)",
+                        value=(api_settings.get("shopify_default_category") or "").strip() or SHOPIFY_DEFAULT_CATEGORY,
+                        placeholder=SHOPIFY_DEFAULT_CATEGORY,
+                        help="Produktkategorie für Shopify/Google (z. B. für Vertriebskanäle). Wird als Metafeld vinyl.product_category gespeichert.",
+                        key="shopify_default_category"
+                    )
+            else:
+                shopify_auto_sync_quantity_on_load = False
+                shopify_zustand_1 = shopify_zustand_2 = shopify_zustand_3 = shopify_zustand_customer = shopify_zustand_after_condition = ""
+                shopify_default_category = ""
+                try:
+                    from config import get_shopify_client_id, get_shopify_client_secret, get_app_url
+                    _env_client_id = get_shopify_client_id()
+                    _env_client_secret = get_shopify_client_secret()
+                except Exception:
+                    _env_client_id = None
+                    _env_client_secret = None
+                shopify_client_id_input = st.text_input(
+                    "Shopify Client ID",
+                    value=api_settings.get("shopify_client_id") or "" if api_settings else "",
+                    help="Client ID Ihrer Shopify-App (Partner Dashboard). Kann auch in .env als SHOPIFY_CLIENT_ID gesetzt werden.",
+                    placeholder="z. B. aus dem Shopify Partner Dashboard",
+                    key="shopify_client_id_input"
+                )
+                shopify_client_secret_input = st.text_input(
+                    "Shopify Client Secret",
+                    value=api_settings.get("shopify_client_secret") or "" if api_settings else "",
+                    type="password",
+                    help="Client Secret Ihrer Shopify-App. Kann auch in .env als SHOPIFY_CLIENT_SECRET gesetzt werden.",
+                    placeholder="Client Secret eingeben",
+                    key="shopify_client_secret_input"
+                )
+                shopify_client_id = (shopify_client_id_input or "").strip() or None
+                shopify_client_secret = (shopify_client_secret_input or "").strip() or None
+                client_id = shopify_client_id or _env_client_id
+                client_secret = shopify_client_secret or _env_client_secret
+                if not client_id or not client_secret:
+                    st.warning("⚠️ Bitte Shopify Client ID und Client Secret in den Feldern oben oder in .env setzen.")
+                else:
+                    oauth_store_url = st.text_input(
+                        "🏪 Store-URL",
+                        value=api_settings.get("shopify_store_url") or "" if api_settings else "",
+                        help="Format: name.myshopify.com (ohne https://)",
+                        placeholder="mein-shop.myshopify.com",
+                        key="shopify_store_url_oauth_input"
+                    )
+                    oauth_store_url = normalize_shopify_store_url(oauth_store_url or "") or (oauth_store_url or "").strip()
+                    valid_url, url_error = validate_shopify_store_url(oauth_store_url)
+                    if not valid_url and oauth_store_url:
+                        st.error(f"❌ {url_error}")
+                    elif valid_url:
+                        redirect_uri = get_app_url().rstrip("/")
+                        install_url = get_shopify_install_url(oauth_store_url, redirect_uri, client_id)
+                        st.link_button("🛒 Mit Shopify verbinden", install_url, type="primary", use_container_width=True)
+                        st.caption("Sie werden zu Shopify weitergeleitet. Nach der Freigabe kehren Sie hierher zurück.")
+                shopify_auto_sync_quantity_on_load = False
+                shopify_zustand_1 = shopify_zustand_2 = shopify_zustand_3 = shopify_zustand_customer = shopify_zustand_after_condition = ""
+                shopify_default_category = ""
+        else:
+            shopify_store_url = ""
+            shopify_access_token = ""
+            shopify_client_id = None
+            shopify_client_secret = None
+            shopify_auto_sync_quantity_on_load = False
+            shopify_zustand_1 = shopify_zustand_2 = shopify_zustand_3 = shopify_zustand_customer = shopify_zustand_after_condition = ""
+            shopify_default_category = ""
+            st.info("ℹ️ Shopify ist deaktiviert.")
     
     st.markdown("---")
     
@@ -5901,12 +8813,51 @@ def show_settings():
             key="tax_number_input"
         )
         
+        vat_id = st.text_input(
+            "USt-IdNr.",
+            value=company_settings.get("vat_id", "") if company_settings else "",
+            key="vat_id_input",
+            help="Optional, z.B. DE123456789"
+        )
+        
+        st.markdown("**Zahlungsbedingungen (für Rechnung):**")
+        payment_terms = st.text_input(
+            "Zahlungsbedingungen (Freitext)",
+            value=company_settings.get("payment_terms", "") if company_settings else "",
+            key="payment_terms_input",
+            placeholder="z.B. Zahlbar innerhalb von 14 Tagen ohne Abzug",
+            help="Optional, erscheint auf der Rechnungs-PDF"
+        )
+        payment_days = st.number_input(
+            "Zahlbar innerhalb von (Tagen)",
+            min_value=0,
+            value=int(company_settings.get("payment_days") or 0) if company_settings else 0,
+            key="payment_days_input",
+            help="Optional. Fälligkeitsdatum = Rechnungsdatum + diese Tage"
+        )
+        
         invoice_prefix = st.text_input(
             "Rechnungsnummer-Präfix",
             value=company_settings.get("invoice_prefix", "RE") if company_settings else "RE",
             key="invoice_prefix_input",
             help="Präfix für Rechnungsnummern (z.B. 'RE' für RE-2024-0001)"
         )
+        
+        st.markdown("**Logo (Rechnung-PDF):**")
+        current_logo_path = (company_settings.get("company_logo_path") or "").strip() if company_settings else ""
+        logo_abs = os.path.join(BASE_DIR, current_logo_path) if current_logo_path else None
+        if logo_abs and os.path.exists(logo_abs):
+            try:
+                st.image(logo_abs, caption="Aktuelles Logo", width=120)
+            except Exception:
+                pass
+        logo_upload = st.file_uploader(
+            "Neues Logo hochladen (wird rechts oben in der PDF angezeigt)",
+            type=["png", "jpg", "jpeg"],
+            key="company_logo_upload",
+            help="PNG oder JPG, empfohlen z. B. 200–400 px breit"
+        )
+        remove_logo = st.checkbox("Logo entfernen", value=False, key="company_logo_remove")
     
     st.markdown("---")
     
@@ -6006,111 +8957,6 @@ def show_settings():
                 step=0.01,
                 key="shipping_pickup_cost"
             )
-    
-    st.markdown("---")
-    
-    # Daten-Synchronisation
-    with st.expander("💾 Daten-Synchronisation", expanded=False):
-        st.markdown("Laden Sie Ihre Datenbank, Bilder und Rechnungen herunter oder hoch, um sie lokal zu speichern oder zu synchronisieren.")
-        
-        # Status-Anzeige
-        status = check_local_data_status()
-        
-        col_status1, col_status2, col_status3 = st.columns(3)
-        
-        with col_status1:
-            if status["db_exists"]:
-                db_size_mb = status["db_size"] / (1024 * 1024)
-                st.metric("📊 Datenbank", f"{db_size_mb:.2f} MB", "Vorhanden")
-            else:
-                st.metric("📊 Datenbank", "Nicht vorhanden", "Leer")
-        
-        with col_status2:
-            if status["images_exists"]:
-                st.metric("🖼️ Bilder", f"{status['images_count']} Dateien", "Vorhanden")
-            else:
-                st.metric("🖼️ Bilder", "0 Dateien", "Leer")
-        
-        with col_status3:
-            if status["invoices_exists"]:
-                st.metric("🧾 Rechnungen", f"{status['invoices_count']} PDFs", "Vorhanden")
-            else:
-                st.metric("🧾 Rechnungen", "0 PDFs", "Leer")
-        
-        if status["total_size"] > 0:
-            total_size_mb = status["total_size"] / (1024 * 1024)
-            st.info(f"💾 Gesamtgröße aller Daten: {total_size_mb:.2f} MB")
-        
-        st.markdown("---")
-        
-        # Download-Bereich
-        st.markdown("#### 📥 Daten herunterladen")
-        st.markdown("Erstellen Sie eine Sicherungskopie aller Daten (Datenbank, Bilder, Rechnungen) als ZIP-Datei.")
-        
-        if st.button("📥 Alle Daten herunterladen", type="primary", use_container_width=True, key="download_data"):
-            zip_data = download_database_zip()
-            if zip_data:
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                filename = f"vinyllocal_backup_{timestamp}.zip"
-                st.download_button(
-                    label="⬇️ ZIP-Datei herunterladen",
-                    data=zip_data,
-                    file_name=filename,
-                    mime="application/zip",
-                    type="primary",
-                    use_container_width=True,
-                    key="download_zip_button"
-                )
-                st.success("✅ ZIP-Datei erstellt! Klicken Sie auf den Download-Button.")
-            else:
-                st.error("❌ Fehler beim Erstellen der ZIP-Datei.")
-        
-        st.markdown("---")
-        
-        # Upload-Bereich
-        st.markdown("#### 📤 Daten hochladen")
-        st.markdown("Laden Sie eine zuvor heruntergeladene ZIP-Datei hoch, um Ihre Daten zu synchronisieren oder wiederherzustellen.")
-        st.warning("⚠️ **Wichtig:** Beim Hochladen werden die aktuellen Daten durch die hochgeladene Version ersetzt. Ein automatisches Backup wird erstellt.")
-        
-        uploaded_file = st.file_uploader(
-            "Wählen Sie eine ZIP-Datei aus",
-            type=['zip'],
-            help="Wählen Sie eine zuvor heruntergeladene Backup-ZIP-Datei aus.",
-            key="upload_database_zip"
-        )
-        
-        if uploaded_file is not None:
-            file_size_mb = len(uploaded_file.getvalue()) / (1024 * 1024)
-            st.info(f"📁 Datei: {uploaded_file.name} ({file_size_mb:.2f} MB)")
-            
-            if st.button("📤 Daten hochladen und ersetzen", type="primary", use_container_width=True, key="upload_data"):
-                with st.spinner("Daten werden hochgeladen und extrahiert..."):
-                    result = upload_database_zip(uploaded_file)
-                
-                if result["success"]:
-                    st.success(f"✅ {result['message']}")
-                    if "backup_file" in result:
-                        st.info(f"💾 Backup gespeichert in: {result['backup_file']}")
-                    st.info("🔄 Die App wird neu geladen...")
-                    st.rerun()
-                else:
-                    st.error(f"❌ {result['message']}")
-        
-        # Localhost-Daten zurücksetzen (nur im Localhost-Modus sichtbar)
-        if st.session_state.get("current_user", {}).get("username") == "localhost":
-            st.markdown("---")
-            st.markdown("#### 🗑️ Daten zurücksetzen")
-            st.markdown("Löscht alle Localhost-Daten (Bestand, Rechnungen, Kunden, Einstellungen). Die Datenbank wird neu angelegt und ist danach leer. Bilder und PDF-Dateien auf der Festplatte werden nicht gelöscht.")
-            confirm_reset = st.checkbox("Ja, Localhost-Daten löschen", key="confirm_reset_localhost")
-            if st.button("🗑️ Localhost-Daten löschen", type="secondary", use_container_width=True, key="reset_localhost_data", disabled=not confirm_reset):
-                db = st.session_state.get("db")
-                if db:
-                    db.close()
-                if "db" in st.session_state:
-                    del st.session_state.db
-                st.session_state["pending_delete_localhost"] = True
-                st.success("✅ Localhost-Daten werden beim Neuladen gelöscht. Die App wird neu geladen.")
-                st.rerun()
     
     st.markdown("---")
     
@@ -6220,6 +9066,68 @@ def show_settings():
             key="condition_text_p"
         )
     
+    # Kleinanzeigen-Assistent
+    with st.expander("📋 Kleinanzeigen-Assistent", expanded=False):
+        st.markdown("Standard-Texte für den Export zu Kleinanzeigen. Werden beim Generieren von Titel und Beschreibung verwendet.")
+        kleinanzeigen_intro_text = st.text_area(
+            "Intro-Text (optional)",
+            value=company_settings.get("kleinanzeigen_intro_text", "") if company_settings else "",
+            placeholder="z.B. Löse meine Sammlung auf",
+            height=60,
+            key="kleinanzeigen_intro_text"
+        )
+        kleinanzeigen_footer_text = st.text_area(
+            "Footer-Text (optional)",
+            value=company_settings.get("kleinanzeigen_footer_text", "") if company_settings else "",
+            placeholder="z.B. Zusätzliche Hinweise",
+            height=60,
+            key="kleinanzeigen_footer_text"
+        )
+        st.caption("Bearbeite die Vorlagen nach Bedarf. Leer lassen = Standard-Vorlage wird verwendet.")
+        _ship = (company_settings.get("kleinanzeigen_shipping_info") or "").strip() if company_settings else ""
+        _leg = (company_settings.get("kleinanzeigen_legal_info") or "").strip() if company_settings else ""
+        _pay = (company_settings.get("kleinanzeigen_payment_info") or "").strip() if company_settings else ""
+        kleinanzeigen_shipping_info = st.text_area(
+            "Versand",
+            value=_ship or DEFAULT_SHIPPING,
+            height=60,
+            key="kleinanzeigen_shipping_info"
+        )
+        kleinanzeigen_legal_info = st.text_area(
+            "Rechtliches",
+            value=_leg or DEFAULT_LEGAL,
+            height=60,
+            key="kleinanzeigen_legal_info"
+        )
+        kleinanzeigen_payment_info = st.text_area(
+            "Zahlungsarten",
+            value=_pay or DEFAULT_PAYMENT,
+            height=60,
+            key="kleinanzeigen_payment_info"
+        )
+        kleinanzeigen_translate_condition = st.checkbox(
+            "Zustand übersetzen (VG+ → verständliche Beschreibung)",
+            value=company_settings.get("kleinanzeigen_translate_condition", 1) == 1 if company_settings else True,
+            help="Erweitert z.B. VG+ zu 'Zustand: Very Good Plus (VG+) - Leichte Gebrauchsspuren, spielt einwandfrei'",
+            key="kleinanzeigen_translate_condition"
+        )
+
+    # Voreinstellungen für Scan
+    with st.expander("📀 Voreinstellungen für Scan", expanded=False):
+        format_options_scan = ["12\" LP", "12\" Single", "12\" EP", "10\" LP", "10\" EP", "7\" Single", "7\" EP", "Sonstiges"]
+        default_format_options = ["Keine Voreinstellung"] + format_options_scan
+        current_default_format = (company_settings.get("default_format") or "").strip() if company_settings else ""
+        if current_default_format and current_default_format not in default_format_options:
+            current_default_format = ""
+        default_format_index = default_format_options.index(current_default_format) if current_default_format in default_format_options else 0
+        default_format = st.selectbox(
+            "Standard-Plattenformat",
+            default_format_options,
+            index=default_format_index,
+            help="Beim Start einer neuen Scan-Session wird dieses Format vorausgewählt (z. B. bei vielen 7\" Singles).",
+            key="settings_default_format"
+        )
+    
     st.markdown("---")
     
     # Speichern Button
@@ -6242,6 +9150,29 @@ def show_settings():
         }
         shipping_options_json_str = json.dumps(shipping_options_dict)
         
+        # Logo: neu hochgeladen, entfernen oder unverändert
+        company_logo_path_to_save = (company_settings.get("company_logo_path") or "").strip() or None if company_settings else None
+        if remove_logo:
+            company_logo_path_to_save = None
+        elif logo_upload is not None:
+            ext = "png"
+            if logo_upload.type and "jpeg" in logo_upload.type or (getattr(logo_upload, "name", "") or "").lower().endswith((".jpg", ".jpeg")):
+                ext = "jpg"
+            elif getattr(logo_upload, "name", ""):
+                n = (logo_upload.name or "").lower()
+                if n.endswith(".jpg") or n.endswith(".jpeg"):
+                    ext = "jpg"
+            logo_filename = f"company_logo.{ext}"
+            logo_rel = os.path.join("vinyl_images", logo_filename)
+            logo_abs_path = os.path.join(COVERS_ABS, logo_filename)
+            try:
+                os.makedirs(COVERS_ABS, exist_ok=True)
+                with open(logo_abs_path, "wb") as f:
+                    f.write(logo_upload.getvalue())
+                company_logo_path_to_save = logo_rel
+            except Exception:
+                company_logo_path_to_save = company_logo_path_to_save  # behalte altes
+        
         # Speichere Steuer-Einstellungen und Firmendaten
         settings_data = {
             "tax_status": tax_status_value,
@@ -6253,7 +9184,11 @@ def show_settings():
             "company_state": company_state.strip() if company_state and company_state.strip() else None,
             "company_country": company_country.strip() if company_country and company_country.strip() else "Deutschland",
             "tax_number": tax_number if tax_number else None,
+            "vat_id": vat_id.strip() if vat_id and vat_id.strip() else None,
+            "payment_terms": payment_terms.strip() if payment_terms and payment_terms.strip() else None,
+            "payment_days": int(payment_days) if payment_days and int(payment_days) > 0 else None,
             "invoice_prefix": invoice_prefix if invoice_prefix else "RE",
+            "company_logo_path": company_logo_path_to_save,
             "shipping_options": shipping_options_json_str,
             # API-Keys
             "gemini_api_key": gemini_api_key.strip() if gemini_api_key else None,
@@ -6264,6 +9199,18 @@ def show_settings():
             "musicbrainz_enabled": 1 if musicbrainz_enabled else 0,
             "discogs_api_key": discogs_token.strip() if discogs_token else None,
             "discogs_enabled": 1 if discogs_enabled else 0,
+            "shopify_store_url": shopify_store_url.strip() if shopify_store_url else None,
+            "shopify_access_token": shopify_access_token.strip() if shopify_access_token else None,
+            "shopify_client_id": shopify_client_id.strip() if shopify_client_id else None,
+            "shopify_client_secret": shopify_client_secret.strip() if shopify_client_secret else None,
+            "shopify_enabled": 1 if shopify_enabled else 0,
+            "shopify_auto_sync_quantity_on_load": 1 if (shopify_enabled and shopify_auto_sync_quantity_on_load) else 0,
+            "shopify_zustand_1": (shopify_zustand_1 or "").strip() or None,
+            "shopify_zustand_2": (shopify_zustand_2 or "").strip() or None,
+            "shopify_zustand_3": (shopify_zustand_3 or "").strip() or None,
+            "shopify_zustand_customer": (shopify_zustand_customer or "").strip() or None,
+            "shopify_zustand_after_condition": (shopify_zustand_after_condition or "").strip() or None,
+            "shopify_default_category": (shopify_default_category or "").strip() or None,
             # Zustandsbewertung
             "default_condition": default_condition,
             "default_condition_text": default_condition_text.strip() if default_condition_text else None,
@@ -6278,6 +9225,14 @@ def show_settings():
                 "G": condition_text_g.strip() if condition_text_g else "",
                 "P": condition_text_p.strip() if condition_text_p else ""
             }),
+            "default_format": (default_format.strip() or None) if default_format and default_format != "Keine Voreinstellung" else None,
+            # Kleinanzeigen-Assistent
+            "kleinanzeigen_intro_text": (kleinanzeigen_intro_text or "").strip() or None,
+            "kleinanzeigen_footer_text": (kleinanzeigen_footer_text or "").strip() or None,
+            "kleinanzeigen_shipping_info": (kleinanzeigen_shipping_info or "").strip() or None,
+            "kleinanzeigen_legal_info": (kleinanzeigen_legal_info or "").strip() or None,
+            "kleinanzeigen_payment_info": (kleinanzeigen_payment_info or "").strip() or None,
+            "kleinanzeigen_translate_condition": 1 if kleinanzeigen_translate_condition else 0,
             # Bankverbindung
             "bank_name": bank_name.strip() if bank_name and bank_name.strip() else None,
             "bank_account_holder": bank_account_holder.strip() if bank_account_holder and bank_account_holder.strip() else None,
@@ -6309,6 +9264,19 @@ def show_settings():
             except: pass
             # #endregion
             
+            # Discogs-Client sofort mit gespeichertem Token setzen, damit die Scan-Session ohne Reload funktioniert
+            _discogs_token_saved = (discogs_token or "").strip()
+            if discogs_enabled and _discogs_token_saved:
+                try:
+                    st.session_state.discogs_client = DiscogsClient(token=_discogs_token_saved)
+                except Exception:
+                    st.session_state.discogs_client = None
+            else:
+                st.session_state.discogs_client = None
+            
+            # Heavy-Init beim nächsten Run erneut ausführen, damit neue API-Keys (z. B. Discogs) geladen werden
+            if "_init_heavy_done" in st.session_state:
+                del st.session_state["_init_heavy_done"]
             # Setze Erfolgsmeldung direkt
             set_success_message("✅ Einstellungen wurden gespeichert!", save_settings_key)
             st.rerun()
@@ -6772,6 +9740,7 @@ def _show_new_invoice_form(db, company_settings, tax_status):
             st.info(f"**Ausgewählter Kunde:** {customer_data_prefill['name']}")
     
     # Kundendatenfelder nur anzeigen wenn kein Kunde ausgewählt oder "new"
+    missing_fields = st.session_state.get("checkout_validation_missing", [])
     if not selected_customer_id or selected_customer_id == "new":
         # Vollständiges Formular für Kundendaten
         st.markdown("**Kundendaten für Rechnung:**")
@@ -6782,36 +9751,46 @@ def _show_new_invoice_form(db, company_settings, tax_status):
             value=customer_data_prefill.get('name', ''),
             key="checkout_customer_name"
         )
+        if "Name" in missing_fields:
+            st.markdown("<span style='color:#e74c3c;font-size:0.85em'>Bitte ausfüllen.</span>", unsafe_allow_html=True)
         
         # Adressfelder
         st.markdown("**Adresse:**")
         col_checkout_street, col_checkout_house = st.columns([3, 1])
         with col_checkout_street:
             checkout_customer_street = st.text_input(
-                "Straße", 
+                "Straße *", 
                 value=customer_data_prefill.get('street', ''),
                 key="checkout_customer_street"
             )
+            if "Straße" in missing_fields:
+                st.markdown("<span style='color:#e74c3c;font-size:0.85em'>Bitte ausfüllen.</span>", unsafe_allow_html=True)
         with col_checkout_house:
             checkout_customer_house_number = st.text_input(
-                "Hausnummer", 
+                "Hausnummer *", 
                 value=customer_data_prefill.get('house_number', ''),
                 key="checkout_customer_house_number"
             )
+            if "Hausnummer" in missing_fields:
+                st.markdown("<span style='color:#e74c3c;font-size:0.85em'>Bitte ausfüllen.</span>", unsafe_allow_html=True)
         
         col_checkout_plz, col_checkout_city = st.columns([1, 3])
         with col_checkout_plz:
             checkout_customer_postal_code = st.text_input(
-                "PLZ", 
+                "PLZ *", 
                 value=customer_data_prefill.get('postal_code', ''),
                 key="checkout_customer_postal_code"
             )
+            if "PLZ" in missing_fields:
+                st.markdown("<span style='color:#e74c3c;font-size:0.85em'>Bitte ausfüllen.</span>", unsafe_allow_html=True)
         with col_checkout_city:
             checkout_customer_city = st.text_input(
-                "Ort", 
+                "Ort *", 
                 value=customer_data_prefill.get('city', ''),
                 key="checkout_customer_city"
             )
+            if "Ort" in missing_fields:
+                st.markdown("<span style='color:#e74c3c;font-size:0.85em'>Bitte ausfüllen.</span>", unsafe_allow_html=True)
         
         col_checkout_state, col_checkout_country = st.columns([2, 2])
         with col_checkout_state:
@@ -6977,6 +9956,24 @@ def _show_new_invoice_form(db, company_settings, tax_status):
     
     create_invoice_key = "create_invoice"
     if st.button("💾 Rechnung erstellen", type="primary", use_container_width=True, key=create_invoice_key):
+        # Prüfung: Name, Straße, Hausnummer, PLZ und Ort sind Pflichtangaben für die Rechnung
+        missing = []
+        if not (customer_name or "").strip():
+            missing.append("Name")
+        if not (checkout_customer_street or "").strip():
+            missing.append("Straße")
+        if not (checkout_customer_house_number or "").strip():
+            missing.append("Hausnummer")
+        if not (checkout_customer_postal_code or "").strip():
+            missing.append("PLZ")
+        if not (checkout_customer_city or "").strip():
+            missing.append("Ort")
+        if missing:
+            st.session_state["checkout_validation_missing"] = missing
+            st.error("Für die Rechnungserstellung fehlen Pflichtangaben: " + ", ".join(missing) + ". Bitte füllen Sie alle Felder aus oder wählen Sie einen Kunden mit vollständigen Adressdaten.")
+            st.stop()
+        if "checkout_validation_missing" in st.session_state:
+            del st.session_state["checkout_validation_missing"]
         # Generiere Rechnungsnummer
         invoice_number = generate_invoice_number(db)
         
@@ -7179,22 +10176,20 @@ def _show_new_invoice_form(db, company_settings, tax_status):
             "tax_rate": totals["tax_rate"],
             "tax_amount": totals["tax_amount"],
             "tax_status": tax_status,
-            "customer_info": {
-                "Name": customer_name,
-                "Adresse": final_customer_address
-            } if customer_name else None,
-            "company_info": company_settings,
+            "customer_info": customer_info_dict if customer_info_dict else None,
+            "company_info": {**company_settings, "company_logo_abs": (os.path.join(BASE_DIR, company_settings.get("company_logo_path")) if company_settings.get("company_logo_path") and os.path.isfile(os.path.join(BASE_DIR, company_settings.get("company_logo_path") or "")) else None)},
             "shipping_option": shipping_option,
             "shipping_cost": shipping_cost
         }
         
-        pdf_path = f"invoices/{invoice_number}.pdf"
-        Path("invoices").mkdir(exist_ok=True)
-        st.session_state.pdf_generator.generate_invoice(pdf_invoice_data, pdf_path)
+        pdf_path_rel = os.path.join("invoices", f"{invoice_number}.pdf")
+        Path(INVOICES_ABS).mkdir(parents=True, exist_ok=True)
+        pdf_path_abs = os.path.join(BASE_DIR, pdf_path_rel)
+        st.session_state.pdf_generator.generate_invoice(pdf_invoice_data, pdf_path_abs)
         
-        # Aktualisiere PDF-Pfad in der Datenbank
+        # Aktualisiere PDF-Pfad in der Datenbank (relativ zu BASE_DIR)
         if invoice_db_id:
-            db.update_record("invoices", invoice_db_id, {"pdf_path": pdf_path})
+            db.update_record("invoices", invoice_db_id, {"pdf_path": pdf_path_rel})
         
         # Lösche selected_items aus Session State
         st.session_state.invoice_selected_items = []
@@ -7203,8 +10198,8 @@ def _show_new_invoice_form(db, company_settings, tax_status):
         set_success_message(f"✅ Rechnung erstellt! Rechnungsnummer: {invoice_number}", create_invoice_key)
         
         # Download-Link anbieten
-        if os.path.exists(pdf_path):
-            with open(pdf_path, "rb") as pdf_file:
+        if os.path.exists(pdf_path_abs):
+            with open(pdf_path_abs, "rb") as pdf_file:
                 st.download_button(
                     label="📥 Rechnung herunterladen",
                     data=pdf_file.read(),
@@ -7299,9 +10294,10 @@ def _show_invoice_overview(db):
                     st.markdown("**Adresse:**")
                     st.text(customer_info.get("Adresse"))
                 
-                # PDF-Download
-                if pdf_path and os.path.exists(pdf_path):
-                    with open(pdf_path, "rb") as pdf_file:
+                # PDF-Download (pdf_path in DB ist relativ zu BASE_DIR)
+                pdf_path_abs = os.path.join(BASE_DIR, pdf_path) if pdf_path else ""
+                if pdf_path_abs and os.path.exists(pdf_path_abs):
+                    with open(pdf_path_abs, "rb") as pdf_file:
                         st.download_button(
                             label="📥 PDF herunterladen",
                             data=pdf_file.read(),
@@ -7313,6 +10309,35 @@ def _show_invoice_overview(db):
                     # PDF neu generieren falls nicht vorhanden
                     if st.button(f"🔄 PDF neu generieren", key=f"regenerate_pdf_{invoice_id}"):
                         _regenerate_invoice_pdf(db, invoice_id, invoice)
+                
+                # Rechnung dauerhaft löschen (mit Bestätigung)
+                if st.session_state.get("confirm_delete_invoice_id") != invoice_id:
+                    if st.button("🗑️ Rechnung dauerhaft löschen", type="secondary", key=f"delete_invoice_{invoice_id}"):
+                        st.session_state["confirm_delete_invoice_id"] = invoice_id
+                        st.rerun()
+                else:
+                    st.caption("Stückzahlen werden ins Inventar zurückgebucht, Kundenstatistik wird angepasst.")
+            
+            # Bestätigung zum endgültigen Löschen
+            if st.session_state.get("confirm_delete_invoice_id") == invoice_id:
+                st.markdown("---")
+                st.warning("Rechnung wirklich endgültig löschen? PDF und Datenbankeintrag werden entfernt.")
+                col_confirm_yes, col_confirm_no = st.columns(2)
+                with col_confirm_yes:
+                    if st.button("✅ Ja, endgültig löschen", type="primary", key=f"confirm_delete_invoice_{invoice_id}"):
+                        success, err = _delete_invoice_permanently(db, invoice_id, invoice)
+                        if "confirm_delete_invoice_id" in st.session_state:
+                            del st.session_state["confirm_delete_invoice_id"]
+                        if success:
+                            st.success("Rechnung wurde dauerhaft gelöscht.")
+                            st.rerun()
+                        else:
+                            st.error(f"Fehler beim Löschen: {err}")
+                with col_confirm_no:
+                    if st.button("❌ Abbrechen", key=f"cancel_delete_invoice_{invoice_id}"):
+                        if "confirm_delete_invoice_id" in st.session_state:
+                            del st.session_state["confirm_delete_invoice_id"]
+                        st.rerun()
             
             # Artikel-Liste anzeigen
             st.markdown("---")
@@ -7406,6 +10431,75 @@ def _show_invoice_overview(db):
                 st.info("Keine Artikel-Daten verfügbar.")
 
 
+def _delete_invoice_permanently(db, invoice_id, invoice):
+    """
+    Löscht eine Rechnung dauerhaft: Inventar-Stückzahlen zurückbuchen,
+    Kundenstatistik anpassen, DB-Eintrag und PDF-Datei entfernen.
+    Returns: (success: bool, error_message: Optional[str])
+    """
+    try:
+        # 1. Items parsen und Inventar-Stückzahlen zurückbuchen
+        items_raw = invoice.get("items") or "[]"
+        try:
+            items = json.loads(items_raw) if isinstance(items_raw, str) else items_raw
+        except (json.JSONDecodeError, TypeError):
+            items = []
+        if not isinstance(items, list):
+            items = []
+
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            try:
+                item_id = item.get("item_id")
+                quantity = item.get("quantity", 1)
+                if item_id is None:
+                    continue
+                item_id = int(item_id)
+                quantity = int(quantity) if quantity is not None else 1
+                if quantity < 1:
+                    quantity = 1
+                db.increment_quantity(item_id, quantity, increment_max_quantity=True)
+            except (ValueError, TypeError) as e:
+                # Artikel evtl. bereits gelöscht – weitermachen
+                continue
+
+        # 2. Kundenstatistik zurücksetzen
+        customer_id = invoice.get("customer_id")
+        if customer_id is not None:
+            try:
+                customer_id = int(customer_id)
+                customer = db.get_customer(customer_id)
+                if customer:
+                    total_purchases = int(customer.get("total_purchases") or 0)
+                    total_amount = float(customer.get("total_amount") or 0.0)
+                    invoice_amount = float(invoice.get("total_amount") or 0.0)
+                    new_purchases = max(0, total_purchases - 1)
+                    new_amount = max(0.0, total_amount - invoice_amount)
+                    db.update_record("customers", customer_id, {
+                        "total_purchases": new_purchases,
+                        "total_amount": new_amount
+                    })
+            except (ValueError, TypeError):
+                pass
+
+        # 3. DB-Eintrag löschen
+        ok = db.delete_record("invoices", invoice_id)
+        if not ok:
+            return (False, "Rechnung konnte in der Datenbank nicht gelöscht werden.")
+
+        # 4. PDF-Datei löschen (pdf_path in DB ist relativ zu BASE_DIR)
+        pdf_path = invoice.get("pdf_path") or ""
+        if pdf_path and isinstance(pdf_path, str) and pdf_path.strip():
+            p = Path(os.path.join(BASE_DIR, pdf_path))
+            if p.exists() and p.is_file():
+                p.unlink(missing_ok=True)
+
+        return (True, None)
+    except Exception as e:
+        return (False, str(e))
+
+
 def _regenerate_invoice_pdf(db, invoice_id, invoice_data):
     """Generiert PDF für eine Rechnung neu."""
     try:
@@ -7440,20 +10534,22 @@ def _regenerate_invoice_pdf(db, invoice_id, invoice_data):
             "tax_amount": totals.get("tax_amount", 0.0),
             "tax_status": invoice_data.get("tax_status", "differenzbesteuerung"),
             "customer_info": customer_info if customer_info else None,
-            "company_info": company_settings,
+            "company_info": {**company_settings, "company_logo_abs": (os.path.join(BASE_DIR, company_settings.get("company_logo_path")) if company_settings.get("company_logo_path") and os.path.isfile(os.path.join(BASE_DIR, company_settings.get("company_logo_path") or "")) else None)},
             "shipping_option": invoice_data.get("shipping_option"),
             "shipping_cost": invoice_data.get("shipping_cost", 0.0)
         }
         
-        # Generiere PDF
-        pdf_path = f"invoices/{invoice_data.get('invoice_number', '')}.pdf"
-        Path("invoices").mkdir(exist_ok=True)
-        st.session_state.pdf_generator.generate_invoice(pdf_invoice_data, pdf_path)
+        # Generiere PDF (unter invoices/)
+        inv_number = invoice_data.get("invoice_number", "")
+        pdf_path_rel = os.path.join("invoices", f"{inv_number}.pdf")
+        Path(INVOICES_ABS).mkdir(parents=True, exist_ok=True)
+        pdf_path_abs = os.path.join(BASE_DIR, pdf_path_rel)
+        st.session_state.pdf_generator.generate_invoice(pdf_invoice_data, pdf_path_abs)
         
-        # Aktualisiere PDF-Pfad in Datenbank
-        db.update_record("invoices", invoice_id, {"pdf_path": pdf_path})
+        # Aktualisiere PDF-Pfad in Datenbank (relativ zu BASE_DIR)
+        db.update_record("invoices", invoice_id, {"pdf_path": pdf_path_rel})
         
-        st.success(f"✅ PDF erfolgreich neu generiert: {pdf_path}")
+        st.success(f"✅ PDF erfolgreich neu generiert: {pdf_path_rel}")
         st.rerun()
         
     except Exception as e:
@@ -7489,6 +10585,67 @@ def show_customer_management():
         
         # Lade Kunden
         customers = db.get_all_customers(search_query if search_query else None)
+        
+        # Export / Import
+        with st.expander("📤 Kundenliste exportieren / importieren", expanded=False):
+            _customer_export_cols = ["name", "street", "house_number", "postal_code", "city", "state", "country", "email", "phone", "tax_number", "notes"]
+            _all_customers = db.get_all_customers(None)
+            if _all_customers:
+                _export_rows = []
+                for _c in _all_customers:
+                    _row = {col: (_c.get(col) or "") for col in _customer_export_cols}
+                    _export_rows.append(_row)
+                _df_cust_export = pd.DataFrame(_export_rows, columns=_customer_export_cols)
+                _csv_customers = _df_cust_export.to_csv(index=False, encoding="utf-8-sig", quoting=csv.QUOTE_NONNUMERIC)
+                st.download_button(
+                    label="📥 Kundenliste als CSV exportieren",
+                    data=_csv_customers,
+                    file_name=f"kunden_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    mime="text/csv",
+                    key="customer_export_csv"
+                )
+            st.caption("Exportierte CSV mit denselben Spalten unten zum Wiedereinfuegen hochladen. Jede Zeile wird als neuer Kunde angelegt.")
+            st.markdown("#### Kunden importieren")
+            _uploaded_customer_csv = st.file_uploader(
+                "CSV-Datei auswaehlen",
+                type=["csv"],
+                help="UTF-8-CSV mit Spalten: name, street, house_number, postal_code, city, state, country, email, phone, tax_number, notes",
+                key="upload_customer_csv"
+            )
+            if _uploaded_customer_csv is not None:
+                if st.button("📤 Kunden aus CSV einfügen", type="primary", use_container_width=True, key="import_customer_csv"):
+                    try:
+                        _raw = _uploaded_customer_csv.getvalue().decode("utf-8-sig") or _uploaded_customer_csv.getvalue().decode("utf-8")
+                        _df_cust_imp = pd.read_csv(io.StringIO(_raw), dtype=str, keep_default_na=False)
+                        _required = ["name"]
+                        _inserted = 0
+                        _errors = 0
+                        for _idx, _row in _df_cust_imp.iterrows():
+                            _name = (_row.get("name") or "").strip()
+                            if not _name:
+                                continue
+                            _data = {
+                                "name": _name,
+                                "street": (_row.get("street") or "").strip() or None,
+                                "house_number": (_row.get("house_number") or "").strip() or None,
+                                "postal_code": (_row.get("postal_code") or "").strip() or None,
+                                "city": (_row.get("city") or "").strip() or None,
+                                "state": (_row.get("state") or "").strip() or None,
+                                "country": (_row.get("country") or "Deutschland").strip() or "Deutschland",
+                                "email": (_row.get("email") or "").strip() or None,
+                                "phone": (_row.get("phone") or "").strip() or None,
+                                "tax_number": (_row.get("tax_number") or "").strip() or None,
+                                "notes": (_row.get("notes") or "").strip() or None,
+                            }
+                            try:
+                                db.add_customer(_data)
+                                _inserted += 1
+                            except Exception:
+                                _errors += 1
+                        st.success(f"Import abgeschlossen: {_inserted} Kunden angelegt." + (f" {_errors} Zeilen mit Fehler." if _errors else ""))
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"CSV konnte nicht gelesen werden: {e}")
         
         # Zeige Erfolgsmeldung wenn ein neuer Kunde angelegt wurde
         if "new_customer_id" in st.session_state and st.session_state.new_customer_id:
@@ -7692,7 +10849,10 @@ def show_customer_management():
                 
                 customer_id = db.add_customer(customer_data)
                 if customer_id:
-                    st.success(f"✅ Kunde erfolgreich angelegt! (ID: {customer_id})")
+                    set_success_message(
+                        f"✅ Kunde erfolgreich angelegt! (ID: {customer_id})",
+                        "create_customer"
+                    )
                     # Setze Session State für Navigation
                     st.session_state.customer_tab = "📋 Liste"
                     st.session_state.new_customer_id = customer_id
@@ -7759,6 +10919,55 @@ def show_customer_management():
 
 def main():
     """Hauptfunktion der Anwendung."""
+    _boot_checkpoint("main_start")
+    _boot_debug("main_start")
+    _diagnostic_log("main_entry", {"run": st.session_state.get("boot_run_count", 0), "skip_login": st.query_params.get("skip_login"), "auth": st.session_state.get("is_authenticated")}, "A")
+    # #region agent log
+    try:
+        with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as _dl:
+            _dl.write(json_log.dumps({"sessionId":"debug-session","runId":f"run{st.session_state.get('boot_run_count',0)}","hypothesisId":"A","location":"app.py:main_entry","message":"main_entry","data":{"skip_login":st.query_params.get("skip_login"),"is_authenticated":st.session_state.get("is_authenticated")},"timestamp":int(time.time()*1000)}) + "\n")
+    except Exception:
+        pass
+    # #endregion
+
+    # Nur für Blink-Test: Login überspringen (?skip_login=1) – für echten Betrieb/Release aus lassen
+    if st.query_params.get("skip_login") == "1":
+        st.session_state.is_authenticated = True
+        st.session_state.current_user = {"username": "blink_test", "email": "test@test"}
+        st.session_state.db = Database(db_path=os.path.join(BASE_DIR, "vinyl_blink_test.db"))
+
+    # Hide-CSS deaktiviert: Opacity-0 führte zu sichtbarem weißen Bildschirm + grauem Skeleton (nur Streamlit-Hülle sichtbar)
+    _hide_app = False  # war: not debug_boot and not boot_ui_ready
+    # #region agent log
+    try:
+        with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as _dl:
+            _dl.write(json_log.dumps({"sessionId":"debug-session","runId":f"run{st.session_state.get('boot_run_count',0)}","hypothesisId":"B","location":"app.py:hide_css","message":"hide_css_decision","data":{"hide_app_applied":_hide_app,"boot_ui_ready":st.session_state.get("boot_ui_ready")},"timestamp":int(time.time()*1000)}) + "\n")
+    except Exception:
+        pass
+    # #endregion
+    if _hide_app:
+        st.markdown(_HIDE_APP_CSS, unsafe_allow_html=True)
+
+    # Placeholder: nur beim ersten Lauf "Lade…" zeigen; bei Reruns (Run 2+) leer lassen → weniger Blinken
+    _placeholder = st.empty()
+    _boot_checkpoint("before_placeholder_markdown")
+    _init_done = st.session_state.get("_init_heavy_done")
+    # #region agent log
+    try:
+        with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as _dl:
+            _dl.write(json_log.dumps({"sessionId":"debug-session","runId":f"run{st.session_state.get('boot_run_count',0)}","hypothesisId":"C","location":"app.py:placeholder","message":"before_placeholder","data":{"_init_heavy_done":_init_done,"will_show_lade":not _init_done},"timestamp":int(time.time()*1000)}) + "\n")
+    except Exception:
+        pass
+    # #endregion
+    if not _init_done:
+        _placeholder.markdown("**Lade VinylLocal AI …**")
+        _placeholder.caption("Einstellungen und APIs werden geladen …")
+    _boot_checkpoint("main_placeholder_rendered")
+    _boot_debug("main_placeholder_rendered")
+
+    _boot_checkpoint("main_after_boot")
+    _boot_debug("main_after_boot")
+
     # #region agent log
     try:
         with open(log_path, "a", encoding="utf-8") as f_log:
@@ -7780,32 +10989,148 @@ def main():
                 f_log.write(json_log.dumps({"sessionId":"debug-session","runId":"startup","hypothesisId":"E","location":"app.py:5893","message":"Error in init_session_state","data":{"error":str(e),"error_type":type(e).__name__},"timestamp":int(os_log.path.getmtime(log_path) if os_log.path.exists(log_path) else 0)}) + "\n")
         except: pass
         # #endregion
+        _placeholder.empty()
         st.error(f"Fehler beim Initialisieren: {e}")
         import traceback
         st.code(traceback.format_exc())
         return
-    
-    # Prüfe Query-Parameter für E-Mail-Bestätigung
-    page_param = st.query_params.get("page", "")
-    if page_param == "verify_email":
-        show_email_verification()
-        return
-    
-    # Prüfe ob erneutes Senden der Bestätigungs-E-Mail angezeigt werden soll
-    if st.session_state.get("show_resend_verification", False):
-        show_resend_verification()
-        return
-    
-    # Prüfe Authentifizierung
-    if not check_authentication():
-        # Nicht eingeloggt - zeige Login oder Registrierung
-        if st.session_state.get("show_register", False):
-            show_register()
+
+    _boot_checkpoint("main_after_init")
+    _boot_debug("main_after_init")
+
+    try:
+        # Prüfe Query-Parameter für E-Mail-Bestätigung
+        page_param = st.query_params.get("page", "")
+        if page_param == "verify_email":
+            _placeholder.empty()
+            show_email_verification()
+            return
+
+        # Prüfe ob erneutes Senden der Bestätigungs-E-Mail angezeigt werden soll
+        if st.session_state.get("show_resend_verification", False):
+            _placeholder.empty()
+            show_resend_verification()
+            return
+
+        # Remember-Me: Wiederherstellung im selben Lauf (kein Extra-Rerun, verhindert mehrfaches Blinken)
+        if not st.session_state.is_authenticated and os.path.exists(REMEMBER_ME_PATH) and not st.session_state.get("pending_remember_me_restore"):
+            st.session_state.pending_remember_me_restore = True
+            try:
+                if "user_db" not in st.session_state:
+                    st.session_state.user_db = UserDatabase(os.path.join(BASE_DIR, "users.db"))
+                with open(REMEMBER_ME_PATH, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                username = data.get("username")
+                if username:
+                    user_db = st.session_state.user_db
+                    user_data = user_db.get_user(username)
+                    if user_data:
+                        st.session_state.is_authenticated = True
+                        st.session_state.current_user = user_data
+                        safe_username = re.sub(r"[^a-zA-Z0-9_]", "_", username)
+                        st.session_state.db = Database(db_path=get_vinyl_db_path(username))
+            except Exception:
+                pass
+            if "pending_remember_me_restore" in st.session_state:
+                del st.session_state["pending_remember_me_restore"]
+            if st.session_state.is_authenticated:
+                init_session_state()
+
+        # Prüfe Authentifizierung
+        _auth_ok = check_authentication()
+        _diagnostic_log("check_auth", {"auth_ok": _auth_ok, "run": st.session_state.get("boot_run_count", 0)}, "E")
+        # #region agent log
+        try:
+            with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as _dl:
+                _dl.write(json_log.dumps({"sessionId":"debug-session","runId":f"run{st.session_state.get('boot_run_count',0)}","hypothesisId":"E","location":"app.py:check_auth","message":"check_authentication","data":{"auth_ok":_auth_ok},"timestamp":int(time.time()*1000)}) + "\n")
+        except Exception:
+            pass
+        # #endregion
+        if not _auth_ok:
+            _placeholder.empty()
+            if "user_db" not in st.session_state:
+                st.session_state.user_db = UserDatabase(os.path.join(BASE_DIR, "users.db"))
+            if st.session_state.get("show_register", False):
+                show_register()
+            else:
+                show_login()
+            return
+
+        _boot_debug("main_before_main_content")
+        _main_content(_placeholder)
+        _diagnostic_log("main_content_returned", {"run": st.session_state.get("boot_run_count", 0)}, "A")
+        # #region agent log
+        try:
+            with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as _dl:
+                _dl.write(json_log.dumps({"sessionId":"debug-session","runId":f"run{st.session_state.get('boot_run_count',0)}","hypothesisId":"A","location":"app.py:main","message":"main_content_returned","data":{},"timestamp":int(time.time()*1000)}) + "\n")
+        except Exception:
+            pass
+        # #endregion
+    except Exception as e:
+        import traceback
+        _placeholder.empty()
+        st.error(f"Fehler: {e}")
+        st.code(traceback.format_exc())
+
+
+def _main_content(placeholder=None):
+    """Hauptinhalt nach Login (Sidebar, Seite). Bei Fehler wird in main() die Exception angezeigt.
+    placeholder: st.empty() aus main() – wird nach Heavy-Init geleert."""
+    _boot_checkpoint("main_content_enter")
+    _boot_debug("main_content_enter")
+    # Heavy-Init immer in diesem Lauf (kein Extra-Rerun mehr – verhindert mehrfaches Blinken)
+    if not st.session_state.get("_init_heavy_done"):
+        # Spinner im Placeholder, damit kein separates Delta und weniger Blinken
+        if placeholder is not None:
+            with placeholder.container():
+                st.markdown("**Lade VinylLocal AI …**")
+                st.caption("Einstellungen und APIs werden geladen …")
+                with st.spinner("Lade Einstellungen und APIs …"):
+                    _init_session_state_heavy()
         else:
-            show_login()
-        return
-    
-    # Ab hier: Benutzer ist eingeloggt
+            with st.spinner("Lade Einstellungen und APIs …"):
+                _init_session_state_heavy()
+    _boot_checkpoint("main_content_heavy_init_done")
+    _boot_debug("main_content_heavy_init_done")
+    _boot_debug("main_content_placeholder_cleared")
+    # Shopify OAuth Callback: code und shop in URL → Token tauschen, in DB speichern, Metafelder anlegen
+    if st.query_params.get("code") and st.query_params.get("shop") and "db" in st.session_state:
+        try:
+            from config import get_shopify_client_id, get_shopify_client_secret
+            db = st.session_state.db
+            settings = db.get_company_settings() or {}
+            client_id = (settings.get("shopify_client_id") or "").strip() or get_shopify_client_id()
+            client_secret = (settings.get("shopify_client_secret") or "").strip() or get_shopify_client_secret()
+            if not client_id or not client_secret:
+                st.error("Shopify OAuth fehlgeschlagen: Client ID und Client Secret in den Einstellungen oder in .env setzen.")
+                st.stop()
+            params_dict = dict(st.query_params)
+            if not verify_shopify_hmac(params_dict, client_secret):
+                st.error("Shopify OAuth fehlgeschlagen: HMAC-Prüfung fehlgeschlagen.")
+                st.stop()
+            code = st.query_params.get("code", "")
+            shop = st.query_params.get("shop", "")
+            access_token, err_msg = exchange_code_for_token(shop, code, client_id, client_secret)
+            if err_msg:
+                st.error(f"Shopify OAuth fehlgeschlagen: {err_msg}")
+                st.stop()
+            store_url = normalize_shopify_store_url(shop)
+            db = st.session_state.db
+            settings = db.get_company_settings() or {}
+            settings["shopify_store_url"] = store_url
+            settings["shopify_access_token"] = access_token
+            settings["shopify_enabled"] = 1
+            db.update_company_settings(settings)
+            client = ShopifyClient(store_url=store_url, access_token=access_token)
+            metafield_err = client.ensure_vinyl_metafield_definitions()
+            if metafield_err:
+                pass  # Verbindung erfolgreich; Metafelder ggf. später erneut anlegen
+            st.session_state.shopify_oauth_success = True
+            st.query_params.clear()
+            st.rerun()
+        except Exception as e:
+            st.error(f"Shopify OAuth fehlgeschlagen: {e}")
+            st.stop()
     
     # Prüfe ob E-Mail-Adresse vorhanden ist
     current_user = st.session_state.get("current_user")
@@ -7817,20 +11142,24 @@ def main():
         return
     
     # Ab hier: Benutzer ist eingeloggt und hat E-Mail
-    
+
     # Sidebar Navigation
+    _boot_checkpoint("main_content_sidebar_start")
+    _boot_debug("main_content_sidebar_start")
     # #region agent log
     try:
         with open(log_path, "a", encoding="utf-8") as f_log:
             f_log.write(json_log.dumps({"sessionId":"debug-session","runId":"startup","hypothesisId":"F","location":"app.py:5905","message":"Before sidebar.title","data":{},"timestamp":int(os_log.path.getmtime(log_path) if os_log.path.exists(log_path) else 0)}) + "\n")
     except: pass
     # #endregion
-    st.sidebar.title("🎵 VinylLocal AI")
+    st.sidebar.title("🎵 Vinyl-Shop")
     
     # Zeige eingeloggten Benutzer
     current_user = st.session_state.current_user
     if current_user:
         st.sidebar.markdown(f"**👤 {current_user.get('username', 'Benutzer')}**")
+    if CLOUD_DEMO_MODE:
+        st.sidebar.caption("☁️ **Cloud-Demo** – gemeinsame Datenbasis")
     
     st.sidebar.markdown("---")
     
@@ -7842,7 +11171,7 @@ def main():
     st.sidebar.markdown("---")
     
     # Navigation mit Session State für programmatische Navigation
-    nav_options = ["Dashboard", "Scan-Session", "Lager-Verwaltung", "Kasse/Rechnung", "Kunden", "⚙️ Einstellungen"]
+    nav_options = ["Dashboard", "Scan-Session", "Scan-Warteschlange", "Lager-Verwaltung", "📋 Kleinanzeigen-Assistent", "Kasse/Rechnung", "Kunden", "⚙️ Einstellungen"]
     
     # Speichere vorherige Seite für Vergleich
     previous_page = st.session_state.get("previous_page", None)
@@ -7890,13 +11219,16 @@ def main():
     # #endregion
     
     # Radio-Button mit explizitem Key für konsistenten State
+    _boot_checkpoint("before_sidebar_radio")
+    _boot_debug("before_sidebar_radio")
     page = st.sidebar.radio(
         "Navigation",
         nav_options,
         index=default_index,
         key="main_navigation_radio"
     )
-    
+    _boot_checkpoint("after_sidebar_radio")
+    _boot_debug("after_sidebar_radio")
     # Lösche navigate_to NACH dem Rendern des Radio-Buttons
     if "navigate_to" in st.session_state and st.session_state.navigate_to:
         # Prüfe ob Navigation erfolgreich war
@@ -7929,75 +11261,115 @@ def main():
         except: pass
         # #endregion
     
-    # System- und Speicher-Status (Sidebar)
-    try:
-        result = run_full_system_check(
-            project_root=BASE_DIR,
-            db=st.session_state.get("db"),
-            gemini_key_loaded=st.session_state.get("vision_ocr") is not None,
-        )
-    except Exception as e:
-        result = {
-            "structure": {"ok": False, "message": str(e)},
-            "database": {"ok": False, "message": str(e)},
-            "disk": {"ok": False, "status": "red", "message": str(e), "free_mb": 0.0, "total_mb": 0.0, "used_mb": 0.0},
-            "api": {"ok": None, "message": str(e)},
-        }
-    with st.sidebar.expander("🛠️ System & Speicher Status"):
-        for label, key in [("Struktur & Pfade", "structure"), ("Datenbank", "database"), ("API (Gemini)", "api")]:
-            item = result.get(key, {})
-            ok = item.get("ok")
-            msg = item.get("message", "")
-            icon = "✅" if ok is True else ("❌" if ok is False else "⚠️")
-            st.markdown(f"{icon} **{label}:** {msg}")
-        disk = result.get("disk", {})
-        ok = disk.get("ok")
-        status = disk.get("status", "green")
-        icon = "✅" if ok is True else ("❌" if ok is False else "⚠️")
-        st.markdown(f"{icon} **Speicherplatz:** {disk.get('message', '')}")
-        total_mb = disk.get("total_mb") or 0
-        used_mb = disk.get("used_mb") or 0
-        if total_mb > 0:
-            used_ratio = used_mb / total_mb
-            st.progress(min(1.0, max(0.0, used_ratio)))
-    
-    # Seiteninhalt anzeigen (nur wenn eingeloggt)
-    if not check_authentication():
-        show_login()
-        return
-    
-    # Duplikat-Meldung ausblenden, sobald Nutzer zu anderer Seite navigiert
-    if page != "Scan-Session":
-        if "duplicate_success_message" in st.session_state:
-            del st.session_state.duplicate_success_message
-        if "inventory_success_message" in st.session_state:
+    # Hauptinhalt in Placeholder rendern (ein Update statt empty + neu → weniger Blinken)
+    _boot_checkpoint("main_content_before_main_container")
+    with (placeholder.container() if placeholder is not None else contextlib.nullcontext()):
+        # Seiteninhalt anzeigen (nur wenn eingeloggt)
+        if not check_authentication():
+            show_login()
+            return
+
+        # Cloud-Demo-Hinweis oben im Hauptbereich
+        if CLOUD_DEMO_MODE:
+            st.info("Sie nutzen die **VinylLocal Cloud-Demo**. Alle Tester arbeiten mit derselben Datenbasis (Kunden, Inventar, Einstellungen).")
+
+        # Erfolgsmeldungen von Speicher-Buttons anzeigen (z.B. E-Mail speichern, Kunde anlegen, Inventar)
+        show_success_message("", "save_email")
+        show_success_message("", "create_customer")
+        show_success_message("", "save_inventory")
+
+        # Duplikat-Meldung ausblenden, sobald Nutzer zu anderer Seite navigiert
+        if page != "Scan-Session":
+            if "duplicate_success_message" in st.session_state:
+                del st.session_state.duplicate_success_message
+        # Inventar-Erfolgsmeldung nur löschen, wenn Nutzer die Lager-Verwaltung verlässt (nicht auf Inventar-Seite)
+        if page not in ("Scan-Session", "Lager-Verwaltung") and "inventory_success_message" in st.session_state:
             del st.session_state.inventory_success_message
-        if "sync_error_message" in st.session_state:
-            del st.session_state.sync_error_message
-        if "sync_error_traceback" in st.session_state:
-            del st.session_state.sync_error_traceback
-        st.session_state.duplicate_found = False
-        st.session_state.items_with_duplicates = []
-    
-    if page == "Dashboard":
-        show_dashboard()
-    elif page == "Scan-Session":
-        show_scan_session()
-    elif page == "Lager-Verwaltung":
-        show_inventory()
-    elif page == "Kasse/Rechnung":
-        show_checkout()
-    elif page == "Kunden":
-        show_customer_management()
-    elif page == "⚙️ Einstellungen":
-        show_settings()
-    
-    # Footer
+            if "sync_error_message" in st.session_state:
+                del st.session_state.sync_error_message
+            if "sync_error_traceback" in st.session_state:
+                del st.session_state.sync_error_traceback
+            st.session_state.duplicate_found = False
+            st.session_state.items_with_duplicates = []
+
+        # Beim Verlassen der Lager-Verwaltung Auto-Sync-Flag zurücksetzen (nächstes Öffnen löst ggf. Auto-Sync aus)
+        if page != "Lager-Verwaltung":
+            st.session_state["inventory_shopify_auto_sync_done"] = False
+
+        if page == "Dashboard":
+            show_dashboard()
+        elif page == "Scan-Session":
+            # Beim Wechsel von anderer Seite zur Scan-Session: alte Daten leeren (neue Session).
+            # previous_page ist die Seite vom letzten Run – st.session_state.previous_page wurde bereits auf page gesetzt.
+            if previous_page != "Scan-Session":
+                clear_scan_session_for_new_session()
+            show_scan_session()
+        elif page == "Scan-Warteschlange":
+            show_scan_queue()
+        elif page == "Lager-Verwaltung":
+            show_inventory()
+        elif page == "📋 Kleinanzeigen-Assistent":
+            show_kleinanzeigen_assistant()
+        elif page == "Kasse/Rechnung":
+            show_checkout()
+        elif page == "Kunden":
+            show_customer_management()
+        elif page == "⚙️ Einstellungen":
+            show_settings()
+
+    # Footer: Version aus config (nach Update sichtbar) + optional "Letztes Update"
     st.sidebar.markdown("---")
-    st.sidebar.markdown("**VinylLocal AI v1.3**")
+    st.sidebar.markdown(f"**Vinyl-Shop v{APP_VERSION}**")
+    _last_update_path = os.path.join(BASE_DIR, "last_update.txt")
+    if os.path.isfile(_last_update_path):
+        try:
+            with open(_last_update_path, "r", encoding="utf-8") as _f:
+                _lines = _f.read().strip().splitlines()
+            if _lines:
+                _ver = _lines[0].strip()
+                _date = _lines[1].strip() if len(_lines) > 1 else ""
+                if _date:
+                    st.sidebar.caption(f"Update angewendet: {_date}")
+        except Exception:
+            pass
+    # Nach vollständigem Render: Hide-CSS bei Folgeläufen nicht mehr anwenden → kein erneutes Ausblenden
+    st.session_state.boot_ui_ready = True
+    _diagnostic_log("boot_ui_ready_set", {"run": st.session_state.get("boot_run_count", 0)}, "D")
+    # #region agent log
+    try:
+        with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as _dl:
+            _dl.write(json_log.dumps({"sessionId":"debug-session","runId":f"run{st.session_state.get('boot_run_count',0)}","hypothesisId":"D","location":"app.py:_main_content","message":"boot_ui_ready_set","data":{},"timestamp":int(time.time()*1000)}) + "\n")
+    except Exception:
+        pass
+    # #endregion
+    _boot_checkpoint("main_content_finished")
 
 
 if __name__ == "__main__":
+    # #region agent log
+    try:
+        with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as _dl:
+            _dl.write(json_log.dumps({"sessionId":"debug-session","runId":"startup","hypothesisId":"H4","location":"app.py:__main__","message":"script_main_block_start","data":{},"timestamp":int(time.time()*1000)}) + "\n")
+    except Exception:
+        pass
+    # #endregion
+    # Run-Zähler und Checkpoints für Blink-Diagnose
+    st.session_state.boot_run_count = st.session_state.get("boot_run_count", 0) + 1
+    st.session_state.boot_phases_this_run = []
+    st.session_state.boot_checkpoints_this_run = []
+    st.session_state.boot_run_start = datetime.now().isoformat()
+    st.session_state.boot_run_start_ts = time.time()
+    # Lauf-Timeline (letzte 20 Runs) für Blink-Diagnose in der UI
+    if "run_timestamps" not in st.session_state:
+        st.session_state.run_timestamps = []
+    _ts = time.time()
+    st.session_state.run_timestamps.append((st.session_state.boot_run_count, _ts))
+    st.session_state.run_timestamps = st.session_state.run_timestamps[-20:]
+    _diagnostic_log("script_run_start", {"run": st.session_state.boot_run_count}, "A")
+    _boot_debug(f"===== RUN #{st.session_state.boot_run_count} =====")
+    _boot_checkpoint("__main___entry")
+    _boot_debug("__main___entry")
+    _boot_debug("script_entering_main")
     # #region agent log
     try:
         with open(log_path, "a", encoding="utf-8") as f_log:
@@ -8007,15 +11379,20 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as e:
+        import traceback
+        _boot_debug("main_exception " + type(e).__name__ + " " + str(e)[:150])
+        try:
+            tb_lines = traceback.format_exc().strip().split("\n")
+            for line in tb_lines[:5]:
+                _boot_debug("main_exception_tb " + line[:200])
+        except Exception:
+            pass
         # #region agent log
         try:
             with open(log_path, "a", encoding="utf-8") as f_log:
                 f_log.write(json_log.dumps({"sessionId":"debug-session","runId":"startup","hypothesisId":"D","location":"app.py:5965","message":"Error in main()","data":{"error":str(e),"error_type":type(e).__name__},"timestamp":int(os_log.path.getmtime(log_path) if os_log.path.exists(log_path) else 0)}) + "\n")
         except: pass
         # #endregion
-        import traceback
-        # print(f"CRITICAL ERROR: {e}")  # Deaktiviert wegen Streamlit stdout
-        # print(traceback.format_exc())  # Deaktiviert wegen Streamlit stdout
         st.error(f"CRITICAL ERROR: {e}")
         st.code(traceback.format_exc())
         raise

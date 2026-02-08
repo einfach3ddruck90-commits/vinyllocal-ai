@@ -26,10 +26,11 @@ wheels/
 # Environment variables
 .env
 
-# Database
+# Database (lokale Dev-DBs; Cloud-Demo-Assets ausgenommen)
 *.db
 *.db-shm
 *.db-wal
+!cloud_demo_assets/vinyl_demo.db
 
 # IDE
 .vscode/
@@ -50,10 +51,19 @@ backups/
 invoices/
 *.pdf
 
-# Images (optional, falls große Mengen)
+# Images (optional, falls große Mengen; Cloud-Demo-Assets ausgenommen)
 # uploads/
 # images/
 vinyl_images/
+!cloud_demo_assets/vinyl_images/
 
-# Debug logs
+# Debug logs und lokale Planungsdateien
 .cursor/debug.log
+.cursor/boot_debug.txt
+.cursor/plans/# Generierte Diagnose-Reports (vom App-Button)
+VinylLocal_Diagnose.txt# Build-Ausgabe (Installer/EXE)
+output/# Temporäre Ordner beim Bauen (build_release_zip.bat)
+release_staging/# Optionell: Update-ZIP nicht versionieren (wird von Update_ordner_erneuern.bat erzeugt)
+# Update/*.zip# Entwicklertests (API/OCR)
+test_run.py
+test_vinyl.jpg

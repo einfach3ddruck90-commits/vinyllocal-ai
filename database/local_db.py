@@ -13,8 +13,10 @@ from typing import Optional, List, Dict, Any
 from pathlib import Path
 from datetime import datetime
 
-# Debug logging - Projektroot (database/ ist Unterordner)
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+from config import get_base_path
+
+# Basisverzeichnis (Projektroot oder EXE-Verzeichnis)
+BASE_DIR = get_base_path()
 LOG_DIR = os.path.join(BASE_DIR, ".cursor")
 os.makedirs(LOG_DIR, exist_ok=True)
 DEBUG_LOG_PATH = os.path.join(LOG_DIR, "debug.log")
@@ -175,6 +177,20 @@ class Database:
             cursor.execute("SELECT format FROM inventory LIMIT 1")
         except sqlite3.OperationalError:
             cursor.execute("ALTER TABLE inventory ADD COLUMN format TEXT")
+            conn.commit()
+        
+        # Prüfe ob shopify_product_id Spalte existiert (für Shopify-Upload)
+        try:
+            cursor.execute("SELECT shopify_product_id FROM inventory LIMIT 1")
+        except sqlite3.OperationalError:
+            cursor.execute("ALTER TABLE inventory ADD COLUMN shopify_product_id TEXT")
+            conn.commit()
+        
+        # Prüfe ob genre Spalte existiert
+        try:
+            cursor.execute("SELECT genre FROM inventory LIMIT 1")
+        except sqlite3.OperationalError:
+            cursor.execute("ALTER TABLE inventory ADD COLUMN genre TEXT")
             conn.commit()
         
         # UNIQUE Constraint auf cat_no hinzufügen (Datenbank-Härtung für Duplikat-Schutz)
@@ -367,7 +383,13 @@ class Database:
             ("musicbrainz_api_key", "TEXT"),
             ("musicbrainz_enabled", "INTEGER DEFAULT 0"),
             ("discogs_api_key", "TEXT"),
-            ("discogs_enabled", "INTEGER DEFAULT 0")
+            ("discogs_enabled", "INTEGER DEFAULT 0"),
+            ("shopify_store_url", "TEXT"),
+            ("shopify_access_token", "TEXT"),
+            ("shopify_enabled", "INTEGER DEFAULT 0"),
+            ("shopify_auto_sync_quantity_on_load", "INTEGER DEFAULT 0"),
+            ("shopify_client_id", "TEXT"),
+            ("shopify_client_secret", "TEXT"),
         ]
         
         for column_name, column_type in api_key_columns:
@@ -404,6 +426,74 @@ class Database:
                     # Ignoriere Fehler falls Spalte bereits existiert
                     pass
         
+        # Prüfe ob Kleinanzeigen-Assistent-Spalten existieren
+        kleinanzeigen_columns = [
+            ("kleinanzeigen_intro_text", "TEXT"),
+            ("kleinanzeigen_footer_text", "TEXT"),
+            ("kleinanzeigen_translate_condition", "INTEGER DEFAULT 1"),
+            ("kleinanzeigen_shipping_info", "TEXT"),
+            ("kleinanzeigen_legal_info", "TEXT"),
+            ("kleinanzeigen_payment_info", "TEXT"),
+        ]
+        for column_name, column_type in kleinanzeigen_columns:
+            try:
+                cursor.execute(f"SELECT {column_name} FROM company_settings LIMIT 1")
+            except sqlite3.OperationalError:
+                try:
+                    cursor.execute(f"ALTER TABLE company_settings ADD COLUMN {column_name} {column_type}")
+                    conn.commit()
+                except Exception as migration_err:
+                    conn.rollback()
+                    pass
+
+        # Prüfe ob Shopify-Zustandsbeschreibung-Spalten existieren (für Produktbeschreibung)
+        shopify_zustand_columns = [
+            ("shopify_zustand_1", "TEXT"),
+            ("shopify_zustand_2", "TEXT"),
+            ("shopify_zustand_3", "TEXT"),
+            ("shopify_zustand_customer", "TEXT"),
+            ("shopify_zustand_after_condition", "TEXT"),
+            ("shopify_default_category", "TEXT"),
+        ]
+        for column_name, column_type in shopify_zustand_columns:
+            try:
+                cursor.execute(f"SELECT {column_name} FROM company_settings LIMIT 1")
+            except sqlite3.OperationalError:
+                try:
+                    cursor.execute(f"ALTER TABLE company_settings ADD COLUMN {column_name} {column_type}")
+                    conn.commit()
+                except Exception as migration_err:
+                    conn.rollback()
+                    pass
+        
+        # Prüfe ob Rechnungs-PDF-Spalten existieren (USt-IdNr., Zahlungsbedingungen)
+        invoice_pdf_columns = [
+            ("vat_id", "TEXT"),
+            ("payment_terms", "TEXT"),
+            ("payment_days", "INTEGER"),
+        ]
+        for column_name, column_type in invoice_pdf_columns:
+            try:
+                cursor.execute(f"SELECT {column_name} FROM company_settings LIMIT 1")
+            except sqlite3.OperationalError:
+                try:
+                    cursor.execute(f"ALTER TABLE company_settings ADD COLUMN {column_name} {column_type}")
+                    conn.commit()
+                except Exception as migration_err:
+                    conn.rollback()
+                    pass
+        
+        # Voreinstellung Plattenformat für Scan (Standard-Plattenformat)
+        try:
+            cursor.execute("SELECT default_format FROM company_settings LIMIT 1")
+        except sqlite3.OperationalError:
+            try:
+                cursor.execute("ALTER TABLE company_settings ADD COLUMN default_format TEXT")
+                conn.commit()
+            except Exception as migration_err:
+                conn.rollback()
+                pass
+        
         # Prüfe ob Bankverbindungs-Spalten existieren, falls nicht hinzufügen
         bank_columns = [
             ("bank_name", "TEXT"),
@@ -423,6 +513,17 @@ class Database:
                     conn.rollback()
                     # Ignoriere Fehler falls Spalte bereits existiert
                     pass
+        
+        # Firmen-Logo (relativer Pfad, z. B. vinyl_images/company_logo.png)
+        try:
+            cursor.execute("SELECT company_logo_path FROM company_settings LIMIT 1")
+        except sqlite3.OperationalError:
+            try:
+                cursor.execute("ALTER TABLE company_settings ADD COLUMN company_logo_path TEXT")
+                conn.commit()
+            except Exception as migration_err:
+                conn.rollback()
+                pass
         
         # Tabelle: customers (Kundenverwaltung)
         cursor.execute("""
@@ -537,6 +638,19 @@ class Database:
         # #region agent log
         _debug_log("database.py:_initialize_database", "Function exit", {}, "A")
         # #endregion
+    
+    def ensure_inventory_shopify_product_id_column(self) -> None:
+        """
+        Stellt sicher, dass die Spalte shopify_product_id in inventory existiert.
+        Nützlich wenn die DB vor der Migration erstellt wurde (legt Spalte bei Bedarf an).
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("SELECT shopify_product_id FROM inventory LIMIT 1")
+        except sqlite3.OperationalError:
+            cursor.execute("ALTER TABLE inventory ADD COLUMN shopify_product_id TEXT")
+            conn.commit()
     
     def add_record(self, table: str, data: Dict[str, Any]) -> int:
         """
@@ -1469,28 +1583,64 @@ class Database:
             """, (cat_no_normalized,))
             existing_record = cursor.fetchone()
         
-        # FALL A: Duplikat gefunden - führe automatisch UPDATE durch
+        # FALL A: Duplikat gefunden - UPDATE inkl. Ergänzen fehlender Metadaten
         if existing_record:
             existing_id = dict(existing_record)["id"] if isinstance(existing_record, sqlite3.Row) else existing_record[0]
             existing_quantity = dict(existing_record)["quantity"] if isinstance(existing_record, sqlite3.Row) else existing_record[1]
             existing_max_quantity = dict(existing_record)["max_quantity"] if isinstance(existing_record, sqlite3.Row) else existing_record[2]
             
-            # Berechne neue Werte
+            # Berechne neue Stückzahl
             new_quantity_value = record_data.get("quantity", 1)
             new_quantity = (existing_quantity or 0) + new_quantity_value
             new_max_quantity = (existing_max_quantity or existing_quantity or 0) + new_quantity_value
             
-            # UPDATE Statement
+            # Vollständigen bestehenden Datensatz laden für Merge
+            existing_row = self.get_record("inventory", existing_id)
+            if not existing_row:
+                existing_row = {}
+            
+            def _value_empty(val: Any, for_year: bool = False) -> bool:
+                """True wenn Wert als 'leer' gilt (darf ergänzt werden)."""
+                if val is None:
+                    return True
+                if isinstance(val, str):
+                    return not val.strip()
+                if isinstance(val, (int, float)):
+                    if for_year:
+                        return val == 0
+                    return False  # 0 als Preis etc. nicht als leer
+                if isinstance(val, list):
+                    return len(val) == 0
+                return False
+            
+            # Felder, die bei Duplikat ergänzt werden dürfen (nur Lücken füllen)
+            supplementable_fields = [
+                "artist", "title", "label", "year", "tracklist", "image_paths", "format", "genre",
+                "pricing", "condition_grading", "media_condition", "sleeve_condition",
+                "general_condition", "individual_condition_enabled", "individual_condition_text",
+                "purchase_price"
+            ]
+            fields_supplemented: List[str] = []
             update_data = {
                 "quantity": new_quantity,
                 "max_quantity": new_max_quantity,
                 "status": "available",
                 "updated_at": "CURRENT_TIMESTAMP"
             }
-            
-            # Füge purchase_price hinzu wenn vorhanden
-            if "purchase_price" in record_data and record_data["purchase_price"] is not None:
-                update_data["purchase_price"] = record_data["purchase_price"]
+            existing_keys = set(existing_row.keys()) if existing_row else set()
+            for key in supplementable_fields:
+                if key not in record_data or (existing_keys and key not in existing_keys):
+                    continue
+                new_val = record_data.get(key)
+                existing_val = existing_row.get(key) if existing_row else None
+                is_year = key == "year"
+                if _value_empty(existing_val, for_year=is_year) and not _value_empty(new_val, for_year=is_year):
+                    # image_paths: falls Liste, für DB als JSON speichern
+                    if key == "image_paths" and isinstance(new_val, list):
+                        update_data[key] = json.dumps(new_val) if new_val else ""
+                    else:
+                        update_data[key] = new_val
+                    fields_supplemented.append(key)
             
             # Baue UPDATE Query
             set_clauses = []
@@ -1512,16 +1662,21 @@ class Database:
             _debug_log("database.py:sync_to_inventory", "Update successful", {
                 "id": existing_id,
                 "old_quantity": existing_quantity,
-                "new_quantity": new_quantity
+                "new_quantity": new_quantity,
+                "fields_supplemented": fields_supplemented
             }, "SYNC")
             # #endregion
             
-            return {
+            result = {
                 "status": "updated",
                 "id": existing_id,
                 "old_quantity": existing_quantity or 0,
                 "new_quantity": new_quantity
             }
+            if fields_supplemented:
+                result["fields_supplemented"] = fields_supplemented
+                result["supplemented_count"] = len(fields_supplemented)
+            return result
         
         # FALL B: Kein Duplikat gefunden - führe INSERT durch
         else:
@@ -1912,9 +2067,13 @@ class Database:
             )
             conn.commit()
     
-    def get_sales_statistics(self) -> Dict[str, Any]:
+    def get_sales_statistics(self, date_from: Optional[str] = None, date_to: Optional[str] = None) -> Dict[str, Any]:
         """
         Berechnet umfassende Verkaufsstatistiken.
+        
+        Args:
+            date_from: Optional start date (YYYY-MM-DD) for invoice-based stats
+            date_to: Optional end date (YYYY-MM-DD) for invoice-based stats
         
         Returns:
             Dictionary mit verschiedenen Verkaufsstatistiken
@@ -1923,13 +2082,18 @@ class Database:
         cursor = conn.cursor()
         
         stats = {}
+        inv_where = ""
+        inv_params: tuple = ()
+        if date_from is not None and date_to is not None:
+            inv_where = " WHERE invoice_date >= ? AND invoice_date <= ?"
+            inv_params = (date_from, date_to)
         
         # Gesamtumsatz aus Rechnungen
-        cursor.execute("SELECT COALESCE(SUM(total_amount), 0) FROM invoices")
+        cursor.execute(f"SELECT COALESCE(SUM(total_amount), 0) FROM invoices{inv_where}", inv_params)
         stats['total_revenue'] = cursor.fetchone()[0] or 0.0
         
         # Anzahl Rechnungen
-        cursor.execute("SELECT COUNT(*) FROM invoices")
+        cursor.execute(f"SELECT COUNT(*) FROM invoices{inv_where}", inv_params)
         stats['total_invoices'] = cursor.fetchone()[0] or 0
         
         # Anzahl verkaufter Platten (status = 'sold')
@@ -1946,8 +2110,8 @@ class Database:
         
         # Gesamtgewinn berechnen: Umsatz - Einkaufskosten
         # WICHTIG: Berechne Einkaufskosten aus Rechnungen (nicht aus inventory status)
-        # Hole purchase_price aus invoice items
-        cursor.execute("SELECT items FROM invoices")
+        # Hole purchase_price aus invoice items (mit optionalem Datumsfilter)
+        cursor.execute(f"SELECT items FROM invoices{inv_where}", inv_params)
         total_cost = 0.0
         total_sold_quantity = 0
         
@@ -2126,19 +2290,45 @@ class Database:
         
         return stats
     
-    def get_top_customers(self, limit: int = 10, sort_by: str = 'revenue') -> List[Dict[str, Any]]:
+    def get_top_customers(self, limit: int = 10, sort_by: str = 'revenue', date_from: Optional[str] = None, date_to: Optional[str] = None) -> List[Dict[str, Any]]:
         """
         Ruft Top-Kunden nach Umsatz oder Anzahl ab.
         
         Args:
             limit: Anzahl der Top-Kunden
             sort_by: 'revenue' oder 'count'
+            date_from: Optional start date (YYYY-MM-DD)
+            date_to: Optional end date (YYYY-MM-DD)
         
         Returns:
             Liste von Dictionaries mit Kundendaten
         """
         conn = self._get_connection()
         cursor = conn.cursor()
+        
+        if date_from is not None and date_to is not None:
+            order_col = "revenue" if sort_by == 'revenue' else "purchases"
+            cursor.execute(f"""
+                SELECT c.id, c.name,
+                    COUNT(i.id) as purchases,
+                    COALESCE(SUM(i.total_amount), 0) as revenue
+                FROM invoices i
+                JOIN customers c ON c.id = i.customer_id
+                WHERE i.invoice_date >= ? AND i.invoice_date <= ? AND i.customer_id IS NOT NULL
+                GROUP BY c.id, c.name
+                HAVING COUNT(i.id) > 0
+                ORDER BY {order_col} DESC
+                LIMIT ?
+            """, (date_from, date_to, limit))
+            results = []
+            for row in cursor.fetchall():
+                results.append({
+                    'id': row[0],
+                    'name': row[1] or 'Unbekannt',
+                    'purchases': row[2] or 0,
+                    'revenue': row[3] or 0.0
+                })
+            return results
         
         if sort_by == 'revenue':
             order_by = "total_amount DESC"
@@ -2164,13 +2354,15 @@ class Database:
         
         return results
     
-    def get_top_sellers(self, limit: int = 10, sort_by: str = 'quantity') -> List[Dict[str, Any]]:
+    def get_top_sellers(self, limit: int = 10, sort_by: str = 'quantity', date_from: Optional[str] = None, date_to: Optional[str] = None) -> List[Dict[str, Any]]:
         """
         Ruft Top-verkaufte Platten ab.
         
         Args:
             limit: Anzahl der Top-Verkäufe
             sort_by: 'quantity' oder 'revenue'
+            date_from: Optional start date (YYYY-MM-DD)
+            date_to: Optional end date (YYYY-MM-DD)
         
         Returns:
             Liste von Dictionaries mit Verkaufsdaten
@@ -2178,8 +2370,14 @@ class Database:
         conn = self._get_connection()
         cursor = conn.cursor()
         
+        inv_where = ""
+        inv_params: tuple = ()
+        if date_from is not None and date_to is not None:
+            inv_where = " WHERE invoice_date >= ? AND invoice_date <= ?"
+            inv_params = (date_from, date_to)
+        
         # Hole alle Rechnungen und extrahiere verkaufte Items
-        cursor.execute("SELECT items FROM invoices")
+        cursor.execute(f"SELECT items FROM invoices{inv_where}", inv_params)
         all_items = []
         
         for row in cursor.fetchall():
@@ -2240,12 +2438,14 @@ class Database:
         
         return top_items
     
-    def get_sales_over_time(self, period: str = 'month') -> List[Dict[str, Any]]:
+    def get_sales_over_time(self, period: str = 'month', date_from: Optional[str] = None, date_to: Optional[str] = None) -> List[Dict[str, Any]]:
         """
         Ruft Verkaufsdaten über Zeit ab.
         
         Args:
             period: 'day', 'week', 'month', 'year'
+            date_from: Optional start date (YYYY-MM-DD)
+            date_to: Optional end date (YYYY-MM-DD)
         
         Returns:
             Liste von Dictionaries mit Zeitstempel und Verkaufsdaten
@@ -2267,6 +2467,12 @@ class Database:
             date_format = "strftime('%Y-%m', invoice_date)"
             group_by = "strftime('%Y-%m', invoice_date)"
         
+        where_clause = ""
+        params: tuple = ()
+        if date_from is not None and date_to is not None:
+            where_clause = " WHERE invoice_date >= ? AND invoice_date <= ?"
+            params = (date_from, date_to)
+        
         cursor.execute(f"""
             SELECT 
                 {date_format} as period,
@@ -2274,9 +2480,10 @@ class Database:
                 COALESCE(SUM(total_amount), 0) as revenue,
                 COUNT(DISTINCT customer_id) as customer_count
             FROM invoices
+            {where_clause}
             GROUP BY {group_by}
             ORDER BY period ASC
-        """)
+        """, params)
         
         results = []
         for row in cursor.fetchall():
@@ -2329,6 +2536,26 @@ class Database:
             })
         
         return results
+    
+    def get_inventory_by_condition(self) -> List[Dict[str, Any]]:
+        """
+        Ruft die Verteilung der Zustände im aktuellen (verfügbaren) Inventar ab.
+        
+        Returns:
+            Liste von Dictionaries mit condition und count
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT
+                COALESCE(NULLIF(TRIM(condition_grading), ''), NULLIF(TRIM(general_condition), ''), 'Unbekannt') AS cond,
+                SUM(COALESCE(quantity, 1)) AS cnt
+            FROM inventory
+            WHERE status = 'available' AND (COALESCE(quantity, 1) > 0)
+            GROUP BY cond
+            ORDER BY cnt DESC
+        """)
+        return [{"condition": row[0] or "Unbekannt", "count": int(row[1] or 0)} for row in cursor.fetchall()]
     
     def get_top_labels(self, limit: int = 10) -> List[Dict[str, Any]]:
         """

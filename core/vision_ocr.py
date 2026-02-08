@@ -8,8 +8,7 @@ import json
 import base64
 from typing import Optional, Dict, Any, List, Union
 from pathlib import Path
-from google import genai
-from PIL import Image, ImageEnhance
+from PIL import Image
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -26,6 +25,7 @@ class VisionOCR:
             api_key: Optionaler API-Key. Falls None, wird versucht aus Umgebungsvariablen zu laden.
         """
         try:
+            from google import genai
             # Verwende übergebenen API-Key oder versuche aus Umgebungsvariablen
             if not api_key:
                 api_key = os.getenv("GEMINI_API_KEY")
@@ -43,6 +43,11 @@ class VisionOCR:
             # Debug: Zeige verwendetes Modell (deaktiviert wegen Streamlit stdout)
             # print(f"Nutze Modell: {self.model_name}")
             
+        except ImportError as e:
+            raise RuntimeError(
+                f"Google GenAI (google-genai) nicht verfuegbar: {e}. "
+                "In der EXE-Version: Bitte App neu bauen oder Scan-Session mit API-Aufruf von ausserhalb nutzen."
+            ) from e
         except Exception as e:
             raise RuntimeError(f"Fehler bei Initialisierung der Gemini API: {e}")
     
@@ -299,13 +304,15 @@ WICHTIGE HINWEISE:
         if image.mode != 'RGB':
             image = image.convert('RGB')
         
-        # Erhöhe Kontrast (Faktor 1.2)
-        enhancer = ImageEnhance.Contrast(image)
-        image = enhancer.enhance(1.2)
-        
-        # Erhöhe Schärfe (Faktor 1.1)
-        enhancer = ImageEnhance.Sharpness(image)
-        image = enhancer.enhance(1.1)
+        # Erhöhe Kontrast/Schärfe falls ImageEnhance verfügbar (in EXE ggf. nicht gebündelt)
+        try:
+            from PIL import ImageEnhance
+            enhancer = ImageEnhance.Contrast(image)
+            image = enhancer.enhance(1.2)
+            enhancer = ImageEnhance.Sharpness(image)
+            image = enhancer.enhance(1.1)
+        except (ImportError, AttributeError):
+            pass  # Ohne Vorverarbeitung weiterverwenden
         
         return image
     
@@ -514,6 +521,171 @@ Antworte NUR mit dem JSON-Objekt, ohne zusätzlichen Text oder Erklärungen."""
         except Exception as e:
             raise RuntimeError(f"Unerwarteter Fehler bei Bildanalyse: {e}")
     
+    def classify_front_back(self, image_paths: List[str]) -> Dict[str, int]:
+        """
+        Erkennt, welches von zwei Bildern das Frontcover und welches das Rückcover ist.
+        
+        Args:
+            image_paths: Liste mit genau 2 Bildpfaden (Reihenfolge beliebig).
+        
+        Returns:
+            {"front_index": 0, "back_index": 1} oder {"front_index": 1, "back_index": 0}.
+            Bei Fehler Fallback: front_index=0, back_index=1.
+        """
+        fallback = {"front_index": 0, "back_index": 1}
+        if not image_paths or len(image_paths) != 2:
+            return fallback
+        if not os.path.exists(image_paths[0]) or not os.path.exists(image_paths[1]):
+            return fallback
+        try:
+            import io
+            image_bytes_list = []
+            for img_path in image_paths:
+                image = Image.open(img_path)
+                image = self._preprocess_image(image)
+                buffer = io.BytesIO()
+                image.save(buffer, format='JPEG', quality=95)
+                image_bytes_list.append(buffer.getvalue())
+        except Exception:
+            return fallback
+        prompt = """Du siehst zwei Bilder einer Schallplatte. Bild 1 ist das erste Bild, Bild 2 das zweite.
+Das Frontcover zeigt meist Künstler und Albumtitel. Das Rückcover zeigt oft Tracklist, Label, Katalognummer.
+Antworte NUR mit einem JSON-Objekt in dieser Form (ohne anderen Text):
+{"front_index": 0 oder 1, "back_index": 0 oder 1}
+front_index = Index des Bildes, das das FRONTCOVER ist (0 = erstes Bild, 1 = zweites Bild).
+back_index = Index des Bildes, das das RÜCKCOVER ist. front_index und back_index müssen verschieden sein."""
+        try:
+            from google.genai import types
+            contents = [
+                types.Part.from_text(text=prompt),
+                types.Part.from_bytes(data=image_bytes_list[0], mime_type="image/jpeg"),
+                types.Part.from_bytes(data=image_bytes_list[1], mime_type="image/jpeg")
+            ]
+            response = self.client.models.generate_content(
+                model=self.model_name,
+                contents=contents
+            )
+            response_text = ""
+            if hasattr(response, 'text'):
+                response_text = response.text.strip()
+            elif hasattr(response, 'candidates') and response.candidates:
+                parts = getattr(response.candidates[0].content, 'parts', None)
+                if parts and hasattr(parts[0], 'text'):
+                    response_text = parts[0].text.strip()
+            if not response_text:
+                return fallback
+            if "```" in response_text:
+                if "```json" in response_text:
+                    response_text = response_text.split("```json")[1].split("```")[0].strip()
+                else:
+                    response_text = response_text.split("```")[1].split("```")[0].strip()
+            data = json.loads(response_text)
+            fi = int(data.get("front_index", 0))
+            bi = int(data.get("back_index", 1))
+            if fi not in (0, 1) or bi not in (0, 1) or fi == bi:
+                return fallback
+            return {"front_index": fi, "back_index": bi}
+        except Exception:
+            return fallback
+
+    def group_covers_batch(self, image_paths: List[str]) -> Dict[str, Any]:
+        """
+        Gruppiert mehrere Cover-Bilder in Paare (Front+Rück derselben Platte) und Einzelcover.
+
+        Args:
+            image_paths: Liste von N Bildpfaden.
+
+        Returns:
+            {"pairs": [[i, j], [k, l], ...], "singles": [a, b, ...]}
+            Jeder Index 0..N-1 kommt höchstens einmal vor. Bei Fehler: alle als singles.
+        """
+        n = len(image_paths) if image_paths else 0
+        fallback = {"pairs": [], "singles": list(range(n)), "rejected": []}
+        if n == 0:
+            return fallback
+        for p in image_paths:
+            if not p or not os.path.exists(p):
+                return fallback
+        try:
+            import io
+            from google.genai import types
+            image_bytes_list = []
+            for img_path in image_paths:
+                image = Image.open(img_path)
+                image = self._preprocess_image(image)
+                buffer = io.BytesIO()
+                image.save(buffer, format='JPEG', quality=95)
+                image_bytes_list.append(buffer.getvalue())
+        except Exception:
+            return fallback
+        prompt = f"""Du siehst {n} Bilder von Schallplatten-Covern (Bild 0 bis Bild {n-1}).
+Typischerweise sind es zwei Fotos pro Platte: Vorder- und Rueckseite derselben Schallplatte. Deine Aufgabe: Ordne zu, welche Bilder zusammengehoeren (Front+Rueck einer Platte) und welche nur ein Einzelcover sind.
+Antworte NUR mit einem JSON-Objekt in exakt dieser Form (kein anderer Text):
+{{"pairs": [[i, j], [k, l], ...], "singles": [a, b, ...], "rejected": [x, y, ...]}}
+- pairs: Liste von Index-Paaren. Jedes Paar [i, j] = Bild i und Bild j sind Front- und Rueckcover derselben Platte. Jeder Index nur einmal.
+- singles: Indizes, die nur ein Einzelcover sind (kein Paar).
+- rejected: Optional. Indizes von Bildern, die KEIN Vinyl-Cover sind (z. B. andere Fotos, unscharf, leer). Nur angeben wenn wirklich kein Cover.
+Alle uebrigen Indizes 0 bis {n-1} genau einmal (in einem Paar oder in singles). Wenn unsicher: bilde Paare aus aufeinanderfolgenden Bildern (0-1, 2-3, 4-5, ...). rejected kann leer sein []."""
+        try:
+            contents = [types.Part.from_text(text=prompt)]
+            for data in image_bytes_list:
+                contents.append(types.Part.from_bytes(data=data, mime_type="image/jpeg"))
+            response = self.client.models.generate_content(
+                model=self.model_name,
+                contents=contents
+            )
+            response_text = ""
+            if hasattr(response, 'text'):
+                response_text = response.text.strip()
+            elif hasattr(response, 'candidates') and response.candidates:
+                parts = getattr(response.candidates[0].content, 'parts', None)
+                if parts and hasattr(parts[0], 'text'):
+                    response_text = parts[0].text.strip()
+            if not response_text:
+                return fallback
+            if "```" in response_text:
+                if "```json" in response_text:
+                    response_text = response_text.split("```json")[1].split("```")[0].strip()
+                else:
+                    response_text = response_text.split("```")[1].split("```")[0].strip()
+            start = response_text.find("{")
+            end = response_text.rfind("}")
+            if start >= 0 and end > start:
+                response_text = response_text[start : end + 1]
+            data = json.loads(response_text)
+            pairs = data.get("pairs", [])
+            singles = data.get("singles", [])
+            rejected = data.get("rejected", [])
+            if not isinstance(pairs, list):
+                pairs = []
+            if not isinstance(singles, list):
+                singles = []
+            if not isinstance(rejected, list):
+                rejected = []
+            used = set()
+            valid_rejected = [int(r) for r in rejected if isinstance(r, (int, float)) and 0 <= int(r) < n]
+            used.update(valid_rejected)
+            valid_pairs = []
+            for p in pairs:
+                if isinstance(p, (list, tuple)) and len(p) == 2:
+                    i, j = int(p[0]), int(p[1])
+                    if 0 <= i < n and 0 <= j < n and i != j and i not in used and j not in used:
+                        used.add(i)
+                        used.add(j)
+                        valid_pairs.append([i, j])
+            valid_singles = [int(s) for s in singles if isinstance(s, (int, float)) and 0 <= int(s) < n and int(s) not in used]
+            for idx in range(n):
+                if idx not in used:
+                    valid_singles.append(idx)
+            if not valid_pairs and n >= 2 and n % 2 == 0 and not valid_rejected:
+                valid_pairs = [[i, i + 1] for i in range(0, n, 2)]
+                valid_singles = []
+            return {"pairs": valid_pairs, "singles": valid_singles, "rejected": valid_rejected}
+        except Exception:
+            if n >= 2 and n % 2 == 0:
+                return {"pairs": [[i, i + 1] for i in range(0, n, 2)], "singles": [], "rejected": []}
+            return {"pairs": fallback["pairs"], "singles": fallback["singles"], "rejected": []}
+
     def _parse_year(self, year_value: Any) -> Optional[int]:
         """
         Parst Jahr-Wert in Integer um.

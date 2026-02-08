@@ -17,5 +17,6 @@ __all__ = [
     "parse_tracklist_to_table",
     "table_to_tracklist_string",
     "table_to_readable_string",
+    "html_to_tracklist_text",
     "run_full_system_check",
 ]

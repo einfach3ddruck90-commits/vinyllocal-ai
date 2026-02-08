@@ -5,9 +5,10 @@ Unterstützt beide Steuer-Status:
 - Differenzbesteuerung (§ 25a UStG)
 """
 
+import os
 from typing import Dict, Any, List, Optional
 from fpdf import FPDF
-from datetime import datetime
+from datetime import datetime, timedelta
 
 
 class InvoicePDFGenerator:
@@ -82,17 +83,22 @@ class InvoicePDFGenerator:
                     if bank_bic:
                         bank_lines.append(f"BIC: {bank_bic}")
             
-            # Zeige Bankverbindung
-            if bank_lines:
-                for line in bank_lines:
-                    pdf_instance.cell(0, 4, line, ln=True, align="C")
-                pdf_instance.ln(2)
-            
-            # Erstellungsdatum und Seitenzahl (Format: "Seite X von Y")
-            # Verwende {nb} Platzhalter für Gesamtseitenzahl (wird beim Output ersetzt)
+            # BIC zentriert auf der Seite, Seitenzahl rechtsbündig auf gleicher Höhe
             current_page = pdf_instance.page_no()
-            footer_text = f"Erstellt am {datetime.now().strftime('%d.%m.%Y %H:%M')} | Seite {current_page} von " + "{nb}"
-            pdf_instance.cell(0, 4, footer_text, ln=True, align="C")
+            page_text = f"Seite {current_page} von " + "{nb}"
+            if bank_lines:
+                for i, line in enumerate(bank_lines):
+                    if i < len(bank_lines) - 1:
+                        pdf_instance.cell(0, 4, line, ln=True, align="C")
+                    else:
+                        # BIC zentrisch, Seitenzahl rechts: Platz für Seitenzahl reservieren, BIC in Rest zentrieren
+                        page_w = pdf_instance.get_string_width(page_text) + 6
+                        usable = 180 - page_w  # nutzbare Breite ohne Seitenzahl
+                        pdf_instance.cell(page_w / 2, 4, "")
+                        pdf_instance.cell(usable, 4, line, align="C")
+                        pdf_instance.cell(0, 4, page_text, ln=True, align="R")
+            else:
+                pdf_instance.cell(0, 4, page_text, ln=True, align="R")
         
         self.pdf.footer = footer
         
@@ -121,13 +127,25 @@ class InvoicePDFGenerator:
         # Steuerhinweis (abhängig vom Status)
         self._add_tax_note(invoice_data)
         
+        # Zahlungsbedingungen (optional)
+        self._add_payment_terms(invoice_data)
+        
         # Speichern
         self.pdf.output(output_path)
         
         return output_path
     
     def _add_company_header(self, company_info: Dict[str, Any]) -> None:
-        """Fügt Firmendaten-Header zur PDF hinzu."""
+        """Fügt Firmendaten-Header zur PDF hinzu. Logo optional rechts oben."""
+        # FPDF verlangt vor jedem cell() eine gesetzte Schrift (sonst Fehler auf einigen Systemen)
+        self.pdf.set_font("Helvetica", "", 10)
+        logo_path = company_info.get("company_logo_abs") or ""
+        if logo_path and os.path.isfile(logo_path):
+            try:
+                # A4: 210 mm; Logo klein, rechts oben (15 mm Abstand rechts, 22 mm breit)
+                self.pdf.image(logo_path, x=210 - 15 - 22, y=10, w=22, keep_aspect_ratio=True)
+            except Exception:
+                pass
         company_name = company_info.get("company_name", "")
         tax_number = company_info.get("tax_number", "")
         
@@ -181,7 +199,14 @@ class InvoicePDFGenerator:
             self.pdf.set_font("Arial", "", 9)
             self.pdf.cell(0, 5, f"Steuernummer: {tax_number}", ln=True)
         
-        self.pdf.ln(5)
+        vat_id = (company_info.get("vat_id") or "").strip()
+        if vat_id:
+            self.pdf.set_font("Arial", "", 9)
+            self.pdf.cell(0, 5, f"USt-IdNr.: {vat_id}", ln=True)
+        
+        self.pdf.ln(2)
+        self.pdf.cell(0, 0, "", border="B", ln=True)
+        self.pdf.ln(4)
     
     def _add_invoice_header(self, invoice_data: Dict[str, Any]) -> None:
         """Fügt Rechnungs-Header zur PDF hinzu."""
@@ -195,6 +220,7 @@ class InvoicePDFGenerator:
     
     def _add_customer_info(self, customer_info: Dict[str, str]) -> None:
         """Fügt Kundendaten zur PDF hinzu."""
+        self.pdf.ln(2)
         self.pdf.set_font("Arial", "B", 12)
         self.pdf.cell(0, 8, "Rechnungsempfänger:", ln=True)
         
@@ -204,45 +230,36 @@ class InvoicePDFGenerator:
         if name:
             self.pdf.cell(0, 5, name, ln=True)
         
-        # Prüfe ob einzelne Adressfelder vorhanden sind
-        street = customer_info.get("Straße", "")
-        house_number = customer_info.get("Hausnummer", "")
-        postal_code = customer_info.get("PLZ", "")
-        city = customer_info.get("Ort", "")
-        state = customer_info.get("Bundesland", "")
-        country = customer_info.get("Land", "")
+        # Einzelne Adressfelder (mit Fallback auf "Strasse" ohne Umlaut)
+        street = (customer_info.get("Straße") or customer_info.get("Strasse") or "").strip()
+        house_number = (customer_info.get("Hausnummer") or "").strip()
+        postal_code = (customer_info.get("PLZ") or "").strip()
+        city = (customer_info.get("Ort") or "").strip()
+        state = (customer_info.get("Bundesland") or "").strip()
+        country = (customer_info.get("Land") or "").strip()
         
-        # Verwende einzelne Felder falls vorhanden
         if street or postal_code or city:
             # Zeile 1: Straße + Hausnummer
             if street:
-                street_line = street
-                if house_number:
-                    street_line = f"{street} {house_number}"
+                street_line = f"{street} {house_number}".strip() if house_number else street
                 self.pdf.cell(0, 5, street_line, ln=True)
-            
-            # Zeile 2: PLZ + Ort
+            # Zeile 2: PLZ + Ort (immer unter der Straße)
             if postal_code and city:
                 self.pdf.cell(0, 5, f"{postal_code} {city}", ln=True)
             elif city:
                 self.pdf.cell(0, 5, city, ln=True)
             elif postal_code:
                 self.pdf.cell(0, 5, postal_code, ln=True)
-            
-            # Weitere Zeilen: Bundesland und Land
             if state:
                 self.pdf.cell(0, 5, state, ln=True)
-            
             if country and country != 'Deutschland':
                 self.pdf.cell(0, 5, country, ln=True)
         else:
-            # Fallback: Verwende "Adresse"-Feld falls einzelne Felder nicht vorhanden sind
-            address = customer_info.get("Adresse", "")
+            # Fallback: "Adresse" in Zeilen aufteilen (Komma = neue Zeile, damit PLZ/Ort unter Straße)
+            address = (customer_info.get("Adresse") or "").strip()
             if address:
-                address_lines = address.split('\n')
-                for line in address_lines:
-                    if line.strip():
-                        self.pdf.cell(0, 5, line.strip(), ln=True)
+                for part in [p.strip() for p in address.split(",") if p.strip()]:
+                    self.pdf.cell(0, 5, part, ln=True)
         
         self.pdf.ln(5)
     
@@ -267,15 +284,17 @@ class InvoicePDFGenerator:
         if not regular_items and not shipping_items:
             return
         
+        self.pdf.ln(4)
         self.pdf.set_font("Arial", "B", 12)
         self.pdf.cell(0, 8, "Positionen:", ln=True)
         self.pdf.ln(2)
         
-        # Tabellen-Header
+        # Tabellen-Header (Beschreibung, Stückzahl, Betrag)
         self.pdf.set_font("Arial", "B", 10)
-        col_widths = [120, 70]  # Beschreibung, Preis
+        col_widths = [95, 22, 63]  # Beschreibung, Stückzahl, Betrag (EUR)
         self.pdf.cell(col_widths[0], 7, "Beschreibung", border=1)
-        self.pdf.cell(col_widths[1], 7, "Betrag (EUR)", border=1, align="R")
+        self.pdf.cell(col_widths[1], 7, "Stück", border=1, align="C")
+        self.pdf.cell(col_widths[2], 7, "Betrag (EUR)", border=1, align="R")
         self.pdf.ln()
         
         # Tabellen-Zeilen für reguläre Artikel
@@ -286,31 +305,27 @@ class InvoicePDFGenerator:
             quantity = int(item.get("quantity", 1) or 1)  # WICHTIG: Hole quantity für Anzeige
             discount_percent = float(item.get("discount_percent", 0.0) or 0.0)  # WICHTIG: Hole Rabatt für Anzeige
             
-            # Beschreibung mit quantity und Rabatt erweitern
+            # Beschreibung mit Rabatt erweitern (Stückzahl steht in eigener Spalte)
             description_parts = []
-            if quantity > 1:
-                description_parts.append(f"{quantity}x")
             if discount_percent > 0:
                 description_parts.append(f"Rabatt: {discount_percent:.1f}%")
-            
-            if description_parts:
-                description_with_info = f"{description} ({', '.join(description_parts)})"
-            else:
-                description_with_info = description
+            description_with_info = f"{description} ({', '.join(description_parts)})" if description_parts else description
             
             # Beschreibung kann lang sein - umbrechen falls nötig
             desc_lines = self.pdf.multi_cell(col_widths[0], 6, description_with_info, border=1, align="L", split_only=True)
             max_lines = len(desc_lines)
             
-            # Zeichne erste Zeile
+            # Zeichne erste Zeile (Beschreibung, Stückzahl, Betrag)
             self.pdf.cell(col_widths[0], 6, desc_lines[0] if desc_lines else description_with_info, border=1)
-            self.pdf.cell(col_widths[1], 6, f"{price_total:.2f}", border=1, align="R")  # WICHTIG: Verwende Gesamtpreis (nach Rabatt)
+            self.pdf.cell(col_widths[1], 6, str(quantity), border=1, align="C")
+            self.pdf.cell(col_widths[2], 6, f"{price_total:.2f}", border=1, align="R")  # WICHTIG: Gesamtpreis (nach Rabatt)
             self.pdf.ln()
             
-            # Weitere Zeilen falls Beschreibung umgebrochen wurde
+            # Weitere Zeilen falls Beschreibung umgebrochen wurde (nur Beschreibungsspalte gefüllt)
             for i in range(1, max_lines):
                 self.pdf.cell(col_widths[0], 6, desc_lines[i], border=1)
-                self.pdf.cell(col_widths[1], 6, "", border=1)  # Leere Zelle für Preis
+                self.pdf.cell(col_widths[1], 6, "", border=1)
+                self.pdf.cell(col_widths[2], 6, "", border=1)
                 self.pdf.ln()
         
         self.pdf.ln(3)
@@ -346,14 +361,14 @@ class InvoicePDFGenerator:
             else:
                 shipping_name = "Versandkosten"
         
-        # Zeige Versandkosten separat wenn vorhanden
+        # Zeige Versandkosten separat wenn vorhanden (3 Spalten wie Tabelle)
         if shipping_cost > 0:
             self.pdf.ln(2)
             self.pdf.set_font("Arial", "", 10)
-            col_widths = [120, 70]
-            # Versandkosten-Zeile ohne oberen Rand (visuell getrennt)
-            self.pdf.cell(col_widths[0], 6, f"Versandkosten ({shipping_name})", border="LTR")
-            self.pdf.cell(col_widths[1], 6, f"{shipping_cost:.2f}", border="LTR", align="R")
+            col_widths = [95, 22, 63]
+            self.pdf.cell(col_widths[0], 6, f"Versandkosten ({shipping_name})", border=1)
+            self.pdf.cell(col_widths[1], 6, "-", border=1, align="C")
+            self.pdf.cell(col_widths[2], 6, f"{shipping_cost:.2f}", border=1, align="R")
             self.pdf.ln()
             self.pdf.ln(3)
     
@@ -362,9 +377,9 @@ class InvoicePDFGenerator:
         total_amount = float(invoice_data.get("total_amount", 0.0))
         
         self.pdf.set_font("Arial", "B", 11)
-        col_widths = [120, 70]
-        self.pdf.cell(col_widths[0], 8, "Gesamtbetrag:", border=1, align="R")
-        self.pdf.cell(col_widths[1], 8, f"{total_amount:.2f} EUR", border=1, align="R")
+        col_widths = [95, 22, 63]
+        self.pdf.cell(col_widths[0] + col_widths[1], 8, "Gesamtbetrag:", border=1, align="R")
+        self.pdf.cell(col_widths[2], 8, f"{total_amount:.2f} EUR", border=1, align="R")
         self.pdf.ln(5)
     
     def _add_tax_note(self, invoice_data: Dict[str, Any]) -> None:
@@ -386,6 +401,33 @@ class InvoicePDFGenerator:
             self.pdf.cell(0, 5, "Differenzbesteuerung nach § 25a UStG", ln=True)
             self.pdf.cell(0, 5, f"Die Umsatzsteuer ist im Verkaufspreis enthalten und wird auf die Marge berechnet.", ln=True)
             self.pdf.cell(0, 5, f"Marge: {margin:.2f} EUR, Umsatzsteuer ({tax_rate*100:.0f}%): {tax_amount:.2f} EUR", ln=True)
+    
+    def _add_payment_terms(self, invoice_data: Dict[str, Any]) -> None:
+        """Fügt optional Zahlungsbedingungen und Fälligkeitsdatum zur PDF hinzu."""
+        company_info = invoice_data.get("company_info") or {}
+        payment_terms = (company_info.get("payment_terms") or "").strip()
+        payment_days = company_info.get("payment_days")
+        try:
+            payment_days = int(payment_days) if payment_days is not None else None
+        except (TypeError, ValueError):
+            payment_days = None
+        if not payment_terms and not (payment_days and payment_days > 0):
+            return
+        self.pdf.ln(5)
+        self.pdf.set_font("Arial", "B", 9)
+        self.pdf.cell(0, 5, "Zahlungsbedingungen:", ln=True)
+        self.pdf.set_font("Arial", "", 9)
+        if payment_terms:
+            self.pdf.cell(0, 5, payment_terms, ln=True)
+        if payment_days and payment_days > 0:
+            invoice_date_str = invoice_data.get("invoice_date", "")
+            if invoice_date_str:
+                try:
+                    inv_dt = datetime.strptime(invoice_date_str, "%Y-%m-%d")
+                    due_dt = inv_dt + timedelta(days=payment_days)
+                    self.pdf.cell(0, 5, f"Fällig am: {due_dt.strftime('%d.%m.%Y')}", ln=True)
+                except (ValueError, TypeError):
+                    pass
     
     def _add_footer(self) -> None:
         """Legacy-Methode - wird nicht mehr verwendet, da footer() automatisch aufgerufen wird."""

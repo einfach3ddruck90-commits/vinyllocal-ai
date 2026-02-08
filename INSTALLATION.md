@@ -79,6 +79,10 @@
 ### "Permission denied" (Linux/Mac)
 - Machen Sie `start.sh` ausführbar: `chmod +x start.sh`
 
+## Updates
+
+Zum Aktualisieren einer bestehenden Installation siehe **UPDATE_ANLEITUNG.txt** (welche Dateien kopieren, welche nicht überschreiben).
+
 ## Unterstützung
 
 Bei weiteren Problemen prüfen Sie die Log-Datei in `.cursor/debug.log`

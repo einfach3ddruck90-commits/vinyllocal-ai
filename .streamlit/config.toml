@@ -1,4 +1,21 @@
 # Streamlit-Konfiguration
 # Maximale Upload-Größe in MB (für Backup-ZIP und andere Datei-Uploads bei großen Inventaren)
+[global]
+developmentMode = false
+
 [server]
 maxUploadSize = 2000
+enableCORS = false
+enableXsrfProtection = false
+
+# Einheitliches Erscheinungsbild (Dashboard wie auf Entwicklungsrechner)
+# Farben abgestimmt auf app.py show_dashboard() (DASHBOARD_*, ACCENT_*)
+[theme]
+base = "light"
+primaryColor = "#5c6bc0"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f5f5f5"
+textColor = "#2c2c2c"
+
+[browser]
+gatherUsageStats = false

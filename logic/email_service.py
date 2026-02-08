@@ -5,8 +5,6 @@ Verwaltet SMTP-Verbindungen und E-Mail-Versand.
 
 import smtplib
 import os
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 from typing import Optional, Dict, Any
 from datetime import datetime
 from dotenv import load_dotenv
@@ -164,6 +162,11 @@ class EmailService:
         Returns:
             Tuple (success: bool, message: str)
         """
+        try:
+            from email.mime.text import MIMEText
+            from email.mime.multipart import MIMEMultipart
+        except ImportError:
+            return False, "E-Mail-Modul (email.mime) nicht verfügbar. Bitte App neu bauen oder Python-Standardbibliothek prüfen."
         try:
             # Erstelle E-Mail-Nachricht
             msg = MIMEMultipart('alternative')

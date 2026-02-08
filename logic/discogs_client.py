@@ -40,34 +40,41 @@ class DiscogsClient:
         except Exception as e:
             raise RuntimeError(f"Fehler bei Initialisierung des Discogs Clients: {e}")
     
-    def search(self, query: str, type: str = "release", per_page: int = 25, 
-               prefer_catno: bool = False) -> Optional[Dict[str, Any]]:
+    @staticmethod
+    def _strip_quotes(s: str) -> str:
+        """Entfernt Anführungszeichen aus einem String, damit die API keine Anführungsstriche in query/catno erhält."""
+        if not s:
+            return s
+        quotes = '"\'`"\u201c\u201d\u2018\u2019\u201a\u201b\u201e\u201f\u2039\u203a\uff02\u00ab\u00bb'
+        return "".join(c for c in s if c not in quotes).strip()
+    
+    def search(self, query: str, type: str = "release", per_page: int = 25,
+               prefer_catno: bool = False, catno: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """
         Sucht nach Releases in der Discogs-Datenbank.
-        
+
         Args:
             query: Suchbegriff (z.B. "Artist - Title" oder Katalognummer)
             type: Typ der Suche (default: "release")
             per_page: Anzahl Ergebnisse pro Seite (max 100)
-            prefer_catno: Wenn True, wird die Suche für Katalognummern optimiert
-            
+            prefer_catno: Wenn True, wird die Suche für Katalognummern optimiert (veraltet, nutze catno=)
+            catno: Optional. Katalognummer; wird als API-Parameter catno gesendet für präzisere Treffer
+
         Returns:
             Dictionary mit Suchergebnissen oder None bei Fehler
         """
         try:
+            query = self._strip_quotes(str(query).strip()) if query else ""
+            catno = self._strip_quotes(str(catno).strip()) if catno else None
             url = f"{self.BASE_URL}/database/search"
             params = {
                 "q": query,
                 "type": type,
                 "per_page": min(per_page, 100)  # Max 100 pro Seite
             }
-            
-            # Wenn Cat-No bevorzugt wird, kann man zusätzliche Parameter setzen
-            # Discogs sortiert automatisch nach Relevanz, Cat-No-Suchen sind meist sehr präzise
-            if prefer_catno:
-                # Optionale Parameter für bessere Cat-No-Suche könnten hier hinzugefügt werden
-                pass
-            
+            if catno:
+                params["catno"] = catno
+
             response = requests.get(url, headers=self.headers, params=params, timeout=10)
             response.raise_for_status()
             
@@ -130,10 +137,44 @@ class DiscogsClient:
             print(f"Unerwarteter Fehler bei Release-Abfrage: {e}")
             return None
     
+    def get_master(self, master_id: int) -> Optional[Dict[str, Any]]:
+        """
+        Ruft Details zu einem Master-Release ab (z. B. für Jahr-Fallback wenn Release kein Jahr hat).
+        
+        Args:
+            master_id: Discogs Master-ID
+            
+        Returns:
+            Dictionary mit Master-Details oder None bei Fehler
+        """
+        try:
+            url = f"{self.BASE_URL}/masters/{master_id}"
+            response = requests.get(url, headers=self.headers, timeout=10)
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.Timeout:
+            print(f"Zeitüberschreitung bei Abfrage von Master {master_id}")
+            return None
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 404:
+                print(f"Master {master_id} nicht gefunden")
+            elif e.response.status_code == 429:
+                print("Rate-Limit erreicht. Bitte warten Sie einen Moment.")
+            else:
+                print(f"HTTP-Fehler bei Master-Abfrage: {e}")
+            return None
+        except requests.exceptions.RequestException as e:
+            print(f"Fehler bei Master-Abfrage: {e}")
+            return None
+        except Exception as e:
+            print(f"Unerwarteter Fehler bei Master-Abfrage: {e}")
+            return None
+    
     def extract_tracklist(self, release: Dict[str, Any]) -> str:
         """
         Extrahiert die Trackliste aus einem Discogs Release und formatiert sie als Text.
         Behält Side-Informationen (A, B, C...) bei, damit sie später in Seiten-Nummern konvertiert werden können.
+        Fallback: Bei numerischen Positionen (1, 2, 3) und Vinyl-Format Side-Marker aus Format ableiten.
         
         Args:
             release: Dictionary mit Release-Details von get_release()
@@ -145,48 +186,101 @@ class DiscogsClient:
             tracklist = release.get("tracklist", [])
             if not tracklist:
                 return ""
-            
+
+            # Prüfe ob mindestens ein Track Side-Buchstaben in position hat
+            has_side_letters = False
+            for track in tracklist:
+                pos = str(track.get("position", "")).strip()
+                if pos and pos[0].isalpha():
+                    has_side_letters = True
+                    break
+
+            # Fallback für numerische Positionen (1, 2, 3): Side-Marker aus Format ableiten
+            if not has_side_letters and len(tracklist) >= 6:
+                num_sides = self._get_vinyl_side_count(release)
+                if num_sides >= 2:
+                    return self._format_tracklist_with_heuristic_sides(
+                        tracklist, num_sides
+                    )
+
             formatted_tracks = []
             current_side = None
-            
+
             for track in tracklist:
                 position = track.get("position", "")
                 title = track.get("title", "")
                 duration = track.get("duration", "")
-                
+
                 # Erkenne Side-Wechsel: Position beginnt oft mit A, B, C, etc.
                 if position:
-                    # Extrahiere Side-Buchstaben aus Position (z.B. "A1" -> "A", "B2" -> "B")
-                    side_match = re.match(r'^([A-Z])\d+', position.upper())
+                    side_match = re.match(r'^([A-Z])\d+', str(position).upper())
                     if side_match:
                         new_side = side_match.group(1)
-                        # Wenn Side gewechselt, füge Side-Marker hinzu
                         if new_side != current_side:
                             current_side = new_side
                             formatted_tracks.append(f"Side {current_side}:")
-                    elif position.upper().startswith("SIDE "):
-                        # Falls Position bereits "Side A" Format hat
+                    elif str(position).upper().startswith("SIDE "):
                         formatted_tracks.append(f"{position}:")
-                
-                # Formatiere Track
+
                 if position and title:
                     track_line = f"{position}. {title}"
                     if duration:
                         track_line += f" ({duration})"
                     formatted_tracks.append(track_line)
                 elif title:
-                    # Fallback: Nur Titel falls Position fehlt
                     track_line = title
                     if duration:
                         track_line += f" ({duration})"
                     formatted_tracks.append(track_line)
-            
+
             return "\n".join(formatted_tracks)
-            
+
         except Exception as e:
             print(f"Fehler beim Extrahieren der Trackliste: {e}")
             return ""
-    
+
+    def _get_vinyl_side_count(self, release: Dict[str, Any]) -> int:
+        """Ermittelt die Anzahl Vinyl-Seiten aus dem Format (1LP=2, 2LP=4, etc.)."""
+        formats_list = release.get("formats", [])
+        if not formats_list:
+            return 2  # Default: 1LP = 2 Seiten
+        for fmt in formats_list:
+            if isinstance(fmt, dict):
+                name = (fmt.get("name") or "").lower()
+                if "vinyl" in name or "lp" in name:
+                    qty = fmt.get("qty", "1")
+                    try:
+                        n = int(str(qty).strip())
+                        return min(max(n * 2, 2), 8)  # 1LP=2, 2LP=4, 3LP=6, 4LP=8
+                    except (ValueError, TypeError):
+                        return 2
+        return 2
+
+    def _format_tracklist_with_heuristic_sides(
+        self, tracklist: list, num_sides: int
+    ) -> str:
+        """Formatiert Tracklist mit Side-Markern basierend auf gleichmäßiger Aufteilung."""
+        side_letters = "ABCDEFGH"
+        n = len(tracklist)
+        tracks_per_side = max(1, (n + num_sides - 1) // num_sides)
+        lines = []
+        current_side_idx = -1
+        for i, track in enumerate(tracklist):
+            side_idx = min(i // tracks_per_side, num_sides - 1)
+            if side_idx != current_side_idx:
+                current_side_idx = side_idx
+                letter = side_letters[side_idx] if side_idx < len(side_letters) else str(side_idx + 1)
+                lines.append(f"Side {letter}:")
+            position = track.get("position", str(i + 1))
+            title = track.get("title", "")
+            duration = track.get("duration", "")
+            if title:
+                line = f"{position}. {title}"
+                if duration:
+                    line += f" ({duration})"
+                lines.append(line)
+        return "\n".join(lines)
+
     def get_marketplace_price(self, release_id: int) -> Optional[float]:
         """
         Ruft den Median-Preis für ein Release aus dem Discogs Marketplace ab.

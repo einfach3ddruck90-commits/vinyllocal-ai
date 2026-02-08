@@ -213,52 +213,64 @@ class MusicBrainzClient:
         return ""
     
     def _extract_tracklist(self, release: Dict[str, Any]) -> List[Dict[str, str]]:
-        """Extrahiert die Trackliste aus einem Release."""
+        """
+        Extrahiert die Trackliste aus einem Release mit Media-Struktur.
+        Jedes Vinyl-Medium hat 2 Seiten (A/B, C/D, ...). Tracks werden pro Medium halbiert.
+        """
         tracks = []
         if "media" in release:
-            for medium in release["media"]:
-                if "tracks" in medium:
-                    for track in medium["tracks"]:
-                        # Konvertiere Laufzeit von Millisekunden zu mm:ss Format
-                        length_str = ""
-                        if track.get("length"):
-                            length_ms = track.get("length", 0)
-                            length_seconds = length_ms // 1000
-                            minutes = length_seconds // 60
-                            seconds = length_seconds % 60
-                            length_str = f"{minutes}:{seconds:02d}"
-                        
-                        track_data = {
-                            "position": str(track.get("position", "")),
-                            "title": track.get("title", ""),
-                            "length": length_str
-                        }
-                        tracks.append(track_data)
+            for medium_idx, medium in enumerate(release["media"]):
+                if "tracks" not in medium:
+                    continue
+                medium_tracks = medium["tracks"]
+                n = len(medium_tracks)
+                mid = (n + 1) // 2  # Erste Hälfte = Seite 1/A, zweite = Seite 2/B
+                for track_idx, track in enumerate(medium_tracks):
+                    # Medium 0: Tracks 0..mid-1 = Seite 1, mid..n-1 = Seite 2
+                    # Medium 1: Tracks 0..mid-1 = Seite 3, mid..n-1 = Seite 4
+                    if track_idx < mid:
+                        seite = str(2 * medium_idx + 1)
+                    else:
+                        seite = str(2 * medium_idx + 2)
+                    length_str = ""
+                    if track.get("length"):
+                        length_ms = track.get("length", 0)
+                        length_seconds = length_ms // 1000
+                        minutes = length_seconds // 60
+                        seconds = length_seconds % 60
+                        length_str = f"{minutes}:{seconds:02d}"
+                    track_data = {
+                        "position": str(track.get("position", "")),
+                        "title": track.get("title", ""),
+                        "length": length_str,
+                        "Seite": seite,
+                    }
+                    tracks.append(track_data)
         return tracks
-    
+
     def format_tracklist_as_string(self, tracklist: List[Dict[str, str]]) -> str:
         """
         Konvertiert MusicBrainz Trackliste (Liste von Dicts) zu String-Format für die App.
-        
-        Args:
-            tracklist: Liste von Dictionaries mit "position", "title", "length"
-        
-        Returns:
-            String im Format "Position. Titel (Laufzeit)" pro Zeile
+        Fügt "Seite 1:", "Seite 2:" etc. ein, wenn track.get("Seite") vorhanden ist.
         """
         if not tracklist:
             return ""
-        
+
         lines = []
+        current_seite = None
         for track in tracklist:
+            seite = track.get("Seite", "")
             position = track.get("position", "")
             title = track.get("title", "")
             length = track.get("length", "")
-            
+
             if title:
+                if seite and seite != current_seite:
+                    current_seite = seite
+                    lines.append(f"Seite {seite}:")
                 line = f"{position}. {title}" if position else title
                 if length:
                     line += f" ({length})"
                 lines.append(line)
-        
+
         return "\n".join(lines)
