@@ -22,6 +22,13 @@ CLOUD_DEMO_MODE = (
     and APP_MODE == "CLOUD"
 )
 
+# Demo-Modus: Nur vorgegebene Bilder aus demo_images/ wählbar, kein file_uploader für Plattenbilder.
+# Nur wirksam wenn CLOUD_DEMO_MODE.
+DEMO_MODE = (
+    (os.getenv("DEMO_MODE") or "").strip().lower() in ("1", "true", "yes")
+    and CLOUD_DEMO_MODE
+)
+
 # Ordner für Cover-Fotos (relativ zum Projektroot). Wird von core/health.py und app.py genutzt.
 COVERS_DIR = "vinyl_images"
 
@@ -46,6 +53,11 @@ def get_base_path() -> str:
 def get_demo_db_path() -> str:
     """Pfad zur gemeinsamen Demo-DB (nur bei CLOUD_DEMO_MODE relevant)."""
     return os.path.join(get_base_path(), "cloud_demo_assets", "vinyl_demo.db")
+
+
+def get_demo_images_dir() -> str:
+    """Pfad zum Ordner mit vorgegebenen Demo-Bildern (nur bei Cloud-Demo relevant)."""
+    return os.path.join(get_base_path(), "cloud_demo_assets", "demo_images")
 
 
 def get_covers_dir() -> str:

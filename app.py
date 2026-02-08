@@ -7,7 +7,7 @@ Streamlit-basiertes Interface für Vinyl-Bestandsverwaltung.
 import json as json_log
 import os
 import os as os_log
-from config import get_base_path, get_covers_dir, get_vinyl_db_path, APP_VERSION, PENDING_SCANS_DIR, CLOUD_DEMO_MODE
+from config import get_base_path, get_covers_dir, get_vinyl_db_path, APP_VERSION, PENDING_SCANS_DIR, CLOUD_DEMO_MODE, DEMO_MODE, get_demo_images_dir
 # Basisverzeichnis (Projektroot oder EXE-Verzeichnis)
 BASE_DIR = get_base_path()
 LOG_DIR = os.path.join(BASE_DIR, ".cursor")
@@ -387,6 +387,21 @@ def format_address(customer: Dict[str, Any]) -> str:
     
     # Fallback auf altes address Feld
     return customer.get('address', '')
+
+
+def _get_demo_image_choices() -> list:
+    """Liefert [(Anzeigename, absoluter_Pfad), ...] für alle Bilddateien im Demo-Ordner. Nur bei DEMO_MODE relevant."""
+    if not DEMO_MODE:
+        return []
+    demo_dir = get_demo_images_dir()
+    if not os.path.isdir(demo_dir):
+        return []
+    allowed = (".jpg", ".jpeg", ".png")
+    out = []
+    for name in sorted(os.listdir(demo_dir)):
+        if name.lower().endswith(allowed):
+            out.append((name, os.path.join(demo_dir, name)))
+    return out
 
 
 def format_company_address(company_settings: Dict[str, Any]) -> str:
@@ -2570,7 +2585,108 @@ def show_scan_queue():
     )
 
     if source == "Bilder hochladen":
-        if is_single_cover:
+        if DEMO_MODE:
+            demo_choices = _get_demo_image_choices()
+            if not demo_choices:
+                st.info("Keine Demo-Bilder im Ordner **cloud_demo_assets/demo_images** vorhanden.")
+            else:
+                options = [c[0] for c in demo_choices]
+                name_to_path = {c[0]: c[1] for c in demo_choices}
+                if is_single_cover:
+                    selected = st.multiselect("Cover-Bilder aus Demo-Ordner wählen (jedes = eine Platte)", options=options, key="queue_demo_singles")
+                    if selected and st.button("Einzelcover zur Warteschlange hinzufügen", type="primary", key="queue_demo_singles_btn"):
+                        try:
+                            queue_singles = []
+                            for name in selected:
+                                path = name_to_path.get(name)
+                                if path and os.path.isfile(path):
+                                    with open(path, "rb") as f:
+                                        queue_singles.append({"front_bytes": f.read(), "back_bytes": None, "front_name": name, "back_name": None})
+                            if queue_singles:
+                                ki_singles_dir = os.path.join(pending_dir, "ki_singles")
+                                os.makedirs(ki_singles_dir, exist_ok=True)
+                                for fname in os.listdir(ki_singles_dir):
+                                    try:
+                                        os.remove(os.path.join(ki_singles_dir, fname))
+                                    except Exception:
+                                        pass
+                                for i, item in enumerate(queue_singles):
+                                    with open(os.path.join(ki_singles_dir, f"{i + 1}.jpg"), "wb") as out:
+                                        out.write(item["front_bytes"])
+                                st.session_state.scan_queue_pairs = []
+                                st.session_state.scan_queue_singles = queue_singles
+                                st.session_state.ki_pairs_dir = os.path.join(pending_dir, "ki_pairs")
+                                st.session_state.ki_singles_dir = ki_singles_dir
+                                st.session_state.batch_result_message = f"{len(queue_singles)} Platte(n) mit 1 Cover zur Warteschlange hinzugefügt."
+                                if "batch_error_message" in st.session_state:
+                                    del st.session_state["batch_error_message"]
+                                if "scan_queue_failed" in st.session_state:
+                                    del st.session_state["scan_queue_failed"]
+                                st.rerun()
+                        except Exception as e:
+                            st.error("Fehler: " + str(e))
+                else:
+                    gemini_available = st.session_state.get("vision_ocr") is not None
+                    openai_available = st.session_state.get("openai_vision_ocr") is not None
+                    if not gemini_available and not openai_available:
+                        st.warning("Keine KI-API verfügbar.")
+                    else:
+                        selected = st.multiselect("Bilder aus Demo-Ordner (2 pro Platte: Front, Rück)", options=options, key="queue_demo_pairs")
+                        if selected and len(selected) % 2 == 0 and st.button("Paare zur Warteschlange hinzufügen", type="primary", key="queue_demo_pairs_btn"):
+                            with st.spinner("Front/Rück wird zugeordnet..."):
+                                try:
+                                    paths = [name_to_path[n] for n in selected if name_to_path.get(n) and os.path.isfile(name_to_path.get(n))]
+                                    vision = st.session_state.openai_vision_ocr if openai_available else st.session_state.vision_ocr
+                                    queue_pairs = []
+                                    for k in range(0, len(paths), 2):
+                                        if k + 1 >= len(paths):
+                                            break
+                                        paths_ij = [paths[k], paths[k + 1]]
+                                        classify = vision.classify_front_back(paths_ij)
+                                        fi, bi = classify["front_index"], classify["back_index"]
+                                        with open(paths_ij[fi], "rb") as fp:
+                                            front_bytes = fp.read()
+                                        with open(paths_ij[bi], "rb") as fp:
+                                            back_bytes = fp.read()
+                                        names_ij = [selected[k], selected[k + 1]]
+                                        queue_pairs.append({"front_bytes": front_bytes, "back_bytes": back_bytes, "front_name": names_ij[fi], "back_name": names_ij[bi]})
+                                    if queue_pairs:
+                                        ki_pairs_dir = os.path.join(pending_dir, "ki_pairs")
+                                        ki_singles_dir = os.path.join(pending_dir, "ki_singles")
+                                        os.makedirs(ki_pairs_dir, exist_ok=True)
+                                        os.makedirs(ki_singles_dir, exist_ok=True)
+                                        for name in os.listdir(ki_pairs_dir):
+                                            path = os.path.join(ki_pairs_dir, name)
+                                            try:
+                                                if os.path.isdir(path):
+                                                    shutil.rmtree(path)
+                                                else:
+                                                    os.remove(path)
+                                            except Exception:
+                                                pass
+                                        for i, item in enumerate(queue_pairs):
+                                            pair_dir = os.path.join(ki_pairs_dir, str(i + 1))
+                                            os.makedirs(pair_dir, exist_ok=True)
+                                            with open(os.path.join(pair_dir, "front.jpg"), "wb") as f:
+                                                f.write(item["front_bytes"])
+                                            with open(os.path.join(pair_dir, "back.jpg"), "wb") as f:
+                                                f.write(item["back_bytes"])
+                                        st.session_state.scan_queue_pairs = queue_pairs
+                                        st.session_state.scan_queue_singles = []
+                                        st.session_state.ki_pairs_dir = ki_pairs_dir
+                                        st.session_state.ki_singles_dir = ki_singles_dir
+                                        st.session_state.batch_result_message = f"{len(queue_pairs)} Platte(n) zur Warteschlange hinzugefügt."
+                                        if "batch_error_message" in st.session_state:
+                                            del st.session_state["batch_error_message"]
+                                        if "scan_queue_failed" in st.session_state:
+                                            del st.session_state["scan_queue_failed"]
+                                        st.rerun()
+                                except Exception as e:
+                                    st.error("Fehler: " + str(e))
+                        elif selected and len(selected) % 2 != 0:
+                            st.warning("Bitte eine gerade Anzahl von Bildern wählen (2 pro Platte).")
+            upload_files = None
+        elif is_single_cover:
             upload_files = st.file_uploader(
                 "Cover-Bilder hochladen (jedes Bild = eine Platte mit einem Cover)",
                 type=["jpg", "jpeg", "png"],
@@ -3132,15 +3248,39 @@ def show_scan_session():
         if "scan_enlarged_cover" not in st.session_state:
             st.session_state.scan_enlarged_cover = None  # None | "front" | "back" – großes Bild in col1, Metadaten in col2 bearbeitbar
 
-        # Ein-Klick-Upload: Beide Cover auf einmal hochladen (2 Bilder)
-        both_covers_upload = st.file_uploader(
-            "Beide Cover auf einmal hochladen (2 Bilder)",
-            type=["jpg", "jpeg", "png"],
-            accept_multiple_files=True,
-            help="Wählen Sie genau 2 Bilder (Front- und Rückcover). Die KI ordnet sie automatisch zu.",
-            key=f"upload_both_covers_{st.session_state.upload_reset_counter}"
-        )
-        if both_covers_upload is not None and len(both_covers_upload) == 2 and not st.session_state.both_covers_upload_done:
+        # Ein-Klick-Upload: Beide Cover hochladen ODER im Demo-Modus aus vorgegebenem Ordner wählen
+        if DEMO_MODE:
+            demo_choices = _get_demo_image_choices()
+            if not demo_choices:
+                st.info("Keine Demo-Bilder im Ordner **cloud_demo_assets/demo_images** vorhanden. Bitte Bilder (JPG/PNG) dort ablegen.")
+            else:
+                opt_none = "— Bitte wählen —"
+                options = [opt_none] + [c[0] for c in demo_choices]
+                name_to_path = {c[0]: c[1] for c in demo_choices}
+                col_d1, col_d2 = st.columns(2)
+                with col_d1:
+                    demo_front = st.selectbox("Frontcover aus Demo-Ordner", options=options, key="demo_scan_front")
+                with col_d2:
+                    demo_back = st.selectbox("Rückcover aus Demo-Ordner", options=options, key="demo_scan_back")
+                if st.button("Diese Auswahl übernehmen", type="primary", key="demo_scan_apply_btn") and demo_front != opt_none and demo_back != opt_none and demo_front != demo_back:
+                    path_front = name_to_path.get(demo_front)
+                    path_back = name_to_path.get(demo_back)
+                    if path_front and path_back:
+                        st.session_state.pending_two_covers_paths = [path_front, path_back]
+                        st.session_state.pending_two_covers_names = [demo_front, demo_back]
+                        st.rerun()
+                elif demo_front != opt_none and demo_back != opt_none and demo_front == demo_back:
+                    st.caption("Bitte zwei unterschiedliche Bilder wählen (Front und Rück).")
+            both_covers_upload = None
+        else:
+            both_covers_upload = st.file_uploader(
+                "Beide Cover auf einmal hochladen (2 Bilder)",
+                type=["jpg", "jpeg", "png"],
+                accept_multiple_files=True,
+                help="Wählen Sie genau 2 Bilder (Front- und Rückcover). Die KI ordnet sie automatisch zu.",
+                key=f"upload_both_covers_{st.session_state.upload_reset_counter}"
+            )
+        if not DEMO_MODE and both_covers_upload is not None and len(both_covers_upload) == 2 and not st.session_state.both_covers_upload_done:
             # Genau 2 Dateien: Temp-Dateien anlegen und als „pending“ speichern (Zuordnung erst per KI)
             tmp_paths = []
             tmp_names = []
@@ -3151,7 +3291,7 @@ def show_scan_session():
                     tmp_names.append(f.name)
             st.session_state.pending_two_covers_paths = tmp_paths
             st.session_state.pending_two_covers_names = tmp_names
-        elif both_covers_upload is not None and len(both_covers_upload) == 1:
+        elif not DEMO_MODE and both_covers_upload is not None and len(both_covers_upload) == 1:
             # Eine Datei: nur bei neuem Upload zuordnen und zurücksetzen (nicht bei Rerun nach Analyse)
             if both_covers_upload[0].name != st.session_state.cover_last_front_uploader_name:
                 st.session_state.cover_front_bytes = both_covers_upload[0].getvalue()
@@ -7312,29 +7452,55 @@ def show_vinyl_detail_view(item_id: int, db: Database, inline: bool = False):
         st.info("ℹ️ Keine Bilder für diese Platte vorhanden.")
         st.markdown("---")
     
-    # Bild-Upload-Sektion für neue Bilder
-    st.subheader("📤 Neue Bilder hochladen")
-    st.markdown("Laden Sie neue Cover-Bilder hoch, um die vorhandenen zu ersetzen oder zu ergänzen.")
+    # Bild-Upload-Sektion für neue Bilder (oder im Demo-Modus: Auswahl aus vorgegebenem Ordner)
+    st.subheader("📤 Neue Bilder hochladen" if not DEMO_MODE else "📤 Bilder aus Demo-Ordner wählen")
+    st.markdown("Laden Sie neue Cover-Bilder hoch, um die vorhandenen zu ersetzen oder zu ergänzen." if not DEMO_MODE else "Wählen Sie Bilder aus dem vorgegebenen Demo-Ordner.")
     
-    col_upload1, col_upload2 = st.columns(2)
-    with col_upload1:
-        edit_front_img = st.file_uploader(
-            "📸 Cover Frontseite",
-            type=["jpg", "jpeg", "png"],
-            help="Frontseite des Vinyl-Covers (JPG, JPEG oder PNG)",
-            key=f"edit_upload_front_{item_id}"
-        )
+    edit_front_img = None
+    edit_back_img = None
+    if DEMO_MODE:
+        demo_choices = _get_demo_image_choices()
+        if not demo_choices:
+            st.info("Keine Demo-Bilder im Ordner **cloud_demo_assets/demo_images** vorhanden.")
+        else:
+            opt_none = "— Keins —"
+            options = [opt_none] + [c[0] for c in demo_choices]
+            name_to_path = {c[0]: c[1] for c in demo_choices}
+            col_upload1, col_upload2 = st.columns(2)
+            with col_upload1:
+                edit_demo_front = st.selectbox("📸 Cover Frontseite aus Demo-Ordner", options=options, key=f"edit_demo_front_{item_id}")
+            with col_upload2:
+                edit_demo_back = st.selectbox("📄 Cover Rückseite aus Demo-Ordner (optional)", options=options, key=f"edit_demo_back_{item_id}")
+            if edit_demo_front != opt_none or edit_demo_back != opt_none:
+                paths_to_use = []
+                if edit_demo_front != opt_none and name_to_path.get(edit_demo_front):
+                    paths_to_use.append(name_to_path[edit_demo_front])
+                if edit_demo_back != opt_none and name_to_path.get(edit_demo_back):
+                    paths_to_use.append(name_to_path[edit_demo_back])
+                if paths_to_use:
+                    if "edit_vinyl_data" not in st.session_state:
+                        st.session_state.edit_vinyl_data = {}
+                    st.session_state.edit_vinyl_data["uploaded_image_paths"] = paths_to_use
+                    st.success(f"✅ {len(paths_to_use)} Bild(er) ausgewählt. Klicken Sie auf 'Änderungen speichern', um sie zu übernehmen.")
+    else:
+        col_upload1, col_upload2 = st.columns(2)
+        with col_upload1:
+            edit_front_img = st.file_uploader(
+                "📸 Cover Frontseite",
+                type=["jpg", "jpeg", "png"],
+                help="Frontseite des Vinyl-Covers (JPG, JPEG oder PNG)",
+                key=f"edit_upload_front_{item_id}"
+            )
+        with col_upload2:
+            edit_back_img = st.file_uploader(
+                "📄 Cover Rückseite (optional)",
+                type=["jpg", "jpeg", "png"],
+                help="Rückseite des Vinyl-Covers für bessere Erkennung von Label und Cat-No",
+                key=f"edit_upload_back_{item_id}"
+            )
     
-    with col_upload2:
-        edit_back_img = st.file_uploader(
-            "📄 Cover Rückseite (optional)",
-            type=["jpg", "jpeg", "png"],
-            help="Rückseite des Vinyl-Covers für bessere Erkennung von Label und Cat-No",
-            key=f"edit_upload_back_{item_id}"
-        )
-    
-    # Verarbeite hochgeladene Bilder
-    if edit_front_img is not None or edit_back_img is not None:
+    # Verarbeite hochgeladene Bilder (nur wenn nicht DEMO_MODE, da Demo oben schon gesetzt)
+    if not DEMO_MODE and (edit_front_img is not None or edit_back_img is not None):
         try:
             # Stelle sicher, dass edit_vinyl_data initialisiert ist
             if "edit_vinyl_data" not in st.session_state:

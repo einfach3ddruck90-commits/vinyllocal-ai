@@ -4,6 +4,7 @@ Dieser Ordner wird für das **Cloud-Demo-Deployment** (Streamlit Community Cloud
 
 - **vinyl_demo.db** – Gemeinsame Demo-Datenbank (Kunden, optional Inventar, Company Settings inkl. Platzhalter für Shopify Demo-Store).
 - **vinyl_images/** – Cover-Bilder für das Demo-Inventar (optional befüllbar).
+- **demo_images/** – Vorgegebene Bilder für den **Demo-Modus**. Wenn `DEMO_MODE=true` (und `CLOUD_DEMO_MODE=true`) gesetzt ist, können Nutzer in Scan-Session und Lager-Verwaltung nur Bilder aus diesem Ordner wählen (kein Upload). JPG/PNG hier ablegen (z. B. 10–20 Cover für Test-Platten).
 
 ## Erstellung / Aktualisierung der Demo-DB
 
