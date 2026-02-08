@@ -7,7 +7,7 @@ Streamlit-basiertes Interface für Vinyl-Bestandsverwaltung.
 import json as json_log
 import os
 import os as os_log
-from config import get_base_path, get_covers_dir, get_vinyl_db_path, APP_VERSION, PENDING_SCANS_DIR, CLOUD_DEMO_MODE, DEMO_MODE, get_demo_images_dir
+from config import get_base_path, get_covers_dir, get_vinyl_db_path, APP_VERSION, PENDING_SCANS_DIR, CLOUD_DEMO_MODE, DEMO_MODE, get_demo_images_dir, APP_MODE
 # Basisverzeichnis (Projektroot oder EXE-Verzeichnis)
 BASE_DIR = get_base_path()
 LOG_DIR = os.path.join(BASE_DIR, ".cursor")
@@ -1084,6 +1084,7 @@ def _init_session_state_heavy():
         # Cloud: Wenn Key aus Secrets vorhanden, Discogs automatisch aktivieren (Demo-DB hat ggf. discogs_enabled=0)
         if APP_MODE == "CLOUD" and get_discogs_api_key() and not discogs_enabled:
             discogs_enabled = True
+            st.session_state.settings_discogs_enabled = True  # damit automatische Discogs-Suche nach KI-Analyse läuft
     except Exception:
         discogs_api_key = api_settings.get("discogs_api_key", "") or ""
     
@@ -1869,6 +1870,7 @@ def _ensure_discogs_client() -> None:
         discogs_api_key = (get_discogs_api_key() or api_settings.get("discogs_api_key") or "").strip()
         if APP_MODE == "CLOUD" and get_discogs_api_key() and not discogs_enabled:
             discogs_enabled = True
+            st.session_state.settings_discogs_enabled = True  # damit automatische Discogs-Suche läuft
     except Exception:
         discogs_api_key = (api_settings.get("discogs_api_key") or "").strip()
     if not discogs_api_key:
@@ -11335,6 +11337,10 @@ def _main_content(placeholder=None):
         st.sidebar.markdown(f"**👤 {current_user.get('username', 'Benutzer')}**")
     if CLOUD_DEMO_MODE:
         st.sidebar.caption("☁️ **Cloud-Demo** – gemeinsame Datenbasis")
+    # Modus-Check (Cloud): Secrets sichtbar machen, damit bei Problemen APP_MODE/CLOUD_DEMO_MODE/DEMO_MODE geprüft werden können
+    if APP_MODE == "CLOUD":
+        with st.sidebar.expander("Modus (Cloud)", expanded=False):
+            st.caption(f"APP_MODE={APP_MODE!r} · CLOUD_DEMO_MODE={CLOUD_DEMO_MODE} · DEMO_MODE={DEMO_MODE}")
     
     st.sidebar.markdown("---")
     
