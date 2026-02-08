@@ -130,8 +130,24 @@ def get_openai_api_key() -> Optional[str]:
 
 
 def get_discogs_api_key() -> Optional[str]:
-    """Cloud: aus st.secrets (DISCOGS_API_KEY / discogs_api_key). Desktop: None."""
-    return _get_secret("DISCOGS_API_KEY", "discogs_api_key")
+    """
+    Cloud: aus st.secrets (DISCOGS_API_KEY / discogs_api_key).
+    Falls _get_secret wegen APP_MODE nichts liefert, wird trotzdem in st.secrets nachgeschaut,
+    damit der Token auf Streamlit Cloud funktioniert, auch wenn APP_MODE aus Secrets nicht geladen wurde.
+    Desktop: None (st.secrets nicht vorhanden oder leer).
+    """
+    v = _get_secret("DISCOGS_API_KEY", "discogs_api_key")
+    if v:
+        return v
+    try:
+        import streamlit as st
+        for key in ("DISCOGS_API_KEY", "discogs_api_key"):
+            x = st.secrets.get(key)
+            if x is not None and isinstance(x, str) and (x := x.strip()):
+                return x
+    except Exception:
+        pass
+    return None
 
 
 def get_musicbrainz_api_key() -> Optional[str]:

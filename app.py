@@ -1079,10 +1079,10 @@ def _init_session_state_heavy():
     
     discogs_enabled = api_settings.get("discogs_enabled", 0) == 1
     try:
-        from config import get_discogs_api_key, APP_MODE
+        from config import get_discogs_api_key
         discogs_api_key = (get_discogs_api_key() or api_settings.get("discogs_api_key", "") or "")
-        # Cloud: Wenn Key aus Secrets vorhanden, Discogs automatisch aktivieren (Demo-DB hat ggf. discogs_enabled=0)
-        if APP_MODE == "CLOUD" and get_discogs_api_key() and not discogs_enabled:
+        # Wenn Key aus Secrets (Cloud) vorhanden, Discogs automatisch aktivieren – unabhängig von APP_MODE/DB
+        if get_discogs_api_key() and not discogs_enabled:
             discogs_enabled = True
             st.session_state.settings_discogs_enabled = True  # damit automatische Discogs-Suche nach KI-Analyse läuft
     except Exception:
@@ -1866,9 +1866,9 @@ def _ensure_discogs_client() -> None:
     api_settings = db.get_company_settings() or {}
     discogs_enabled = api_settings.get("discogs_enabled", 0) == 1
     try:
-        from config import get_discogs_api_key, APP_MODE
+        from config import get_discogs_api_key
         discogs_api_key = (get_discogs_api_key() or api_settings.get("discogs_api_key") or "").strip()
-        if APP_MODE == "CLOUD" and get_discogs_api_key() and not discogs_enabled:
+        if get_discogs_api_key() and not discogs_enabled:
             discogs_enabled = True
             st.session_state.settings_discogs_enabled = True  # damit automatische Discogs-Suche läuft
     except Exception:
@@ -11337,10 +11337,17 @@ def _main_content(placeholder=None):
         st.sidebar.markdown(f"**👤 {current_user.get('username', 'Benutzer')}**")
     if CLOUD_DEMO_MODE:
         st.sidebar.caption("☁️ **Cloud-Demo** – gemeinsame Datenbasis")
-    # Modus-Check (Cloud): Secrets sichtbar machen, damit bei Problemen APP_MODE/CLOUD_DEMO_MODE/DEMO_MODE geprüft werden können
+    # Modus-Check (Cloud): Secrets sichtbar machen, damit bei Problemen APP_MODE/CLOUD_DEMO_MODE/DEMO_MODE und Discogs geprüft werden können
     if APP_MODE == "CLOUD":
         with st.sidebar.expander("Modus (Cloud)", expanded=False):
             st.caption(f"APP_MODE={APP_MODE!r} · CLOUD_DEMO_MODE={CLOUD_DEMO_MODE} · DEMO_MODE={DEMO_MODE}")
+            try:
+                from config import get_discogs_api_key
+                discogs_aus_secrets = "ja" if get_discogs_api_key() else "nein"
+            except Exception:
+                discogs_aus_secrets = "Fehler"
+            discogs_client_aktiv = "ja" if st.session_state.get("discogs_client") else "nein"
+            st.caption(f"Discogs aus Secrets: **{discogs_aus_secrets}** · Discogs-Client: **{discogs_client_aktiv}**")
     
     st.sidebar.markdown("---")
     
